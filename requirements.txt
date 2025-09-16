@@ -134,7 +134,6 @@ pandocfilters==1.5.1
 parso==0.8.4
 pickleshare==0.7.5
 pillow==11.2.1
-pipreqs==0.5.0
 platformdirs==4.3.8
 pluggy==1.6.0
 posthog==4.2.0
@@ -222,3 +221,4 @@ yarg==0.1.9
 yarl==1.20.0
 zipp==3.22.0
 zstandard==0.23.0
+
