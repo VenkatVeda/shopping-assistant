@@ -1,7 +1,7 @@
 # services/vector_service.py
-from langchain.vectorstores.chroma import Chroma
+from langchain_community.vectorstores import Chroma
 from chromadb import PersistentClient
-from langchain.schema import Document
+from langchain_core.documents import Document
 from config.settings import VECTOR_CONFIG
 
 class VectorService:
@@ -29,6 +29,22 @@ class VectorService:
         if not self.vectorstore:
             return []
         return self.vectorstore.similarity_search(query, k=k)
+    
+    def get_all_documents(self) -> list[Document]:
+        """Get all documents from the vector database"""
+        if not self.vectorstore:
+            return []
+        
+        try:
+            # Get all documents by doing a very broad search with high k
+            # This is a workaround since ChromaDB doesn't have a direct "get_all" method
+            # We search with a generic term and high k to get all results
+            all_docs = self.vectorstore.similarity_search("bag handbag tote", k=10000)
+            print(f"Retrieved {len(all_docs)} documents from vector database")
+            return all_docs
+        except Exception as e:
+            print(f"Error retrieving all documents: {e}")
+            return []
     
     def is_available(self) -> bool:
         return self.vectorstore is not None

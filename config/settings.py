@@ -15,7 +15,7 @@ AZURE_CONFIG = {
 
 # Vector Database Configuration
 VECTOR_CONFIG = {
-    "chroma_dir": "./chroma_db_numeric",
+    "chroma_dir":"vector_db backups/chroma_db_numeric",
     "collection_name": "bags"
 }
 
@@ -32,13 +32,16 @@ PREFERENCE_SCHEMA = {
     "categories": [],
     "colors": [],
     "materials": [],
-    "features": []
+    "features": [],
+    "excluded_colors": [],
+    "excluded_brands": [],
+    "excluded_categories": []
 }
 
 #generalise it with pandas
 
 BAG_CATEGORIES = {
-    "tote", "shoulder bag", "duffle bag", "backpack", "clutch", "crossbody",
+    "tote bags", "shoulder bags", "duffle bags", "backpacks", "clutches", "crossbody bags",
     "handbag", "messenger", "satchel", "laptop bag", "briefcase", "wristlet",
     "wallet", "purse"
 }

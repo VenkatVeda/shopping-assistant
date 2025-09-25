@@ -13,6 +13,11 @@ class UserPreferences:
     materials: List[str] = field(default_factory=list)
     features: List[str] = field(default_factory=list)
     
+    # New exclusion fields
+    excluded_colors: List[str] = field(default_factory=list)
+    excluded_brands: List[str] = field(default_factory=list)
+    excluded_categories: List[str] = field(default_factory=list)
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             "price_min": self.price_min,
@@ -21,7 +26,10 @@ class UserPreferences:
             "categories": self.categories,
             "colors": self.colors,
             "materials": self.materials,
-            "features": self.features
+            "features": self.features,
+            "excluded_colors": self.excluded_colors,
+            "excluded_brands": self.excluded_brands,
+            "excluded_categories": self.excluded_categories
         }
     
     @classmethod
@@ -33,7 +41,10 @@ class UserPreferences:
             categories=data.get('categories', []),
             colors=data.get('colors', []),
             materials=data.get('materials', []),
-            features=data.get('features', [])
+            features=data.get('features', []),
+            excluded_colors=data.get('excluded_colors', []),
+            excluded_brands=data.get('excluded_brands', []),
+            excluded_categories=data.get('excluded_categories', [])
         )
     
     def has_active_preferences(self) -> bool:
@@ -44,7 +55,10 @@ class UserPreferences:
             self.categories,
             self.colors,
             self.materials,
-            self.features
+            self.features,
+            self.excluded_colors,
+            self.excluded_brands,
+            self.excluded_categories
         ])
     
     def clear(self):
@@ -52,6 +66,12 @@ class UserPreferences:
         self.price_max = None
         self.brands.clear()
         self.categories.clear()
+        self.colors.clear()
+        self.materials.clear()
+        self.features.clear()
+        self.excluded_colors.clear()
+        self.excluded_brands.clear()
+        self.excluded_categories.clear()
         self.colors.clear()
         self.materials.clear()
         self.features.clear()

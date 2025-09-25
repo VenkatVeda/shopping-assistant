@@ -1,5 +1,5 @@
 # utils/validators.py
-from langchain.schema import Document
+from langchain_core.documents import Document
 from models.preferences import UserPreferences
 
 def matches_preferences(doc: Document, preferences: UserPreferences) -> bool:
@@ -29,6 +29,13 @@ def matches_preferences(doc: Document, preferences: UserPreferences) -> bool:
         doc_brand = meta.get('brand', '').lower()
         if not any(brand.lower() in doc_brand for brand in preferences.brands):
             return False
+    
+    # Check excluded brands - if any excluded brand is found, reject the product
+    if preferences.excluded_brands:
+        doc_brand = meta.get('brand', '').lower()
+        for excluded_brand in preferences.excluded_brands:
+            if excluded_brand.lower() in doc_brand:
+                return False
 
     # Check color constraints
     if preferences.colors:
@@ -36,11 +43,101 @@ def matches_preferences(doc: Document, preferences: UserPreferences) -> bool:
         if not color_match:
             return False
     
+    # Check excluded colors - if any excluded color is found, reject the product
+    if preferences.excluded_colors:
+        for excluded_color in preferences.excluded_colors:
+            if excluded_color.lower() in searchable_text:
+                return False
+    
     # Check category constraints
     if preferences.categories:
-        category_match = any(category.lower() in searchable_text for category in preferences.categories)
+        category_match = False
+        for category in preferences.categories:
+            category_lower = category.lower()
+            
+            # Check for exact match first
+            if category_lower in searchable_text:
+                category_match = True
+                break
+                
+            # Check for variations - remove 's' from plural categories
+            if category_lower.endswith('s'):
+                singular_category = category_lower[:-1]  # "tote bags" -> "tote bag"
+                if singular_category in searchable_text:
+                    category_match = True
+                    break
+                    
+                # Also check just the base word without "bag"
+                if singular_category.endswith(' bag'):
+                    base_word = singular_category.replace(' bag', '')  # "tote bag" -> "tote"
+                    if base_word in searchable_text:
+                        category_match = True
+                        break
+                        
+                # For categories ending in 's' (like 'clutches'), also check the singular form
+                # "clutches" -> "clutch"
+                base_singular = category_lower[:-2] if category_lower.endswith('es') else category_lower[:-1]
+                if base_singular in searchable_text:
+                    category_match = True
+                    break
+            
+            # Handle hyphenated variations (crossbody -> cross-body)
+            # Check if we can convert unhyphenated to hyphenated format
+            if 'crossbody' in category_lower:
+                hyphenated_version = category_lower.replace('crossbody', 'cross-body')
+                if hyphenated_version in searchable_text:
+                    category_match = True
+                    break
+                # Also check the reverse (cross-body -> crossbody)
+                unhyphenated_version = category_lower.replace('cross-body', 'crossbody')
+                if unhyphenated_version in searchable_text:
+                    category_match = True
+                    break
+            
+            # Special handling for cross-body variations in document text
+            # If searching for 'crossbody bags' and doc contains 'Cross-body Bag'
+            if category_lower == 'crossbody bags':
+                # Check for hyphenated version with various capitalizations and bag/bags variations
+                cross_body_variations = [
+                    'cross-body bag', 'cross-body bags', 
+                    'Cross-body bag', 'Cross-body Bag', 'Cross-body bags',
+                    'Cross-Body bag', 'Cross-Body Bag', 'Cross-Body bags'
+                ]
+                if any(variation in searchable_text for variation in cross_body_variations):
+                    category_match = True
+                    break
+            
+            # Check if category is a single word that might appear in product names
+            category_words = category_lower.split()
+            if len(category_words) == 1 or (len(category_words) == 2 and category_words[1] == 'bags'):
+                base_word = category_words[0]  # "tote" from "tote bags"
+                if base_word in searchable_text:
+                    category_match = True
+                    break
+                    
         if not category_match:
             return False
+    
+    # Check excluded categories - if any excluded category is found, reject the product
+    if preferences.excluded_categories:
+        for excluded_category in preferences.excluded_categories:
+            excluded_category_lower = excluded_category.lower()
+            
+            # Use the same matching logic as category matching for exclusions
+            if excluded_category_lower in searchable_text:
+                return False
+                
+            # Check singular forms
+            if excluded_category_lower.endswith('s'):
+                singular_excluded = excluded_category_lower[:-1]
+                if singular_excluded in searchable_text:
+                    return False
+                    
+            # Handle hyphenated variations for exclusions too
+            if 'crossbody' in excluded_category_lower:
+                hyphenated_version = excluded_category_lower.replace('crossbody', 'cross-body')
+                if hyphenated_version in searchable_text:
+                    return False
     
     return True
 

@@ -1,8 +1,7 @@
 # services/azure_service.py
-from langchain.chat_models import AzureChatOpenAI
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain.prompts import PromptTemplate
-from langchain.chains.llm import LLMChain
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_core.prompts import PromptTemplate
+from langchain.chains import LLMChain
 from config.settings import AZURE_CONFIG
 from config.prompts import PREFERENCE_PROMPT, GENERAL_CONVERSATION_PROMPT
 

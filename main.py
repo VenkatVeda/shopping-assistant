@@ -8,7 +8,7 @@ It initializes all services and components, then launches the Gradio interface.
 
 from services.azure_service import AzureService
 from services.vector_service import VectorService
-from services.preference_service import PreferenceService
+from services.enhanced_preference_service import EnhancedPreferenceService as PreferenceService
 from services.search_service import SearchService
 from utils.data_loader import DataLoader
 from ui.formatters import ProductFormatter
@@ -165,7 +165,7 @@ def test_services():
     
     # Test preference service
     preference_service = PreferenceService(azure_service)
-    test_input = "I want black leather bags under $100"
+    test_input = "I want blue crossbody bags under $200"
     updated_prefs = preference_service.update_preferences(test_input)
     print(f"Preference update test: {preference_service.get_summary()}")
     
@@ -185,7 +185,12 @@ if __name__ == "__main__":
         elif mode == "local":
             launch_local()
         elif mode == "test":
-            test_services()
+            try:
+                print("\n🧪 Starting service tests...\n")
+                test_services()
+            except Exception as e:
+                print(f"\n❌ Test failed: {str(e)}")
+                sys.exit(1)
         else:
             print(f"Unknown mode: {mode}")
             print("Available modes: dev, prod, local, test")

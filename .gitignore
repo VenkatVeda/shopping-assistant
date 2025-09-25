@@ -187,5 +187,5 @@ src/storage/cache/*
 !/utils/data_extracts/*.py
 !/utils/data_extracts/imports/.gitkeep
 
-tests/*.html
-tests/*.csv
+# Ignore the entire tests directory
+tests/
