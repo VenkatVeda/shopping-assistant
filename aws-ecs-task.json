@@ -1,0 +1,90 @@
+{
+  "family": "shopping-assistant",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::YOUR_ACCOUNT:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "shopping-assistant-app",
+      "image": "shopping-assistant:latest",
+      "portMappings": [
+        {
+          "containerPort": 7860,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "AZURE_OPENAI_ENDPOINT",
+          "value": "your_endpoint_here"
+        },
+        {
+          "name": "AZURE_OPENAI_DEPLOYMENT_NAME", 
+          "value": "your_deployment_name"
+        },
+        {
+          "name": "ENABLE_REDIS",
+          "value": "true"
+        },
+        {
+          "name": "REDIS_HOST",
+          "value": "redis"
+        },
+        {
+          "name": "ENABLE_NER",
+          "value": "true"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "AZURE_OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:YOUR_ACCOUNT:secret:shopping-assistant/azure-key"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/shopping-assistant",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:7860/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "essential": true
+    },
+    {
+      "name": "redis",
+      "image": "redis:7-alpine",
+      "portMappings": [
+        {
+          "containerPort": 6379,
+          "protocol": "tcp"
+        }
+      ],
+      "command": [
+        "redis-server",
+        "--appendonly", "yes",
+        "--maxmemory", "256mb",
+        "--maxmemory-policy", "allkeys-lru"
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/shopping-assistant-redis",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "essential": false
+    }
+  ]
+}

@@ -348,13 +348,22 @@ class EnhancedPreferenceService:
     def _extract_with_llm(self, user_input: str) -> Tuple[UserPreferences, Dict[str, Any]]:
         """Extract preferences using LLM (fallback/enhancement method)"""
         try:
-            current_prefs_json = json.dumps(self.current_preferences.to_dict(), indent=2)
-            response = self.azure_service.preference_chain.run(
-                user_input=user_input,
-                previous_prefs=current_prefs_json
-            )
-            
-            new_preferences_dict = json.loads(response)
+            # Use cached extraction if available, fallback to direct chain
+            if hasattr(self.azure_service, 'extract_preferences_cached'):
+                # Use the cached method (returns dict directly)
+                new_preferences_dict = self.azure_service.extract_preferences_cached(
+                    user_input, 
+                    self.current_preferences.to_dict()
+                )
+                response = json.dumps(new_preferences_dict)
+            else:
+                # Fallback to direct chain call (returns JSON string)
+                current_prefs_json = json.dumps(self.current_preferences.to_dict(), indent=2)
+                response = self.azure_service.preference_chain.run(
+                    user_input=user_input,
+                    previous_prefs=current_prefs_json
+                )
+                new_preferences_dict = json.loads(response)
             llm_preferences = UserPreferences.from_dict(new_preferences_dict)
             
             metadata = {

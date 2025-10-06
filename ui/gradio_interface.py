@@ -6,15 +6,13 @@ if TYPE_CHECKING:
     from workflows.conversation_flow import ConversationWorkflow
     from services.preference_service import PreferenceService
     from ui.formatters import ProductFormatter
+    from services.session_manager import SessionManager
 
 class GradioInterface:
-    """Manages the Gradio web interface"""
+    """Manages the Gradio web interface with session support"""
     
-    def __init__(self, conversation_workflow, preference_service, formatter):
-        self.workflow = conversation_workflow
-        self.preference_service = preference_service
-        self.formatter = formatter
-        self.chat_history_ui = []
+    def __init__(self, session_manager):
+        self.session_manager = session_manager
     
     def get_base64_image(self, image_path: str) -> str:
         """Convert image to base64 for embedding in HTML"""
@@ -25,37 +23,47 @@ class GradioInterface:
             print(f"Warning: Logo file not found at {image_path}")
             return ""
     
-    def chat_interface(self, user_input: str) -> List[Tuple[str, str]]:
-        """Handle chat interaction and return formatted history"""
+    def chat_interface(self, user_input: str, session_id: str = None) -> Tuple[List[Tuple[str, str]], str]:
+        """Handle chat interaction with session management"""
+        # Get or create session
+        session_id, session_data = self.session_manager.get_or_create_session(session_id)
+        
         if user_input.strip().lower() in ["exit", "quit"]:
-            self.chat_history_ui.append(("user", user_input))
-            self.chat_history_ui.append(("assistant", "Have a great day!"))
-            return [(self.chat_history_ui[i][1], self.chat_history_ui[i+1][1]) 
-                   for i in range(0, len(self.chat_history_ui), 2)]
+            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("assistant", "Have a great day!"))
+            chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
+                           for i in range(0, len(session_data.chat_history_ui), 2)]
+            return chat_history, session_id
 
         try:
-            result = self.workflow.process_message(user_input)
-            self.chat_history_ui.append(("user", user_input))
-            self.chat_history_ui.append(("assistant", result))
+            result = session_data.workflow.process_message(user_input)
+            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("assistant", result))
         except Exception as e:
             print(f"Error processing message: {e}")
             error_msg = "I apologize, but I'm experiencing some technical difficulties. Please try again."
-            self.chat_history_ui.append(("user", user_input))
-            self.chat_history_ui.append(("assistant", error_msg))
+            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("assistant", error_msg))
 
-        return [(self.chat_history_ui[i][1], self.chat_history_ui[i+1][1]) 
-               for i in range(0, len(self.chat_history_ui), 2)]
+        chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
+                       for i in range(0, len(session_data.chat_history_ui), 2)]
+        return chat_history, session_id
 
-    def clear_chat(self):
-        """Clear chat history and reset preferences"""
-        self.chat_history_ui = []
-        self.preference_service.clear_preferences()
-        self.workflow.clear_memory()
-        return []
+    def clear_chat(self, session_id: str = None) -> Tuple[List, str]:
+        """Clear chat history and reset preferences for a session"""
+        session_id, session_data = self.session_manager.get_or_create_session(session_id)
+        
+        session_data.chat_history_ui = []
+        session_data.preference_service.clear_preferences()
+        session_data.workflow.clear_memory()
+        
+        return [], session_id
 
-    def show_current_preferences(self) -> str:
-        """Display current user preferences"""
-        return f"**Current Preferences:** {self.preference_service.get_summary()}"
+    def show_current_preferences(self, session_id: str = None) -> Tuple[str, str]:
+        """Display current user preferences for a session"""
+        session_id, session_data = self.session_manager.get_or_create_session(session_id)
+        preferences = f"**Current Preferences:** {session_data.preference_service.get_summary()}"
+        return preferences, session_id
     
     def build_ui(self) -> gr.Blocks:
         """Build and return the complete Gradio interface"""
@@ -144,6 +152,9 @@ class GradioInterface:
 
         with gr.Blocks(title="Smart Shopping Assistant", css=custom_css) as demo:
             
+            # Hidden session state
+            session_state = gr.State(value=None)
+            
             # Header with logo
             logo_base64 = self.get_base64_image("assets/xponent_logo_white_on_orange.jpg")
             if logo_base64:
@@ -161,9 +172,9 @@ class GradioInterface:
                 </div>
                 """)
 
-            # Preferences display
+            # Preferences display  
             preferences_display = gr.Markdown(
-                self.show_current_preferences(), 
+                "**Current Preferences:** None", 
                 label="Current Preferences"
             )
             
@@ -190,42 +201,55 @@ class GradioInterface:
                 prefs_btn = gr.Button("Show Preferences", scale=1)
 
             # Event handlers
-            def handle_send(user_input):
+            def handle_send(user_input, session_id):
                 """Handle sending a message"""
                 if not user_input.strip():
-                    return self.chat_history_ui, "", self.show_current_preferences()
+                    # Just return current state without changes
+                    if session_id:
+                        _, session_data = self.session_manager.get_or_create_session(session_id)
+                        chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
+                                       for i in range(0, len(session_data.chat_history_ui), 2)]
+                        prefs, _ = self.show_current_preferences(session_id)
+                        return chat_history, "", prefs, session_id
+                    return [], "", "**Current Preferences:** None", None
                 
-                result = self.chat_interface(user_input)
-                updated_prefs = self.show_current_preferences()
-                return result, "", updated_prefs
-
-            def handle_clear():
+                chat_history, new_session_id = self.chat_interface(user_input, session_id)
+                prefs, _ = self.show_current_preferences(new_session_id)
+                return chat_history, "", prefs, new_session_id
+            def handle_clear(session_id):
                 """Handle clearing chat and preferences"""
-                chat_result = self.clear_chat()
-                prefs_result = self.show_current_preferences()
-                return chat_result, prefs_result
+                chat_result, new_session_id = self.clear_chat(session_id)
+                prefs, _ = self.show_current_preferences(new_session_id)
+                return chat_result, prefs, new_session_id
+
+            def handle_show_prefs(session_id):
+                """Handle showing preferences"""
+                prefs, session_id = self.show_current_preferences(session_id)
+                return prefs, session_id
 
             # Bind event handlers
             send_btn.click(
                 fn=handle_send, 
-                inputs=msg, 
-                outputs=[chatbot, msg, preferences_display]
+                inputs=[msg, session_state], 
+                outputs=[chatbot, msg, preferences_display, session_state]
             )
             
             msg.submit(
                 fn=handle_send, 
-                inputs=msg, 
-                outputs=[chatbot, msg, preferences_display]
+                inputs=[msg, session_state], 
+                outputs=[chatbot, msg, preferences_display, session_state]
             )
             
             clear_btn.click(
                 fn=handle_clear,
-                outputs=[chatbot, preferences_display]
+                inputs=[session_state],
+                outputs=[chatbot, preferences_display, session_state]
             )
             
             prefs_btn.click(
-                fn=self.show_current_preferences, 
-                outputs=preferences_display
+                fn=handle_show_prefs, 
+                inputs=[session_state],
+                outputs=[preferences_display, session_state]
             )
 
         return demo

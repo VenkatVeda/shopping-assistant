@@ -24,6 +24,13 @@ DATA_CONFIG = {
     "excel_file": "bags.xlsx"
 }
 
+# Session Management Configuration
+SESSION_CONFIG = {
+    "timeout_hours": 24,  # Session timeout in hours
+    "cleanup_interval_minutes": 60,  # How often to clean up expired sessions
+    "max_concurrent_sessions": 1000  # Maximum number of concurrent sessions
+}
+
 # Preference Schema
 PREFERENCE_SCHEMA = {
     "price_min": None,

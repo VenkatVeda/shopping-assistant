@@ -1,0 +1,65 @@
+# Azure Container Instances Deployment
+# azure-deploy.yaml
+
+apiVersion: 2021-10-01
+location: eastus
+name: shopping-assistant-app
+properties:
+  containers:
+  - name: shopping-assistant
+    properties:
+      image: shopping-assistant:latest  # Replace with your registry URL
+      resources:
+        requests:
+          cpu: 1.0
+          memoryInGb: 2.0
+      ports:
+      - port: 7860
+        protocol: TCP
+      environmentVariables:
+      - name: AZURE_OPENAI_API_KEY
+        secureValue: "your_api_key_here"
+      - name: AZURE_OPENAI_ENDPOINT  
+        value: "your_endpoint_here"
+      - name: AZURE_OPENAI_DEPLOYMENT_NAME
+        value: "your_deployment_name"
+      - name: ENABLE_REDIS
+        value: "false"  # No Redis in single container setup
+      - name: ENABLE_NER
+        value: "true"
+      volumeMounts:
+      - name: vector-data
+        mountPath: "/app/vector_db backups"
+        readOnly: false
+      
+  - name: redis
+    properties:
+      image: redis:7-alpine
+      resources:
+        requests:
+          cpu: 0.5
+          memoryInGb: 0.5
+      ports:
+      - port: 6379
+        protocol: TCP
+      command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - "256mb"
+      
+  osType: Linux
+  restartPolicy: Always
+  ipAddress:
+    type: Public
+    ports:
+    - protocol: TCP
+      port: 7860
+    - protocol: TCP  
+      port: 6379
+  volumes:
+  - name: vector-data
+    emptyDir: {}
+    
+type: Microsoft.ContainerInstance/containerGroups

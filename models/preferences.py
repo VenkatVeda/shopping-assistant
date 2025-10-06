@@ -17,6 +17,7 @@ class UserPreferences:
     excluded_colors: List[str] = field(default_factory=list)
     excluded_brands: List[str] = field(default_factory=list)
     excluded_categories: List[str] = field(default_factory=list)
+    excluded_materials: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -29,7 +30,8 @@ class UserPreferences:
             "features": self.features,
             "excluded_colors": self.excluded_colors,
             "excluded_brands": self.excluded_brands,
-            "excluded_categories": self.excluded_categories
+            "excluded_categories": self.excluded_categories,
+            "excluded_materials": self.excluded_materials
         }
     
     @classmethod
@@ -44,7 +46,8 @@ class UserPreferences:
             features=data.get('features', []),
             excluded_colors=data.get('excluded_colors', []),
             excluded_brands=data.get('excluded_brands', []),
-            excluded_categories=data.get('excluded_categories', [])
+            excluded_categories=data.get('excluded_categories', []),
+            excluded_materials=data.get('excluded_materials', [])
         )
     
     def has_active_preferences(self) -> bool:

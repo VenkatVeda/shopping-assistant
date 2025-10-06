@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: shopping-assistant
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: ./
+    plan: starter  # or standard/pro based on your needs
+    healthCheckPath: /health
+    envVars:
+      - key: AZURE_OPENAI_ENDPOINT
+        value: your_endpoint_here
+      - key: AZURE_OPENAI_DEPLOYMENT_NAME  
+        value: your_deployment_name
+      - key: AZURE_OPENAI_API_KEY
+        sync: false  # Set this as a secret in Render dashboard
+      - key: ENABLE_REDIS
+        value: false  # Start without Redis for simplicity
+      - key: ENABLE_NER
+        value: true
+      - key: PORT
+        value: 7860
+    buildCommand: |
+      echo "Building Shopping Assistant..."
+    startCommand: python main.py prod
+    
+  # Optional: Add Redis service
+  - type: redis
+    name: shopping-assistant-redis
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
