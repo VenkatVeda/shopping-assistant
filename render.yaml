@@ -4,7 +4,7 @@ services:
     env: docker
     dockerfilePath: ./Dockerfile
     dockerContext: ./
-    plan: starter  # or standard/pro based on your needs
+    plan: free  # or standard/pro based on your needs
     healthCheckPath: /health
     envVars:
       - key: AZURE_OPENAI_ENDPOINT
