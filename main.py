@@ -7,6 +7,16 @@ It initializes all services and components with Redis caching, then launches the
 """
 
 import os
+import warnings
+
+# Suppress verbose warnings and logs
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Import config first to set up logging
+from config.settings import configure_logging
+
 from services.azure_service import AzureService
 from services.vector_service import VectorService
 from services.enhanced_preference_service import EnhancedPreferenceService as PreferenceService

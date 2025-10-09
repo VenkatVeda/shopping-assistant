@@ -22,6 +22,11 @@ services:
         sync: false  # Set Upstash Redis URL as secret in Render dashboard
       - key: PORT
         value: 7860
+      # Logging Configuration
+      - key: LOG_LEVEL
+        value: INFO  # Reduce log verbosity (INFO, WARNING, ERROR)
+      - key: HIDE_LLM_PROMPTS
+        value: true  # Hide verbose LLM prompts from logs
     buildCommand: |
       echo "Building Shopping Assistant with Upstash Redis..."
     startCommand: python main.py prod

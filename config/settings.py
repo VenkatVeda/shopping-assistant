@@ -1,8 +1,46 @@
 # config/settings.py
 import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv(".env")
+
+# Configure logging levels to reduce verbosity
+def configure_logging():
+    """Configure logging to reduce LLM prompt verbosity"""
+    # Get log level from environment (default to INFO)
+    log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    
+    # Check if LLM prompts should be hidden
+    hide_llm_prompts = os.getenv("HIDE_LLM_PROMPTS", "true").lower() == "true"
+    
+    if hide_llm_prompts:
+        # Set specific loggers to WARNING or ERROR to reduce noise
+        logging.getLogger("openai").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("langchain").setLevel(logging.WARNING)
+        logging.getLogger("langchain_openai").setLevel(logging.WARNING)
+        logging.getLogger("langchain_core").setLevel(logging.WARNING)
+        logging.getLogger("langchain_community").setLevel(logging.WARNING)
+        logging.getLogger("chromadb").setLevel(logging.WARNING)
+        logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+        print("🔇 LLM prompt logging suppressed for cleaner logs")
+    else:
+        print("📝 LLM prompt logging enabled (verbose mode)")
+    
+    # Keep our app logs at specified level for monitoring
+    logging.getLogger("__main__").setLevel(log_level)
+    
+    # Set root logger to specified level
+    logging.basicConfig(
+        level=log_level,
+        format='%(message)s'  # Simple format for clean logs
+    )
+
+# Initialize logging configuration
+configure_logging()
 
 # Azure Configuration
 AZURE_CONFIG = {
