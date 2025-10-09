@@ -34,8 +34,12 @@ class GradioInterface:
         # LOG USER QUERY for monitoring
         self.session_manager.log_user_query(session_id, user_input, "chat_input")
         
+        # Add timestamp to user query for UI display
+        timestamp = time.strftime("%H:%M:%S")
+        user_input_with_timestamp = f"{user_input}\n\n<small style='color: #666; font-size: 0.8em;'>🕒 {timestamp}</small>"
+        
         if user_input.strip().lower() in ["exit", "quit"]:
-            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", "Have a great day!"))
             chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
                            for i in range(0, len(session_data.chat_history_ui), 2)]
@@ -43,12 +47,12 @@ class GradioInterface:
 
         try:
             result = session_data.workflow.process_message(user_input, session_id)
-            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", result))
         except Exception as e:
             print(f"Error processing message: {e}")
             error_msg = "I apologize, but I'm experiencing some technical difficulties. Please try again."
-            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", error_msg))
 
         chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
@@ -65,10 +69,14 @@ class GradioInterface:
         # LOG USER QUERY for monitoring
         self.session_manager.log_user_query(session_id, user_input, "chat_input")
         
-        print(f"🔄 Processing request for session {session_id[:8]}... at {time.strftime('%H:%M:%S')}")
+        # Add timestamp to user query for UI display
+        timestamp = time.strftime("%H:%M:%S")
+        user_input_with_timestamp = f"{user_input}\n\n<small style='color: #666; font-size: 0.8em;'>🕒 {timestamp}</small>"
+        
+        print(f"🔄 Processing request for session {session_id[:8]}... at {timestamp}")
         
         if user_input.strip().lower() in ["exit", "quit"]:
-            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", "Have a great day!"))
             chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
                            for i in range(0, len(session_data.chat_history_ui), 2)]
@@ -84,7 +92,7 @@ class GradioInterface:
                 session_id
             )
             
-            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", result))
             
             processing_time = time.time() - start_time
@@ -93,7 +101,7 @@ class GradioInterface:
         except Exception as e:
             print(f"❌ Error processing message for session {session_id[:8]}: {e}")
             error_msg = "I apologize, but I'm experiencing some technical difficulties. Please try again."
-            session_data.chat_history_ui.append(("user", user_input))
+            session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", error_msg))
 
         chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
@@ -208,6 +216,20 @@ class GradioInterface:
         /* Input and button styling */
         .gradio-textbox input, .gradio-textbox textarea {
             width: 100% !important;
+        }
+        
+        /* Timestamp styling in chat messages */
+        .timestamp {
+            color: #666 !important;
+            font-size: 0.75em !important;
+            font-style: italic !important;
+            margin-top: 5px !important;
+            opacity: 0.8 !important;
+        }
+        
+        /* Chat message styling to accommodate timestamps */
+        .chatbot .message {
+            margin-bottom: 8px !important;
         }
         
         /* Show More button styling */
