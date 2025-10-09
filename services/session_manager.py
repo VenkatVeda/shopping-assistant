@@ -87,9 +87,22 @@ class SessionManager:
         self._sessions: Dict[str, SessionData] = {}
         self._lock = threading.RLock()
         
+        # Query analytics
+        self.query_count = 0
+        self.session_created_count = 0
+        
         # Cleanup thread for expired sessions
         self._cleanup_thread = threading.Thread(target=self._cleanup_expired_sessions, daemon=True)
         self._cleanup_thread.start()
+    
+    def log_user_query(self, session_id: str, query: str, response_type: str = "unknown"):
+        """Log user queries for monitoring and analytics"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session_short = session_id[:8] if session_id else "unknown"
+        self.query_count += 1
+        
+        print(f"📝 [USER_QUERY] {timestamp} | Session: {session_short} | Type: {response_type} | Query: {query}")
+        print(f"📊 [ANALYTICS] Total queries: {self.query_count} | Active sessions: {len(self._sessions)}")
     
     def create_session(self) -> str:
         """Create a new session and return session ID"""
@@ -111,8 +124,9 @@ class SessionManager:
             
             session_data = SessionData(session_id, preference_service, workflow)
             self._sessions[session_id] = session_data
+            self.session_created_count += 1
             
-        print(f"🆔 Created new session: {session_id}")
+        print(f"🆔 [SESSION_CREATED] {session_id[:8]} | Total sessions created: {self.session_created_count}")
         return session_id
     
     def get_session(self, session_id: str) -> Optional[SessionData]:

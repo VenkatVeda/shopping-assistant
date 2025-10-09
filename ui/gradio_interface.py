@@ -31,6 +31,9 @@ class GradioInterface:
         # Get or create session
         session_id, session_data = self.session_manager.get_or_create_session(session_id)
         
+        # LOG USER QUERY for monitoring
+        self.session_manager.log_user_query(session_id, user_input, "chat_input")
+        
         if user_input.strip().lower() in ["exit", "quit"]:
             session_data.chat_history_ui.append(("user", user_input))
             session_data.chat_history_ui.append(("assistant", "Have a great day!"))
@@ -58,6 +61,10 @@ class GradioInterface:
         
         # Get or create session
         session_id, session_data = self.session_manager.get_or_create_session(session_id)
+        
+        # LOG USER QUERY for monitoring
+        self.session_manager.log_user_query(session_id, user_input, "chat_input")
+        
         print(f"🔄 Processing request for session {session_id[:8]}... at {time.strftime('%H:%M:%S')}")
         
         if user_input.strip().lower() in ["exit", "quit"]:
@@ -373,6 +380,9 @@ class GradioInterface:
                 if not session_id:
                     return [], "**Current Preferences:** None", None, gr.update(visible=False)
                 
+                # LOG SHOW MORE ACTION
+                self.session_manager.log_user_query(session_id, "show more", "show_more_action")
+                
                 chat_history, new_session_id = await self.chat_interface_async("show more", session_id)
                 prefs, _ = await self.show_current_preferences_async(new_session_id)
                 
@@ -391,6 +401,9 @@ class GradioInterface:
                 """Handle show more button click (fallback sync handler)"""
                 if not session_id:
                     return [], "**Current Preferences:** None", None, gr.update(visible=False)
+                
+                # LOG SHOW MORE ACTION
+                self.session_manager.log_user_query(session_id, "show more", "show_more_action")
                 
                 # Simulate "show more" message
                 chat_history, new_session_id = self.chat_interface("show more", session_id)
