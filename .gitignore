@@ -189,3 +189,4 @@ src/storage/cache/*
 
 # Ignore the entire tests directory
 tests/
+docs/
