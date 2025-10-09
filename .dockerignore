@@ -1,0 +1,102 @@
+# .dockerignore - Exclude unnecessary files from Docker build context
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation and examples
+docs/
+*.md
+!README.md
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Node modules (if any)
+node_modules/
+
+# Database backups (don't copy - mount as volume)
+# vector_db backups/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Environment files (keep .env.example)
+.env
+.env.local
+.env.prod
+.env.staging
+
+# Docker files (no need to copy into container)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Large model files that should be downloaded in container
+*.model
+*.bin
+
+# Deployment files (not needed in container)
+deploy-prepare.*
+PROJECT_CLEANUP_SUMMARY.md
+DEPLOYMENT_COMPLETE_GUIDE.md
+azure-deploy.yaml
+aws-ecs-task.json
+gcloud-deploy.yaml
+railway.json

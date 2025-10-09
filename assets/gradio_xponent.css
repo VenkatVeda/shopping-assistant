@@ -1,0 +1,96 @@
+/* URLs are of the form "/file=src/..." for Gradio compatibility*/
+@font-face {
+    font-family: 'ProximaNova-Regular';
+    src: url('/file=src/assets/fonts/ProximaNova-Regular.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+}
+
+@font-face {
+    font-family: 'Gilroy-Bold';
+    src: url('/file=src/assets/fonts/Gilroy-Bold.ttf') format('truetype');
+    font-weight: bold;
+    font-style: normal;
+}
+
+:root {
+    --background-color: #FFFFFF;
+    --header-background: #F15F2E;
+    --text-color: #F5F5F5;
+    --citation-text-color: #959494;
+    --border-color: #7F7E7E;
+    --standard-padding: 8px;
+    /* --body-font: 'ProximaNova-Regular', 'Helvetica Neue', Helvetica, Arial, sans-serif; */
+    --body-font: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    --header-font: 'Gilroy-Bold', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+footer {
+    display: none !important
+}
+
+.gradio-container {
+    background-color: var(--background-color);
+    font-family: var(--body-font);
+    /* line-height: 150%; */
+}
+
+.chatbot.prose {
+    line-height: 200%;
+}
+
+#header {
+    background-color: var(--header-background);
+    padding: var(--standard-padding) 0 10px 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+#header h1 {
+    font-family: var(--header-font);
+    color: var(--text-color);
+    text-align: center;
+}
+
+#header img {
+    margin-bottom: 10px;
+}
+
+#citations {
+    padding: var(--standard-padding);
+    margin-top: 10px;
+}
+
+#citations h1,
+#citations h2 {
+    font-size: medium;
+    font-weight: 450;
+    color: var(--citation-text-color);
+}
+
+#citations table,
+#citations th,
+#citations tr,
+#citations td {
+    border: 0.5px solid var(--border-color);
+    color: var(--citation-text-color);
+}
+
+#citations th {
+    font-weight: 500;
+}
+
+#citations li {
+    color: var(--citation-text-color);
+}
+
+#examples {
+    font-size: small;
+    color: var(--citation-text-color)
+}
+
+#examples .gallery-item {
+    text-align: left;
+    background-color: rgb(245, 245, 245);
+}
