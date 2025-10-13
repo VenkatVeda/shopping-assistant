@@ -1,7 +1,10 @@
 # workflows/conversation_flow.py
+import json
+import time
 from langchain.memory import ConversationBufferMemory
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph
+from langsmith import traceable
 from models.state import BotState
 from utils.validators import is_relevant_to_shopping
 
@@ -126,6 +129,25 @@ I couldn't find any products matching these exact criteria. Try adjusting your p
         try:
             session_id = state.get("session_id") or getattr(self, 'current_session_id', None)
             
+            # Track preference extraction with Azure service for metrics
+            if self.azure_service.preference_chain:
+                try:
+                    # Get current preferences for the prompt
+                    current_prefs_json = json.dumps(self.preference_service.current_preferences.to_dict(), indent=2)
+                    
+                    # Use Azure service to extract preferences (gets us metrics)
+                    result, metrics = self.azure_service.run_with_tracking(
+                        self.azure_service.preference_chain,
+                        {
+                            "user_input": user_question,
+                            "previous_prefs": current_prefs_json
+                        }
+                    )
+                    # Store metrics in state
+                    state["metrics"] = metrics
+                except Exception as e:
+                    print(f"Preference extraction error: {e}")
+            
             # Get all matching results for pagination
             all_docs = self.search_service.search_all_products(
                 user_question, 
@@ -202,42 +224,65 @@ I couldn't find any products matching these exact criteria. Try adjusting your p
                     for msg in recent_messages
                 ])
                 
-                result = self.azure_service.conversation_chain.invoke({
-                    "preferences": self.preference_service.get_summary(),
-                    "recent_chat_history": recent_chat_str,
-                    "question": user_question
-                })
-                state["answer"] = result["text"]
+                # Use tracking method to get both LangSmith tracing AND local metrics
+                result, metrics = self.azure_service.run_with_tracking(
+                    self.azure_service.conversation_chain,
+                    {
+                        "preferences": self.preference_service.get_summary(),
+                        "recent_chat_history": recent_chat_str,
+                        "question": user_question
+                    }
+                )
+                
+                if result:
+                    # Handle both string and dict responses
+                    if isinstance(result, dict) and 'text' in result:
+                        state["answer"] = result["text"]
+                    else:
+                        state["answer"] = str(result)
+                    # Store metrics in state for workflow result
+                    state["metrics"] = metrics
+                else:
+                    state["answer"] = "I'm here to help you find bags and accessories! What are you looking for?"
+                    
             except Exception as e:
                 print(f"LLM error: {e}")
                 state["answer"] = "I'm here to help you find bags and accessories! What are you looking for?"
         else:
             state["answer"] = "I'm here to help you find bags and accessories! What are you looking for?"
     
-    def process_message(self, user_input: str, session_id: str = None) -> str:
-        """Process a user message and return the response"""
+    @traceable(name="process_user_message", project_name="shopping-assistant")
+    def process_message(self, user_input: str, session_id: str = None) -> tuple:
+        """Process a user message and return the response with metrics (LangSmith + local tracking)"""
         # Store session_id as instance variable for use in handlers
         self.current_session_id = session_id
         
         # Check if this is a "show more" request
         if self._is_show_more_request(user_input):
-            return self._handle_show_more_request(session_id)
-        
+            return self._handle_show_more_request(session_id), None
+
         state = {
             "chat_history": self.memory.chat_memory.messages,
             "question": user_input,
             "answer": "",
             "should_retrieve": False,
-            "session_id": session_id
+            "session_id": session_id,
+            "metrics": None
         }
-        
+
         try:
             result = self.agent.invoke(state)
-            return result["answer"]
+            
+            # Get metrics from state or from Azure service
+            metrics = result.get("metrics")
+            if not metrics and hasattr(self.azure_service, 'last_metrics') and self.azure_service.last_metrics:
+                metrics = self.azure_service.last_metrics
+                
+            return result["answer"], metrics
         except Exception as e:
             print(f"Error processing message: {e}")
-            return "I apologize, but I'm experiencing some technical difficulties. Please try again."
-    
+            return "I apologize, but I'm experiencing some technical difficulties. Please try again.", None
+
     def clear_memory(self):
         """Clear conversation memory"""
         self.memory.clear()

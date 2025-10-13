@@ -27,6 +27,15 @@ services:
         value: INFO  # Reduce log verbosity (INFO, WARNING, ERROR)
       - key: HIDE_LLM_PROMPTS
         value: true  # Hide verbose LLM prompts from logs
+      # LangSmith Configuration for Evaluation and Tracing
+      - key: LANGCHAIN_API_KEY
+        sync: false  # Set this as a secret in Render dashboard
+      - key: LANGCHAIN_PROJECT
+        value: shopping-assistant-production
+      - key: LANGCHAIN_TRACING_V2
+        value: true
+      - key: LANGCHAIN_ENDPOINT
+        value: https://api.smith.langchain.com
     buildCommand: |
       echo "Building Shopping Assistant with Upstash Redis..."
     startCommand: python main.py prod

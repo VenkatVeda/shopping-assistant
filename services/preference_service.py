@@ -15,19 +15,22 @@ class PreferenceService:
 
         try:
             current_prefs_json = json.dumps(self.current_preferences.to_dict(), indent=2)
+            
+            # Use LangSmith automatic tracing (no manual tracking needed)
             response = self.azure_service.preference_chain.run(
                 user_input=user_input,
                 previous_prefs=current_prefs_json
             )
             
-            new_preferences_dict = json.loads(response)
-            new_preferences = UserPreferences.from_dict(new_preferences_dict)
-            
-            # 🚨 BACKUP EXCLUSION DETECTION - Fix LLM misses
-            self._backup_exclusion_detection(user_input, new_preferences)
-            
-            # Validate and merge preferences
-            self._validate_and_merge(new_preferences, user_input)
+            if response:
+                new_preferences_dict = json.loads(response)
+                new_preferences = UserPreferences.from_dict(new_preferences_dict)
+                
+                # 🚨 BACKUP EXCLUSION DETECTION - Fix LLM misses
+                self._backup_exclusion_detection(user_input, new_preferences)
+                
+                # Validate and merge preferences
+                self._validate_and_merge(new_preferences, user_input)
             
         except Exception as e:
             print(f"Error updating preferences: {e}")

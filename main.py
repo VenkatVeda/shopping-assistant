@@ -163,24 +163,40 @@ class CachedAzureService:
             return {}
         
         try:
-            response = self.azure_service.preference_chain.run({
-                'user_input': user_input,
-                'previous_prefs': json.dumps(current_preferences or {}, indent=2)
-            })
+            # Use the tracking method for metrics while maintaining cache
+            result, metrics = self.azure_service.run_with_tracking(
+                self.azure_service.preference_chain,
+                {
+                    'user_input': user_input,
+                    'previous_prefs': json.dumps(current_preferences or {}, indent=2)
+                }
+            )
             
-            # Parse JSON from response
-            if isinstance(response, str):
-                import re
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
+            if result:
+                # Parse JSON from response
+                if isinstance(result, str):
+                    import re
+                    json_match = re.search(r'\{.*\}', result, re.DOTALL)
+                    if json_match:
+                        parsed_result = json.loads(json_match.group())
+                    else:
+                        parsed_result = {}
+                elif isinstance(result, dict) and 'text' in result:
+                    # Handle LangChain response format
+                    response_text = result['text']
+                    import re
+                    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                    if json_match:
+                        parsed_result = json.loads(json_match.group())
+                    else:
+                        parsed_result = {}
                 else:
-                    result = {}
+                    parsed_result = result
+                
+                _cache.set(key, parsed_result, ttl=86400)  # 24 hours
+                return parsed_result
             else:
-                result = response
-            
-            _cache.set(key, result, ttl=86400)  # 24 hours
-            return result
+                return {}
             
         except Exception as e:
             print(f"Error in preference extraction: {e}")
@@ -189,6 +205,17 @@ class CachedAzureService:
     # Passthrough methods to maintain compatibility
     def is_available(self) -> bool:
         return self.azure_service.is_available()
+    
+    def is_langsmith_enabled(self) -> bool:
+        return self.azure_service.is_langsmith_enabled()
+    
+    def run_with_tracking(self, chain, inputs):
+        """Passthrough to Azure service tracking method"""
+        return self.azure_service.run_with_tracking(chain, inputs)
+    
+    @property
+    def langsmith_client(self):
+        return getattr(self.azure_service, 'langsmith_client', None)
     
     @property
     def preference_chain(self):

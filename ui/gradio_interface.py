@@ -31,9 +31,6 @@ class GradioInterface:
         # Get or create session
         session_id, session_data = self.session_manager.get_or_create_session(session_id)
         
-        # LOG USER QUERY for monitoring
-        self.session_manager.log_user_query(session_id, user_input, "chat_input")
-        
         # Add timestamp to user query for UI display
         timestamp = time.strftime("%H:%M:%S")
         user_input_with_timestamp = f"{user_input}\n\n<small style='color: #666; font-size: 0.8em;'>🕒 {timestamp}</small>"
@@ -46,17 +43,36 @@ class GradioInterface:
             return chat_history, session_id
 
         try:
-            result = session_data.workflow.process_message(user_input, session_id)
+            result, metrics = session_data.workflow.process_message(user_input, session_id)
             session_data.chat_history_ui.append(("user", user_input_with_timestamp))
-            session_data.chat_history_ui.append(("assistant", result))
+            
+            # Add both LangSmith info AND local metrics to response
+            response_text = result
+            
+            # Add LangSmith project info with metrics integrated
+            if self.session_manager.azure_service.is_langsmith_enabled():
+                if metrics and 'tokens' in metrics:
+                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard | ⚡ Tokens: {metrics['tokens']} | ⏱️ {metrics['latency']:.2f}s | 💰 ${metrics['cost']:.4f}</small>"
+                else:
+                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard</small>"
+                response_text += langsmith_info
+            
+            session_data.chat_history_ui.append(("assistant", response_text))
+            
+            # Return metrics for handler to log
+            self._last_metrics = metrics
         except Exception as e:
             print(f"Error processing message: {e}")
             error_msg = "I apologize, but I'm experiencing some technical difficulties. Please try again."
             session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", error_msg))
 
-        chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
-                       for i in range(0, len(session_data.chat_history_ui), 2)]
+        # Safely create chat history pairs
+        chat_history = []
+        for i in range(0, len(session_data.chat_history_ui) - 1, 2):
+            if i + 1 < len(session_data.chat_history_ui):
+                chat_history.append((session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]))
+        
         return chat_history, session_id
 
     async def chat_interface_async(self, user_input: str, session_id: str = None) -> Tuple[List[Tuple[str, str]], str]:
@@ -65,9 +81,6 @@ class GradioInterface:
         
         # Get or create session
         session_id, session_data = self.session_manager.get_or_create_session(session_id)
-        
-        # LOG USER QUERY for monitoring
-        self.session_manager.log_user_query(session_id, user_input, "chat_input")
         
         # Add timestamp to user query for UI display
         timestamp = time.strftime("%H:%M:%S")
@@ -85,7 +98,7 @@ class GradioInterface:
         try:
             # Run the workflow processing in a thread pool to avoid blocking
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
+            result, metrics = await loop.run_in_executor(
                 None, 
                 session_data.workflow.process_message, 
                 user_input, 
@@ -93,7 +106,22 @@ class GradioInterface:
             )
             
             session_data.chat_history_ui.append(("user", user_input_with_timestamp))
-            session_data.chat_history_ui.append(("assistant", result))
+            
+            # Add both local metrics AND LangSmith info to response
+            response_text = result
+            
+            # Add LangSmith project info with metrics integrated
+            if self.session_manager.azure_service.is_langsmith_enabled():
+                if metrics and 'tokens' in metrics:
+                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard | ⚡ Tokens: {metrics['tokens']} | ⏱️ {metrics['latency']:.2f}s | 💰 ${metrics['cost']:.4f}</small>"
+                else:
+                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard</small>"
+                response_text += langsmith_info
+            
+            session_data.chat_history_ui.append(("assistant", response_text))
+            
+            # Return metrics for handler to log
+            self._last_metrics = metrics
             
             processing_time = time.time() - start_time
             print(f"✅ Completed request for session {session_id[:8]} in {processing_time:.2f}s")
@@ -104,8 +132,12 @@ class GradioInterface:
             session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             session_data.chat_history_ui.append(("assistant", error_msg))
 
-        chat_history = [(session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]) 
-                       for i in range(0, len(session_data.chat_history_ui), 2)]
+        # Safely create chat history pairs
+        chat_history = []
+        for i in range(0, len(session_data.chat_history_ui) - 1, 2):
+            if i + 1 < len(session_data.chat_history_ui):
+                chat_history.append((session_data.chat_history_ui[i][1], session_data.chat_history_ui[i+1][1]))
+        
         return chat_history, session_id
 
     def clear_chat(self, session_id: str = None) -> Tuple[List, str]:
@@ -276,6 +308,20 @@ class GradioInterface:
                 min-height: 300px !important;
             }
         }
+        
+        /* Performance metrics styling */
+        .metrics-info {
+            color: #888 !important;
+            font-size: 0.75em !important;
+            border-top: 1px solid #eee !important;
+            padding-top: 5px !important;
+            margin-top: 8px !important;
+            font-family: 'Courier New', monospace !important;
+            background: #f8f9fa !important;
+            padding: 6px 8px !important;
+            border-radius: 4px !important;
+            display: inline-block !important;
+        }
         """
 
         with gr.Blocks(title="Smart Shopping Assistant", css=custom_css) as demo:
@@ -367,6 +413,10 @@ class GradioInterface:
                 chat_history, new_session_id = await self.chat_interface_async(user_input, session_id)
                 prefs, _ = await self.show_current_preferences_async(new_session_id)
                 
+                # Log user query for analytics (single count per interaction)
+                metrics = getattr(self, '_last_metrics', None)
+                self.session_manager.log_user_query(new_session_id, user_input, "chat_interaction", metrics)
+                
                 # Check if show more button should be visible
                 show_more_visible = False
                 try:
@@ -385,6 +435,10 @@ class GradioInterface:
                 
                 chat_history, new_session_id = self.chat_interface(user_input, session_id)
                 prefs, _ = self.show_current_preferences(new_session_id)
+                
+                # Log user query for analytics (single count per interaction)
+                metrics = getattr(self, '_last_metrics', None)
+                self.session_manager.log_user_query(new_session_id, user_input, "chat_interaction", metrics)
                 
                 # Check if show more button should be visible
                 show_more_visible = False

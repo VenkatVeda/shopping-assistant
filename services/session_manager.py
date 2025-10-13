@@ -95,14 +95,28 @@ class SessionManager:
         self._cleanup_thread = threading.Thread(target=self._cleanup_expired_sessions, daemon=True)
         self._cleanup_thread.start()
     
-    def log_user_query(self, session_id: str, query: str, response_type: str = "unknown"):
-        """Log user queries for monitoring and analytics"""
+    def log_user_query(self, session_id: str, query: str, response_type: str = "unknown", metrics=None):
+        """Log user queries for monitoring and analytics with performance metrics"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         session_short = session_id[:8] if session_id else "unknown"
         self.query_count += 1
         
-        print(f"📝 [{timestamp}] [USER_QUERY] Session: {session_short} | Type: {response_type} | Query: {query}")
-        print(f"📊 [{timestamp}] [ANALYTICS] Total queries: {self.query_count} | Active sessions: {len(self._sessions)}")
+        # Enhanced query log with metrics
+        query_log = f"📝 [{timestamp}] [USER_QUERY] Session: {session_short} | Type: {response_type} | Query: {query}"
+        
+        # Add performance metrics if available
+        if metrics and 'tokens' in metrics:
+            query_log += f" | ✨ Tokens: {metrics['tokens']} | ⏱️ {metrics['latency']:.2f}s"
+            if 'cost' in metrics:
+                query_log += f" | 💰 ${metrics['cost']:.4f}"
+        
+        print(query_log)
+        
+        # Analytics summary
+        analytics_log = f"📊 [{timestamp}] [ANALYTICS] Total queries: {self.query_count} | Active sessions: {len(self._sessions)}"
+        analytics_log += f" | LangSmith tracking: {'✅' if self.azure_service.is_langsmith_enabled() else '❌'}"
+        
+        print(analytics_log)
     
     def create_session(self) -> str:
         """Create a new session and return session ID"""

@@ -356,6 +356,29 @@ class EnhancedPreferenceService:
                     self.current_preferences.to_dict()
                 )
                 response = json.dumps(new_preferences_dict)
+                metadata = {
+                    'llm_response_raw': response,
+                    'llm_preferences_parsed': new_preferences_dict,
+                    'success': True
+                }
+            elif hasattr(self.azure_service, 'run_with_tracking') and self.azure_service.preference_chain:
+                # Use run_with_tracking to capture metrics
+                current_prefs_json = json.dumps(self.current_preferences.to_dict(), indent=2)
+                response, metrics = self.azure_service.run_with_tracking(
+                    self.azure_service.preference_chain,
+                    {
+                        "user_input": user_input,
+                        "previous_prefs": current_prefs_json
+                    }
+                )
+                new_preferences_dict = json.loads(response)
+                
+                metadata = {
+                    'llm_response_raw': response,
+                    'llm_preferences_parsed': new_preferences_dict,
+                    'success': True,
+                    'metrics': metrics  # Include metrics in metadata
+                }
             else:
                 # Fallback to direct chain call (returns JSON string)
                 current_prefs_json = json.dumps(self.current_preferences.to_dict(), indent=2)
@@ -364,14 +387,13 @@ class EnhancedPreferenceService:
                     previous_prefs=current_prefs_json
                 )
                 new_preferences_dict = json.loads(response)
+                metadata = {
+                    'llm_response_raw': response,
+                    'llm_preferences_parsed': new_preferences_dict,
+                    'success': True
+                }
+                
             llm_preferences = UserPreferences.from_dict(new_preferences_dict)
-            
-            metadata = {
-                'llm_response_raw': response,
-                'llm_preferences_parsed': new_preferences_dict,
-                'success': True
-            }
-            
             return llm_preferences, metadata
             
         except Exception as e:

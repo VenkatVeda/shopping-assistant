@@ -5,6 +5,24 @@ from dotenv import load_dotenv
 
 load_dotenv(".env")
 
+# LangSmith Configuration for proper evaluation and tracking
+LANGSMITH_CONFIG = {
+    "api_key": os.getenv("LANGCHAIN_API_KEY"),
+    "project": os.getenv("LANGCHAIN_PROJECT", "shopping-assistant"),
+    "tracing": os.getenv("LANGCHAIN_TRACING_V2", "true").lower() == "true",
+    "endpoint": os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+}
+
+# Set LangSmith environment variables for automatic tracing
+if LANGSMITH_CONFIG["api_key"]:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_PROJECT"] = LANGSMITH_CONFIG["project"]
+    os.environ["LANGCHAIN_API_KEY"] = LANGSMITH_CONFIG["api_key"]
+    os.environ["LANGCHAIN_ENDPOINT"] = LANGSMITH_CONFIG["endpoint"]
+    print(f"🔍 LangSmith tracing enabled for project: {LANGSMITH_CONFIG['project']}")
+else:
+    print("⚠️ LangSmith API key not found - tracing disabled")
+
 # Configure logging levels to reduce verbosity
 def configure_logging():
     """Configure logging to reduce LLM prompt verbosity"""
