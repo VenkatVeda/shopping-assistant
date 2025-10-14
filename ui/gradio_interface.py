@@ -46,16 +46,8 @@ class GradioInterface:
             result, metrics = session_data.workflow.process_message(user_input, session_id)
             session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             
-            # Add both LangSmith info AND local metrics to response
+            # Use clean response without footer (metrics now shown in dedicated display)
             response_text = result
-            
-            # Add LangSmith project info with metrics integrated
-            if self.session_manager.azure_service.is_langsmith_enabled():
-                if metrics and 'tokens' in metrics:
-                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard | ⚡ Tokens: {metrics['tokens']} | ⏱️ {metrics['latency']:.2f}s | 💰 ${metrics['cost']:.4f}</small>"
-                else:
-                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard</small>"
-                response_text += langsmith_info
             
             session_data.chat_history_ui.append(("assistant", response_text))
             
@@ -107,16 +99,8 @@ class GradioInterface:
             
             session_data.chat_history_ui.append(("user", user_input_with_timestamp))
             
-            # Add both local metrics AND LangSmith info to response
+            # Use clean response without footer (metrics now shown in dedicated display)
             response_text = result
-            
-            # Add LangSmith project info with metrics integrated
-            if self.session_manager.azure_service.is_langsmith_enabled():
-                if metrics and 'tokens' in metrics:
-                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard | ⚡ Tokens: {metrics['tokens']} | ⏱️ {metrics['latency']:.2f}s | 💰 ${metrics['cost']:.4f}</small>"
-                else:
-                    langsmith_info = f"\n\n<small style='color: #888; font-size: 0.75em; border-top: 1px solid #eee; padding-top: 5px;'>📊 Also tracked in LangSmith Dashboard</small>"
-                response_text += langsmith_info
             
             session_data.chat_history_ui.append(("assistant", response_text))
             
@@ -165,6 +149,26 @@ class GradioInterface:
         session_data.chat_history_ui = []
         session_data.preference_service.clear_preferences()
         session_data.workflow.clear_memory()
+    
+    def format_metrics_display(self, metrics: dict = None) -> str:
+        """Format metrics for the dedicated metrics display"""
+        if not metrics:
+            return """<div style='background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 10px; margin: 10px 0; font-size: 0.85em; color: #6c757d;'>
+                📊 <strong>Performance Metrics:</strong> Ready to track your queries
+            </div>"""
+        
+        tokens = metrics.get('tokens', 'N/A')
+        latency = metrics.get('latency', 0)
+        cost = metrics.get('cost', 0)
+        timestamp = metrics.get('timestamp', 'N/A')
+        
+        return f"""<div style='background-color: #e8f5e8; border: 1px solid #28a745; border-radius: 5px; padding: 10px; margin: 10px 0; font-size: 0.85em; color: #155724;'>
+            📊 <strong>Latest Query Metrics:</strong><br>
+            ⚡ <strong>Tokens:</strong> {tokens} | 
+            ⏱️ <strong>Response Time:</strong> {latency:.2f}s | 
+            💰 <strong>Cost:</strong> ${cost:.4f} | 
+            🕐 <strong>Time:</strong> {timestamp}
+        </div>"""
 
     def show_current_preferences(self, session_id: str = None) -> Tuple[str, str]:
         """Display current user preferences for a session"""
@@ -374,6 +378,14 @@ class GradioInterface:
                 label="Current Preferences"
             )
             
+            # Metrics display for better visibility on Render
+            metrics_display = gr.HTML(
+                """<div style='background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; padding: 10px; margin: 10px 0; font-size: 0.85em; color: #6c757d;'>
+                    📊 <strong>Performance Metrics:</strong> Ready to track your queries
+                </div>""",
+                label="Performance Metrics"
+            )
+            
             # Main chatbot interface with parallel processing info
             if self.enable_parallel:
                 placeholder_text = "Welcome! Multiple users can chat simultaneously. Each session is isolated."
@@ -408,7 +420,8 @@ class GradioInterface:
             async def handle_send_async(user_input, session_id):
                 """ASYNC handler for sending messages (enables parallel processing)"""
                 if not user_input.strip():
-                    return [], "", "**Current Preferences:** None", None, gr.update(visible=False)
+                    empty_metrics = self.format_metrics_display()
+                    return [], "", "**Current Preferences:** None", None, gr.update(visible=False), empty_metrics
                 
                 chat_history, new_session_id = await self.chat_interface_async(user_input, session_id)
                 prefs, _ = await self.show_current_preferences_async(new_session_id)
@@ -417,6 +430,9 @@ class GradioInterface:
                 metrics = getattr(self, '_last_metrics', None)
                 self.session_manager.log_user_query(new_session_id, user_input, "chat_interaction", metrics)
                 
+                # Format metrics display
+                metrics_html = self.format_metrics_display(metrics)
+                
                 # Check if show more button should be visible
                 show_more_visible = False
                 try:
@@ -426,12 +442,13 @@ class GradioInterface:
                 except Exception as e:
                     show_more_visible = False
                 
-                return chat_history, "", prefs, new_session_id, gr.update(visible=show_more_visible)
+                return chat_history, "", prefs, new_session_id, gr.update(visible=show_more_visible), metrics_html
 
             def handle_send(user_input, session_id):
                 """Handle sending a message (fallback sync handler)"""
                 if not user_input.strip():
-                    return [], "", "**Current Preferences:** None", None, gr.update(visible=False)
+                    empty_metrics = self.format_metrics_display()
+                    return [], "", "**Current Preferences:** None", None, gr.update(visible=False), empty_metrics
                 
                 chat_history, new_session_id = self.chat_interface(user_input, session_id)
                 prefs, _ = self.show_current_preferences(new_session_id)
@@ -440,6 +457,9 @@ class GradioInterface:
                 metrics = getattr(self, '_last_metrics', None)
                 self.session_manager.log_user_query(new_session_id, user_input, "chat_interaction", metrics)
                 
+                # Format metrics display
+                metrics_html = self.format_metrics_display(metrics)
+                
                 # Check if show more button should be visible
                 show_more_visible = False
                 try:
@@ -449,18 +469,23 @@ class GradioInterface:
                 except Exception as e:
                     show_more_visible = False
                 
-                return chat_history, "", prefs, new_session_id, gr.update(visible=show_more_visible)
+                return chat_history, "", prefs, new_session_id, gr.update(visible=show_more_visible), metrics_html
             
             async def handle_show_more_async(session_id):
                 """ASYNC handler for show more button"""
                 if not session_id:
-                    return [], "**Current Preferences:** None", None, gr.update(visible=False)
+                    empty_metrics = self.format_metrics_display()
+                    return [], "**Current Preferences:** None", None, gr.update(visible=False), empty_metrics
                 
                 # LOG SHOW MORE ACTION
                 self.session_manager.log_user_query(session_id, "show more", "show_more_action")
                 
                 chat_history, new_session_id = await self.chat_interface_async("show more", session_id)
                 prefs, _ = await self.show_current_preferences_async(new_session_id)
+                
+                # Format metrics display
+                metrics = getattr(self, '_last_metrics', None)
+                metrics_html = self.format_metrics_display(metrics)
                 
                 # Update button visibility based on remaining results
                 show_more_visible = False
@@ -471,12 +496,13 @@ class GradioInterface:
                 except Exception as e:
                     show_more_visible = False
                 
-                return chat_history, prefs, new_session_id, gr.update(visible=show_more_visible)
+                return chat_history, prefs, new_session_id, gr.update(visible=show_more_visible), metrics_html
 
             def handle_show_more(session_id):
                 """Handle show more button click (fallback sync handler)"""
                 if not session_id:
-                    return [], "**Current Preferences:** None", None, gr.update(visible=False)
+                    empty_metrics = self.format_metrics_display()
+                    return [], "**Current Preferences:** None", None, gr.update(visible=False), empty_metrics
                 
                 # LOG SHOW MORE ACTION
                 self.session_manager.log_user_query(session_id, "show more", "show_more_action")
@@ -485,6 +511,10 @@ class GradioInterface:
                 chat_history, new_session_id = self.chat_interface("show more", session_id)
                 prefs, _ = self.show_current_preferences(new_session_id)
                 
+                # Format metrics display
+                metrics = getattr(self, '_last_metrics', None)
+                metrics_html = self.format_metrics_display(metrics)
+                
                 # Update button visibility based on remaining results
                 show_more_visible = False
                 try:
@@ -494,29 +524,37 @@ class GradioInterface:
                 except Exception as e:
                     show_more_visible = False
                 
-                return chat_history, prefs, new_session_id, gr.update(visible=show_more_visible)
+                return chat_history, prefs, new_session_id, gr.update(visible=show_more_visible), metrics_html
             
             async def handle_clear_async(session_id):
                 """ASYNC handler for clearing chat"""
                 chat_result, new_session_id = await self.clear_chat_async(session_id)
                 prefs, _ = await self.show_current_preferences_async(new_session_id)
-                return chat_result, prefs, new_session_id, gr.update(visible=False)
+                empty_metrics = self.format_metrics_display()
+                return chat_result, prefs, new_session_id, gr.update(visible=False), empty_metrics
 
             def handle_clear(session_id):
                 """Handle clearing chat and preferences (fallback sync handler)"""
                 chat_result, new_session_id = self.clear_chat(session_id)
                 prefs, _ = self.show_current_preferences(new_session_id)
-                return chat_result, prefs, new_session_id, gr.update(visible=False)
+                empty_metrics = self.format_metrics_display()
+                return chat_result, prefs, new_session_id, gr.update(visible=False), empty_metrics
 
             async def handle_show_prefs_async(session_id):
                 """ASYNC handler for showing preferences"""
                 prefs, session_id = await self.show_current_preferences_async(session_id)
-                return prefs, session_id
+                # Keep existing metrics display when showing preferences
+                current_metrics = getattr(self, '_last_metrics', None)
+                metrics_html = self.format_metrics_display(current_metrics)
+                return prefs, session_id, metrics_html
 
             def handle_show_prefs(session_id):
                 """Handle showing preferences (fallback sync handler)"""
                 prefs, session_id = self.show_current_preferences(session_id)
-                return prefs, session_id
+                # Keep existing metrics display when showing preferences
+                current_metrics = getattr(self, '_last_metrics', None)
+                metrics_html = self.format_metrics_display(current_metrics)
+                return prefs, session_id, metrics_html
 
             # Bind event handlers (choose async or sync based on parallel mode)
             if self.enable_parallel:
@@ -524,62 +562,62 @@ class GradioInterface:
                 send_btn.click(
                     fn=handle_send_async, 
                     inputs=[msg, session_state], 
-                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 msg.submit(
                     fn=handle_send_async, 
                     inputs=[msg, session_state], 
-                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 show_more_btn.click(
                     fn=handle_show_more_async,
                     inputs=[session_state],
-                    outputs=[chatbot, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 clear_btn.click(
                     fn=handle_clear_async,
                     inputs=[session_state],
-                    outputs=[chatbot, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 prefs_btn.click(
                     fn=handle_show_prefs_async, 
                     inputs=[session_state],
-                    outputs=[preferences_display, session_state]
+                    outputs=[preferences_display, session_state, metrics_display]
                 )
             else:
                 # Use synchronous handlers (original behavior)
                 send_btn.click(
                     fn=handle_send, 
                     inputs=[msg, session_state], 
-                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 msg.submit(
                     fn=handle_send, 
                     inputs=[msg, session_state], 
-                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, msg, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 show_more_btn.click(
                     fn=handle_show_more,
                     inputs=[session_state],
-                    outputs=[chatbot, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 clear_btn.click(
                     fn=handle_clear,
                     inputs=[session_state],
-                    outputs=[chatbot, preferences_display, session_state, show_more_btn]
+                    outputs=[chatbot, preferences_display, session_state, show_more_btn, metrics_display]
                 )
                 
                 prefs_btn.click(
                     fn=handle_show_prefs, 
                     inputs=[session_state],
-                    outputs=[preferences_display, session_state]
+                    outputs=[preferences_display, session_state, metrics_display]
                 )
 
         return demo
