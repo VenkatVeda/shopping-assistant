@@ -1,0 +1,9 @@
+Summarize the following conversation history concisely, focusing on:
+1. User's shopping preferences (categories, colors, materials, price range)
+2. Products they were interested in
+3. Any refinements or changes to their search
+
+Conversation History:
+{context}
+
+Provide a brief summary (max 200 words):

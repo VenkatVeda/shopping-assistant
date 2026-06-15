@@ -1,0 +1,161 @@
+# Databricks Asset Bundle Configuration for Shopping Assistant
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: ecom-shopping-assistant
+
+# Include app configuration
+include:
+  - "*.yml"
+
+# Define resources (apps, jobs, workflows)
+resources:
+
+  apps:
+    shopping_assistant:
+      name: "${bundle.target}-ecom-shopping-assistant"
+      description: "Smart Shopping Assistant with RAG and Memory"
+      source_code_path: "."
+
+      resources:
+        - name: vector-search-index
+          uc_securable:
+            securable_full_name: "sandbox.venkat.bags_embeddings_index_01"
+            securable_type: "TABLE"
+            permission: "SELECT"
+        - name: sql-warehouse
+          sql_warehouse:
+            id: "8eba55b5eb828697"
+            permission: "CAN_USE"
+
+      # App configuration
+      config:
+        command: ["python", "app.py"]
+        env:
+          - name: FLASK_ENV
+            value: production
+          
+          # Flask Secret Key for sessions
+          - name: FLASK_SECRET_KEY
+            value: "sk_flask_9K2mP7qR5nX8wL4vB3jH6yT1gF0dC9aE2sN8uW5zI7tY4kM3xV6pQ1rJ0bG8hU"
+
+          - name: ENABLE_PERSONALIZATION
+            value: "true"
+          
+          # SQL Warehouse for persistent storage
+          - name: DATABRICKS_WAREHOUSE_ID
+            value: "8eba55b5eb828697"
+          
+          # Extended MCP Tools (Stock, SQL, Admin features)
+          - name: ENABLE_EXTENDED_MCP_TOOLS
+            value: "true"
+          
+          # JWT Configuration
+          - name: JWT_SECRET_KEY
+            value: "jwt_secret_7nQ4wE9rT2yU5iO8pA1sD6fG3hJ0kL5zX8cV4bN7mM2qW6eR1tY9uI3oP0aS4dF"
+          
+          # Google OAuth - configure these with your credentials
+          - name: GOOGLE_CLIENT_ID
+            value: "GOOGLE_CLIENT_ID_REMOVED"
+          - name: GOOGLE_CLIENT_SECRET
+            value: "GOOGLE_CLIENT_SECRET_REMOVED"
+          - name: APP_BASE_URL
+            value: "${var.app_base_url}"
+          
+          # Databricks Foundation Model Endpoints
+          - name: DATABRICKS_EMBEDDING_ENDPOINT
+            value: "databricks-bge-large-en"
+          - name: DATABRICKS_CHAT_ENDPOINT
+            value: "databricks-meta-llama-3-1-8b-instruct"
+          - name: DATABRICKS_INTENT_ENDPOINT
+            value: "databricks-meta-llama-3-1-8b-instruct"
+          
+          # Vector Store Configuration
+          # Set to "false" for Databricks Apps (MCP doesn't work in Apps runtime)
+          - name: USE_MCP_VECTOR_SEARCH
+            value: "false"
+          - name: VECTOR_STORE_TYPE
+            value: "databricks"
+
+          # Databricks Vector Search Configuration
+          - name: DATABRICKS_VECTOR_ENDPOINT
+            value: "bags-vector-search-endpoint"
+          - name: DATABRICKS_VECTOR_INDEX
+            value: "sandbox.venkat.bags_embeddings_index_01"
+          - name: DATABRICKS_SOURCE_TABLE
+            value: "sandbox.venkat.bags_embeddings"
+          - name: VECTOR_EMBEDDING_DIMENSION
+            value: "1024"
+          - name: VECTOR_PRIMARY_KEY
+            value: "product_id"
+          - name: VECTOR_EMBEDDING_COLUMN
+            value: "embedding"
+      
+variables:
+  workspace_path:
+    description: "Base workspace path for deployment"
+    default: "/Workspace/Users/venkat@xponent.ai"
+  
+  pinecone_index:
+    description: "Pinecone index name"
+    default: "bags-embeddings-databricks-bge-large-en"
+  
+  app_base_url:
+    description: "Base URL for OAuth callbacks"
+    default: "https://ecom-shop-assistant-prod-4206962778623078.18.azure.databricksapps.com"
+
+targets:
+  # Development Environment (Local Testing)
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-4206962778623078.18.azuredatabricks.net
+      root_path: "~/.bundle/${bundle.name}/dev"
+    
+    variables:
+      pinecone_index: "bags-embeddings-databricks-bge-large-en-dev"
+      app_base_url: "https://ecom-shop-assistant-dev-4206962778623078.18.azure.databricksapps.com"
+    
+    resources:
+      apps:
+        shopping_assistant:
+          name: "ecom-shop-assistant-dev"
+  
+  # Test/Staging Environment
+  test:
+    mode: development
+    workspace:
+      host: https://adb-4206962778623078.18.azuredatabricks.net
+      root_path: "~/.bundle/${bundle.name}/test"
+    
+    variables:
+      pinecone_index: "bags-embeddings-databricks-bge-large-en-test"
+      app_base_url: "https://ecom-shop-assistant-test-4206962778623078.18.azure.databricksapps.com"
+    
+    resources:
+      apps:
+        shopping_assistant:
+          name: "ecom-shop-assistant-test"
+          
+  # Production Environment
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-4206962778623078.18.azuredatabricks.net
+      root_path: "~/.bundle/${bundle.name}/prod"
+    
+    variables:
+      pinecone_index: "bags-embeddings-databricks-bge-large-en"
+      app_base_url: "https://ecom-shop-assistant-prod-4206962778623078.18.azure.databricksapps.com"
+    
+    resources:
+      apps:
+        shopping_assistant:
+          name: "ecom-shop-assistant-prod"
+    
+    # Production safeguards
+    run_as:
+      # Use a service principal in production (recommended)
+      # service_principal_name: "your-service-principal-id"
+      user_name: "venkat@xponent.ai"
