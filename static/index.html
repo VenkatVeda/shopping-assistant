@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Shopping Assistant</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="app-header">
+        <div class="header-content">
+            <img src="assets/xponent_logo_white_on_orange.jpg" alt="Logo" class="app-logo">
+            <div>
+                <h1 class="app-title">Smart Shopping Assistant</h1>
+                <p class="app-subtitle">Find the perfect bag with AI-powered search</p>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <div class="two-column-container">
+        <!-- Left Column - Chat -->
+        <div class="left-column">
+            <!-- Chat Messages -->
+            <div class="chat-container" id="chatContainer">
+                <div class="chat-placeholder">
+                    👋 Welcome! Ask me to find bags based on your preferences.
+                </div>
+            </div>
+
+            <!-- Input Section -->
+            <div class="input-container">
+                <div class="input-row">
+                    <input 
+                        type="text" 
+                        id="userInput" 
+                        placeholder="What kind of bag are you looking for?"
+                        autocomplete="off"
+                    >
+                    <button id="sendBtn" class="send-btn">🔍</button>
+                </div>
+                <button id="clearBtn" class="clear-btn">🗑️ Clear Chat</button>
+            </div>
+        </div>
+
+        <!-- Right Column - Products -->
+        <div class="right-column" id="resultsContainer">
+            <div class="empty-state">
+                <div class="empty-icon">🛍️</div>
+                <h3>Start searching</h3>
+                <p>Enter your preferences to find the perfect bag</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+# Vector Store Configuration for MCP
+# 
+# This file configures the vector store backend for the MCP server.
+# Switch between providers by changing VECTOR_STORE_TYPE.
+
+# Vector Store Type
+# Options: pinecone, databricks, chroma, qdrant, weaviate
+# Default: pinecone (external), databricks (in-house, lower latency)
+VECTOR_STORE_TYPE=databricks
+
+# Enable MCP mode (vs legacy direct connection)
+# Set to "false" to use direct adapter connection (recommended for Databricks)
+# Set to "true" to use MCP server (for local development)
+USE_MCP_VECTOR_SEARCH=false
+
+# ====================================
+# PINECONE Configuration (External)
+# ====================================
+PINECONE_API_KEY=${PINECONE_API_KEY}
+PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME}
+
+# ====================================
+# DATABRICKS Vector Search Configuration (In-House)
+# ====================================
+# Databricks Workspace URL (e.g., https://adb-xxxx.azuredatabricks.net)
+DATABRICKS_HOST=${DATABRICKS_HOST}
+
+# Databricks Personal Access Token
+DATABRICKS_TOKEN=${DATABRICKS_TOKEN}
+
+# Vector Search Endpoint Name (created in Databricks workspace)
+DATABRICKS_VECTOR_ENDPOINT=${DATABRICKS_VECTOR_ENDPOINT}
+
+# Vector Search Index Name (full 3-level namespace)
+# Format: catalog.schema.index_name
+# Example: sandbox.venkat.bags_embeddings_index_01
+DATABRICKS_VECTOR_INDEX=${DATABRICKS_VECTOR_INDEX}
+
+# Source Delta Table with embeddings
+DATABRICKS_SOURCE_TABLE=${DATABRICKS_SOURCE_TABLE}
+
+# Vector embedding configuration
+VECTOR_EMBEDDING_DIMENSION=${VECTOR_EMBEDDING_DIMENSION}
+VECTOR_PRIMARY_KEY=${VECTOR_PRIMARY_KEY}
+VECTOR_EMBEDDING_COLUMN=${VECTOR_EMBEDDING_COLUMN}
+
+# ====================================
+# Future Vector Store Configurations
+# ====================================
+
+# ChromaDB Configuration (future)
+# CHROMA_HOST=localhost
+# CHROMA_PORT=8000
+# CHROMA_COLLECTION=bags_embeddings
+
+# Qdrant Configuration (future)
+# QDRANT_URL=http://localhost:6333
+# QDRANT_COLLECTION=bags_embeddings

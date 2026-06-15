@@ -1,0 +1,62 @@
+# Environment-Specific Configuration Template
+# Copy and modify for each environment as needed
+
+# Development Environment Variables
+dev:
+  FLASK_ENV: development
+  FLASK_DEBUG: "1"
+  PINECONE_INDEX_NAME: bags-image-url-embeddings
+  DATABRICKS_EMBEDDING_ENDPOINT: databricks-bge-large-en
+  DATABRICKS_CHAT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  DATABRICKS_INTENT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  LOG_LEVEL: DEBUG
+  # Personalization Feature Flag (set to "true" to enable profile learning)
+  ENABLE_PERSONALIZATION: "true"  # Start disabled in dev, enable after testing
+  # SQL Warehouse for persistent storage
+  DATABRICKS_WAREHOUSE_ID: "8eba55b5eb828697"  # Add your SQL Warehouse ID here
+  ENABLE_EXTENDED_MCP_TOOLS: "true"
+
+# Test/Staging Environment Variables
+test:
+  FLASK_ENV: testing
+  FLASK_DEBUG: "0"
+  PINECONE_INDEX_NAME: bags-image-url-embeddings
+  DATABRICKS_EMBEDDING_ENDPOINT: databricks-bge-large-en
+  DATABRICKS_CHAT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  DATABRICKS_INTENT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  LOG_LEVEL: INFO
+  # Personalization Feature Flag
+  ENABLE_PERSONALIZATION: "true"  # Enable in test for validation
+  # SQL Warehouse for persistent storage
+  DATABRICKS_WAREHOUSE_ID: ""  # Add your SQL Warehouse ID here
+  ENABLE_EXTENDED_MCP_TOOLS: "true"
+
+# Production Environment Variables
+prod:
+  FLASK_ENV: production
+  FLASK_DEBUG: "0"
+  PINECONE_INDEX_NAME: bags-image-url-embeddings
+  DATABRICKS_EMBEDDING_ENDPOINT: databricks-bge-large-en
+  DATABRICKS_CHAT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  DATABRICKS_INTENT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  LOG_LEVEL: WARNING
+  # Personalization Feature Flag
+  ENABLE_PERSONALIZATION: "true"  # Enable in production after test validation
+  ENABLE_EXTENDED_MCP_TOOLS: "true"
+
+# Shared Configuration (applies to all environments)
+shared:
+  # Pinecone API Key should be stored in Databricks Secrets
+  # PINECONE_API_KEY: "{{secrets/prod-scope/pinecone-api-key}}"
+  
+  # Model endpoints (can be overridden per environment)
+  DATABRICKS_EMBEDDING_ENDPOINT: databricks-bge-large-en
+  
+  # App settings
+  MAX_MEMORY_SIZE: "1000"
+  SESSION_TIMEOUT: "3600"
+  
+  # Personalization settings
+  PERSONALIZATION_RATE_LIMIT: "10"  # Max requests per minute per user
+  PERSONALIZATION_TABLE: "sandbox.venkat.user_profiles"  # Delta table for profiles
+  ENABLE_EXTENDED_MCP_TOOLS: "true"  # Set to "false" for Databricks Apps (MCP doesn't work in Apps runtime)

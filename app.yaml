@@ -1,0 +1,67 @@
+command: ["python", "app.py"]
+env:
+
+  - name: FLASK_ENV
+    value: production
+  
+
+  # Flask Secret Key for sessions — set via Databricks secret scope in production
+  - name: FLASK_SECRET_KEY
+    value: "{{secrets/shopping-assistant/flask-secret-key}}"
+
+  - name: ENABLE_PERSONALIZATION
+    value: "true"
+  
+  # SQL Warehouse for persistent storage
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: "8eba55b5eb828697"
+  
+  # JWT Configuration
+  - name: JWT_SECRET_KEY
+    value: "{{secrets/shopping-assistant/jwt-secret-key}}"
+  
+  # Google OAuth — set via Databricks secret scope, never hardcode
+  - name: GOOGLE_CLIENT_ID
+    value: "{{secrets/shopping-assistant/google-client-id}}"
+  - name: GOOGLE_CLIENT_SECRET
+    value: "{{secrets/shopping-assistant/google-client-secret}}"
+  - name: APP_BASE_URL
+    value: "${var.app_base_url}"
+  
+  # Databricks Configuration - use app service principal credentials (set via resources in databricks.yml)
+  - name: DATABRICKS_HOST
+    value: "https://adb-4206962778623078.18.azuredatabricks.net"
+
+  # Databricks Foundation Model Endpoints
+  - name: DATABRICKS_EMBEDDING_ENDPOINT
+    value: "databricks-bge-large-en"  # Or your custom embedding endpoint
+  - name: DATABRICKS_CHAT_ENDPOINT
+    value: "databricks-meta-llama-3-1-8b-instruct"  # For memory summarization
+  - name: DATABRICKS_INTENT_ENDPOINT
+    value: "databricks-meta-llama-3-1-8b-instruct"  # For intent classification
+  
+  # MCP Vector Store Configuration
+  - name: USE_MCP_VECTOR_SEARCH
+    value: "false"  # Disabled for Databricks Apps - use DirectVectorClient instead
+  - name: VECTOR_STORE_TYPE
+    value: "databricks"
+
+  # Databricks Vector Search Configuration (In-House)
+  - name: DATABRICKS_VECTOR_ENDPOINT
+    value: "bags-vector-search-endpoint"
+  - name: DATABRICKS_VECTOR_INDEX
+    value: "sandbox.venkat.bags_embeddings_index_01"
+  - name: DATABRICKS_SOURCE_TABLE
+    value: "sandbox.venkat.bags_embeddings"
+  - name: VECTOR_EMBEDDING_DIMENSION
+    value: "1024"
+  - name: VECTOR_PRIMARY_KEY
+    value: "product_id"
+  - name: VECTOR_EMBEDDING_COLUMN
+    value: "embedding"
+  
+  # Pinecone Configuration (Backup - kept for easy switching)
+  # - name: PINECONE_API_KEY
+  #   value: "{{secrets/shopping-assistant/pinecone-api-key}}"
+  # - name: PINECONE_INDEX_NAME
+  #   value: "bags-image-url-embeddings"
