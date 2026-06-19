@@ -7,7 +7,7 @@ env:
 
   # Flask Secret Key for sessions — set via Databricks secret scope in production
   - name: FLASK_SECRET_KEY
-    value: "{{secrets/shopping-assistant/flask-secret-key}}"
+    value: "{{secrets/shopping_assistant/flask-secret-key}}"
 
   - name: ENABLE_PERSONALIZATION
     value: "true"
@@ -18,13 +18,9 @@ env:
   
   # JWT Configuration
   - name: JWT_SECRET_KEY
-    value: "{{secrets/shopping-assistant/jwt-secret-key}}"
+    value: "{{secrets/shopping_assistant/jwt-secret-key}}"
   
-  # Google OAuth — set via Databricks secret scope, never hardcode
-  - name: GOOGLE_CLIENT_ID
-    value: "{{secrets/shopping-assistant/google-client-id}}"
-  - name: GOOGLE_CLIENT_SECRET
-    value: "{{secrets/shopping-assistant/google-client-secret}}"
+
   - name: APP_BASE_URL
     value: "${var.app_base_url}"
   

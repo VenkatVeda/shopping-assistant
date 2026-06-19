@@ -22,8 +22,8 @@ ACCESS_TOKEN_EXPIRY = 15   # minutes
 REFRESH_TOKEN_EXPIRY = 7   # days
 
 # Google OAuth credentials
-GOOGLE_CLIENT_ID     = _get_config("GOOGLE_CLIENT_ID",     secret_key="google-client-id")
-GOOGLE_CLIENT_SECRET = _get_config("GOOGLE_CLIENT_SECRET", secret_key="google-client-secret")
+GOOGLE_CLIENT_ID     = _get_config("GOOGLE_CLIENT_ID",     scope="shopping_assistant", secret_key="google-client-id")
+GOOGLE_CLIENT_SECRET = _get_config("GOOGLE_CLIENT_SECRET", scope="shopping_assistant", secret_key="google-client-secret")
 
 GOOGLE_AUTH_URL     = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL    = "https://oauth2.googleapis.com/token"
