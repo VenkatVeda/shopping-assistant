@@ -22,6 +22,16 @@ resources:
           sql_warehouse:
             id: "8eba55b5eb828697"
             permission: "CAN_USE"
+        - name: flask-secret-key
+          secret:
+            scope: shopping_assistant
+            key: flask-secret-key
+            permission: "READ"
+        - name: jwt-secret-key
+          secret:
+            scope: shopping_assistant
+            key: jwt-secret-key
+            permission: "READ"
         - name: google-client-id
           secret:
             scope: shopping_assistant

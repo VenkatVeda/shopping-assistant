@@ -15,7 +15,7 @@ def _get_config(env_var, scope="shopping-assistant", secret_key=None):
     return val
 
 # JWT Configuration
-JWT_SECRET_KEY = _get_config("JWT_SECRET_KEY", secret_key="jwt-secret-key")
+JWT_SECRET_KEY = _get_config("JWT_SECRET_KEY", scope="shopping_assistant", secret_key="jwt-secret-key")
 JWT_ALGORITHM = "HS256"
 
 ACCESS_TOKEN_EXPIRY = 15   # minutes
