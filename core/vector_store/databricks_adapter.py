@@ -5,9 +5,11 @@ Implements VectorStoreInterface for Databricks Vector Search
 
 import os
 import sys
+import time
 from typing import List, Dict, Any, Optional
 from databricks.vector_search.client import VectorSearchClient
 from .base import VectorStoreInterface
+from ..audit_logger import log_tool_call
 
 
 class DatabricksAdapter(VectorStoreInterface):
@@ -95,20 +97,24 @@ class DatabricksAdapter(VectorStoreInterface):
         vector: List[float],
         top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
-        include_metadata: bool = True
+        include_metadata: bool = True,
+        audit_context: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search Databricks Vector Search index for similar vectors
-        
+
         Args:
             vector: Query embedding
             top_k: Number of results
             filters: Metadata filters (Databricks SQL-style filters)
             include_metadata: Include metadata in response
-            
+            audit_context: Optional dict with request_id, user_id, session_id for audit logging
+
         Returns:
             List of matches with standardized format
         """
+        _t0 = time.time()
+        _error = ""
         try:
             # Convert filters to Databricks SQL WHERE clause if provided
             filter_clause = None
@@ -247,12 +253,32 @@ class DatabricksAdapter(VectorStoreInterface):
                     })
             
             print(f"[DATABRICKS ADAPTER] Found {len(standardized_results)} results", file=sys.stderr)
+            log_tool_call(
+                tool_name="databricks_vector_search",
+                index_name=self.index_name,
+                filter_summary=str(filters)[:300] if filters else "",
+                top_k=top_k,
+                result_count=len(standardized_results),
+                latency_ms=(time.time() - _t0) * 1000,
+                **(audit_context or {}),
+            )
             return standardized_results
-            
+
         except Exception as e:
+            _error = str(e)
             print(f"[DATABRICKS ADAPTER] Search error: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc(file=sys.stderr)
+            log_tool_call(
+                tool_name="databricks_vector_search",
+                index_name=self.index_name,
+                filter_summary=str(filters)[:300] if filters else "",
+                top_k=top_k,
+                result_count=0,
+                latency_ms=(time.time() - _t0) * 1000,
+                error=_error,
+                **(audit_context or {}),
+            )
             return []
     
     def fetch_by_id(self, vector_id: str) -> Optional[Dict[str, Any]]:

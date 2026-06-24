@@ -4,9 +4,11 @@ Implements content safety, factual validation, and response quality checks
 """
 
 import re
+import time
 from typing import Dict, Any, List, Optional, Tuple
 from databricks_langchain import ChatDatabricks
 from .prompt_loader import load_prompt
+from .audit_logger import log_guardrail
 
 
 class OutputGuardrail:
@@ -30,11 +32,12 @@ class OutputGuardrail:
         response: str,
         query: str,
         products: List[dict],
-        preferences: Optional[Any] = None
+        preferences: Optional[Any] = None,
+        audit_context: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Main validation function - runs all guardrail checks
-        
+
         Returns:
             dict: {
                 "status": "pass" | "warning" | "fail",
@@ -43,34 +46,67 @@ class OutputGuardrail:
                 "corrections_made": bool
             }
         """
+        _t0 = time.time()
         print("\n[OUTPUT GUARDRAIL] Starting validation...")
-        
+
         # Quick checks first (no LLM needed)
         quick_check = self._quick_validation(response, products)
         if quick_check["status"] == "fail":
             print(f"[OUTPUT GUARDRAIL] Quick check failed: {quick_check['issues']}")
+            log_guardrail(
+                guardrail_type="output",
+                status=quick_check["status"],
+                issues=quick_check["issues"],
+                corrections_made=quick_check.get("corrections_made", False),
+                latency_ms=(time.time() - _t0) * 1000,
+                query_preview=query[:120],
+                **(audit_context or {}),
+            )
             return quick_check
-        
+
         # Content safety check
         safety_check = self._check_content_safety(response, query, len(products))
         if safety_check["status"] == "fail":
             print(f"[OUTPUT GUARDRAIL] Safety check failed: {safety_check['issues']}")
+            log_guardrail(
+                guardrail_type="output",
+                status=safety_check["status"],
+                issues=safety_check["issues"],
+                corrections_made=safety_check.get("corrections_made", False),
+                latency_ms=(time.time() - _t0) * 1000,
+                query_preview=query[:120],
+                **(audit_context or {}),
+            )
             return safety_check
-        
+
         # Factual accuracy check (only if products exist)
         if products and len(products) > 0:
             accuracy_check = self._check_factual_accuracy(response, query, products)
             if accuracy_check["status"] in ["fail", "warning"]:
                 print(f"[OUTPUT GUARDRAIL] Accuracy check {accuracy_check['status']}: {accuracy_check['issues']}")
+                log_guardrail(
+                    guardrail_type="output",
+                    status=accuracy_check["status"],
+                    issues=accuracy_check["issues"],
+                    corrections_made=accuracy_check.get("corrections_made", False),
+                    latency_ms=(time.time() - _t0) * 1000,
+                    query_preview=query[:120],
+                    **(audit_context or {}),
+                )
                 return accuracy_check
-        
+
         print("[OUTPUT GUARDRAIL] All checks passed ✓")
-        return {
-            "status": "pass",
-            "safe_response": response,
-            "issues": [],
-            "corrections_made": False
-        }
+        result = {"status": "pass", "safe_response": response, "issues": [], "corrections_made": False}
+        log_guardrail(
+            guardrail_type="output",
+            status="pass",
+            issues=[],
+            corrections_made=False,
+            latency_ms=(time.time() - _t0) * 1000,
+            query_preview=query[:120],
+            **(audit_context or {}),
+        )
+        return result
     
     def _quick_validation(self, response: str, products: List[dict]) -> Dict[str, Any]:
         """Fast validation checks without LLM"""
