@@ -1756,36 +1756,34 @@ class ShoppingAssistantWorkflow:
     def process_query(self, query: str, session_id: str, user_id: str = None) -> dict:
         """Main entry point for the app"""
         config = {"configurable": {"thread_id": session_id}}
-        
+
         # Retrieve previous state from the graph
         try:
             state_snapshot = self.app.get_state(config)
             if state_snapshot and state_snapshot.values:
-                # Merge previous state with new query
                 previous_state = state_snapshot.values
                 initial_state = {
                     "query": query,
-                    "user_id": user_id,  # Add user_id for personalization
+                    "user_id": user_id,
                     "history": previous_state.get("history", []),
                     "summary": previous_state.get("summary", ""),
                     "preferences": previous_state.get("preferences"),
-                    "previous_preferences": previous_state.get("preferences"),  # Track previous preferences for conflict detection
-                    "reranked_results": None,  # Always clear — cards must match current search only
-                    "results": None,  # Always clear — prevents stale results from previous turn
-                    "last_discussed_product": previous_state.get("last_discussed_product"),  # Preserve product interest
-                    "product_discussion_mode": previous_state.get("product_discussion_mode"),  # Preserve discussion mode
-                    "product_context": previous_state.get("product_context"),  # Preserve product context
-                    "selected_product_id": previous_state.get("selected_product_id"),  # Preserve selection
-                    "clarification_asked_last_turn": previous_state.get("needs_clarification", False),  # Track if we just asked clarification
-                    "new_preferences": previous_state.get("new_preferences") if previous_state.get("needs_clarification", False) else None,  # Preserve when user is responding to clarification
-                    "user_action_choice": None,  # Clear any previous choice
-                    "personalization_session": previous_state.get("personalization_session")  # Preserve personalization session
+                    "previous_preferences": previous_state.get("preferences"),
+                    "reranked_results": None,
+                    "results": None,
+                    "last_discussed_product": previous_state.get("last_discussed_product"),
+                    "product_discussion_mode": previous_state.get("product_discussion_mode"),
+                    "product_context": previous_state.get("product_context"),
+                    "selected_product_id": previous_state.get("selected_product_id"),
+                    "clarification_asked_last_turn": previous_state.get("needs_clarification", False),
+                    "new_preferences": previous_state.get("new_preferences") if previous_state.get("needs_clarification", False) else None,
+                    "user_action_choice": None,
+                    "personalization_session": previous_state.get("personalization_session"),
                 }
             else:
-                # New session
                 initial_state = {
                     "query": query,
-                    "user_id": user_id,  # Add user_id for personalization
+                    "user_id": user_id,
                     "history": [],
                     "summary": "",
                 }
@@ -1793,11 +1791,16 @@ class ShoppingAssistantWorkflow:
             print(f"[MEMORY] Warning: Could not retrieve previous state: {e}")
             initial_state = {
                 "query": query,
-                "user_id": user_id,  # Add user_id for personalization
+                "user_id": user_id,
                 "history": [],
                 "summary": "",
             }
-        
-        # Run graph - it will update and save state automatically
-        final_state = self.app.invoke(initial_state, config=config)
+
+        # Run graph inside a root MLflow trace so all node spans are nested under it
+        with RequestTrace(query=query, user_id=user_id, session_id=session_id) as rt:
+            final_state = self.app.invoke(initial_state, config=config)
+            rt.set_result(final_state)
+
+        # Attach trace_id to response so the UI / API can surface it for feedback
+        final_state["trace_id"] = rt.trace_id
         return final_state

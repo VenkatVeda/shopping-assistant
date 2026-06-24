@@ -2,13 +2,18 @@
 Observability layer for the Shopping Assistant.
 
 Wraps every LangGraph node with:
-  - MLflow span tracing (latency, inputs, outputs, errors)
+  - MLflow span tracing (latency, inputs, outputs, errors, status)
   - In-memory rolling metrics buffer (p50 / p95 / p99 per node)
   - Structured stderr logging with emoji tags for easy log grep
 
 Usage inside _build_graph:
     tracer = NodeTracer()
     workflow.add_node("intent_classifier", tracer.wrap("intent_classifier", self.intent_classifier_node))
+
+Usage in process_query:
+    with RequestTrace(query, user_id, session_id) as rt:
+        result = self.app.invoke(...)
+        rt.set_outputs(result)
 """
 
 import os
@@ -91,17 +96,11 @@ class MetricsStore:
     """
 
     def __init__(self):
-        # latency buffers keyed by node name (ms)
         self._latency: Dict[str, RollingBuffer] = defaultdict(lambda: RollingBuffer(500))
-        # counters keyed by (node_name, event)
         self._counters: Dict[str, int] = defaultdict(int)
-        # per-request summary list (last 200 requests)
         self._requests: List[Dict] = []
         self._request_maxlen = 200
-        # zero-result tracking
         self._search_result_counts: RollingBuffer = RollingBuffer(500)
-
-    # --- recording ---
 
     def record_latency(self, node: str, duration_ms: float):
         self._latency[node].append(duration_ms)
@@ -116,8 +115,6 @@ class MetricsStore:
 
     def record_search_count(self, count: int):
         self._search_result_counts.append(count)
-
-    # --- retrieval ---
 
     def latency_stats(self, node: str) -> Dict[str, float]:
         return self._latency[node].stats()
@@ -142,7 +139,6 @@ class MetricsStore:
         return stats
 
     def snapshot(self) -> Dict:
-        """Full snapshot for the /metrics endpoint."""
         return {
             "node_latency_ms": self.all_latency_stats(),
             "search_metrics": self.search_stats(),
@@ -151,65 +147,181 @@ class MetricsStore:
         }
 
 
-# Singleton — imported everywhere
 metrics_store = MetricsStore()
+
+
+# ---------------------------------------------------------------------------
+# Rich input/output extractors per node
+# ---------------------------------------------------------------------------
+
+def _prefs_summary(prefs) -> Dict:
+    """Serialise SearchPreferences into a loggable dict."""
+    if prefs is None:
+        return {}
+    return {
+        "colors":     getattr(prefs, "colors", []),
+        "categories": getattr(prefs, "categories", []),
+        "brands":     getattr(prefs, "brands", []),
+        "materials":  getattr(prefs, "materials", []),
+        "price_min":  getattr(prefs, "price_min", None),
+        "price_max":  getattr(prefs, "price_max", None),
+    }
+
+
+def _extract_inputs(node_name: str, state: Dict) -> Dict:
+    """Return a rich, safe, serialisable inputs dict for the given node."""
+    q = state.get("query", "")
+    prefs = state.get("preferences")
+
+    if node_name == "input_guardrail":
+        return {
+            "query":         q[:200],
+            "query_length":  len(q),
+            "history_turns": len(state.get("history", [])),
+            "has_summary":   bool(state.get("summary")),
+        }
+
+    if node_name == "intent_classifier":
+        return {
+            "query":              q[:200],
+            "has_prev_prefs":     prefs is not None,
+            "clarification_last": state.get("clarification_asked_last_turn", False),
+            "discussion_mode":    state.get("product_discussion_mode", False),
+        }
+
+    if node_name == "product_search":
+        p = _prefs_summary(prefs)
+        filter_count = sum(1 for v in [p.get("colors"), p.get("categories"),
+                                        p.get("brands"), p.get("materials")] if v)
+        return {
+            "query":            q[:200],
+            "filter_count":     filter_count,
+            "has_price_filter": bool(p.get("price_min") or p.get("price_max")),
+            "preferences":      p,
+        }
+
+    if node_name == "result_validator":
+        return {"result_count": len(state.get("results", []))}
+
+    if node_name == "constraint_relaxer":
+        return {
+            "relaxation_level": state.get("relaxation_level", 0),
+            "result_count":     len(state.get("results", [])),
+            "preferences":      _prefs_summary(prefs),
+        }
+
+    if node_name == "reranker":
+        return {"result_count": len(state.get("results", []))}
+
+    if node_name == "response_generator":
+        return {
+            "intent":        state.get("intent", ""),
+            "result_count":  len(state.get("reranked_results") or state.get("results", [])),
+            "discussion_mode": state.get("product_discussion_mode", False),
+        }
+
+    if node_name == "output_guardrail":
+        resp = state.get("generated_response", "") or ""
+        return {"response_length": len(resp)}
+
+    if node_name == "personalization":
+        return {
+            "user_id":    state.get("user_id"),
+            "has_history": bool(state.get("history")),
+        }
+
+    if node_name == "clarification":
+        return {
+            "result_count_status": state.get("result_count_status"),
+            "has_prev_prefs":      state.get("previous_preferences") is not None,
+        }
+
+    # fallback
+    return {"query": q[:200]}
+
+
+def _extract_outputs(node_name: str, result: Dict) -> Dict:
+    """Return a rich, safe, serialisable outputs dict for the given node."""
+    if not result:
+        return {}
+
+    if node_name == "input_guardrail":
+        return {
+            "passed":         not bool(result.get("error")),
+            "blocked_reason": result.get("error", "")[:120] if result.get("error") else None,
+        }
+
+    if node_name == "intent_classifier":
+        prefs = result.get("preferences")
+        return {
+            "intent":     result.get("intent", ""),
+            "preferences": _prefs_summary(prefs),
+        }
+
+    if node_name == "product_search":
+        results = result.get("results", [])
+        return {
+            "result_count": len(results),
+            "has_error":    bool(result.get("error")),
+        }
+
+    if node_name == "result_validator":
+        return {
+            "status":       result.get("result_count_status", ""),
+            "result_count": len(result.get("results", result.get("reranked_results", []) or [])),
+        }
+
+    if node_name == "constraint_relaxer":
+        return {
+            "new_relaxation_level": result.get("relaxation_level", 0),
+            "relaxation_message":   (result.get("relaxation_message") or "")[:120],
+        }
+
+    if node_name == "reranker":
+        return {"reranked_count": len(result.get("reranked_results", []))}
+
+    if node_name == "response_generator":
+        resp = result.get("generated_response", "") or ""
+        return {"response_length": len(resp)}
+
+    if node_name == "output_guardrail":
+        issues = result.get("guardrail_issues", []) or []
+        return {
+            "guardrail_status":  result.get("guardrail_status", ""),
+            "issues_count":      len(issues),
+            "issues":            issues[:5],
+            "was_corrected":     result.get("guardrail_status") in ("warning", "fail"),
+        }
+
+    if node_name == "personalization":
+        ctx = result.get("personalization_context") or ""
+        return {"context_length": len(ctx)}
+
+    if node_name == "clarification":
+        return {
+            "needs_clarification": result.get("needs_clarification", False),
+            "question_preview":    (result.get("clarification_question") or "")[:120],
+        }
+
+    return {}
 
 
 # ---------------------------------------------------------------------------
 # NodeTracer — wraps LangGraph node functions
 # ---------------------------------------------------------------------------
 
-def _safe_extract(state: Dict, keys: List[str]) -> Dict:
-    """Pull a handful of safe, serialisable values from state for span logging."""
-    out = {}
-    for k in keys:
-        val = state.get(k)
-        if val is None:
-            continue
-        if isinstance(val, (str, int, float, bool)):
-            out[k] = val
-        elif isinstance(val, list):
-            out[k] = len(val)          # log list length, not full content
-        elif isinstance(val, dict):
-            out[k] = list(val.keys())  # log keys only
-        else:
-            out[k] = type(val).__name__
-    return out
-
-
-# Keys we want to capture per node (safe subset — no PII)
-_NODE_INPUT_KEYS = {
-    "intent_classifier":    ["query", "intent", "history"],
-    "product_search":       ["query", "preferences"],
-    "result_validator":     ["results"],
-    "constraint_relaxer":   ["results", "relaxation_level"],
-    "reranker":             ["results", "reranked_results"],
-    "response_generator":   ["reranked_results", "generated_response"],
-    "input_guardrail":      ["query"],
-    "output_guardrail":     ["generated_response", "guardrail_status"],
-    "personalization":      ["user_id", "personalization_context"],
-    "clarification":        ["needs_clarification", "clarification_question"],
-    "product_selection":    ["product_discussion_mode", "selected_product_id"],
-    "product_detail_response": ["query", "product_discussion_mode"],
-}
-
-
 class NodeTracer:
     """
     Wraps node callables with MLflow span tracing + metrics recording.
 
-    In _build_graph, replace:
-        workflow.add_node("intent_classifier", self.intent_classifier_node)
-    with:
-        workflow.add_node("intent_classifier",
-                          self.tracer.wrap("intent_classifier", self.intent_classifier_node))
+    Every node gets a child span under the active RequestTrace root span.
+    Span inputs/outputs are structured per-node for meaningful observability.
     """
 
     def __init__(self):
         self._mlflow = _MLFLOW_AVAILABLE
 
     def wrap(self, node_name: str, fn: Callable) -> Callable:
-        input_keys = _NODE_INPUT_KEYS.get(node_name, ["query"])
 
         @functools.wraps(fn)
         def wrapped(state: Dict) -> Dict:
@@ -217,22 +329,26 @@ class NodeTracer:
             error_msg: Optional[str] = None
             result: Dict = {}
 
-            captured_inputs = _safe_extract(state, input_keys)
+            inputs = _extract_inputs(node_name, state)
 
             try:
                 if self._mlflow:
                     try:
                         import mlflow
+                        from mlflow.entities import SpanStatusCode
                         with mlflow.start_span(name=node_name) as span:
-                            span.set_inputs(captured_inputs)
+                            span.set_inputs(inputs)
                             result = fn(state)
-                            captured_outputs = _safe_extract(result, input_keys)
-                            span.set_outputs(captured_outputs)
                             elapsed = time.time() * 1000 - start_ms
-                            span.set_attribute("latency_ms", round(elapsed, 2))
+                            outputs = _extract_outputs(node_name, result)
+                            outputs["latency_ms"] = round(elapsed, 2)
+                            span.set_outputs(outputs)
                             span.set_attribute("node", node_name)
+                            span.set_status(SpanStatusCode.OK)
+                    except ImportError:
+                        result = fn(state)
                     except Exception as mlflow_err:
-                        logger.debug(f"[OBSERVABILITY] MLflow span error: {mlflow_err}")
+                        logger.debug(f"[OBSERVABILITY] span error in {node_name}: {mlflow_err}")
                         result = fn(state)
                 else:
                     result = fn(state)
@@ -240,7 +356,17 @@ class NodeTracer:
             except Exception as exc:
                 error_msg = str(exc)
                 metrics_store.increment(f"{node_name}.error")
-                logger.error(f"[{node_name.upper()}] ❌ Error: {exc}")
+                logger.error(f"[{node_name.upper()}] ❌ {exc}")
+                # mark span failed if still in context
+                if self._mlflow:
+                    try:
+                        import mlflow
+                        from mlflow.entities import SpanStatusCode
+                        active = mlflow.get_current_active_span()
+                        if active:
+                            active.set_status(SpanStatusCode.ERROR, str(exc))
+                    except Exception:
+                        pass
                 raise
 
             finally:
@@ -248,7 +374,6 @@ class NodeTracer:
                 metrics_store.record_latency(node_name, elapsed)
                 metrics_store.increment(f"{node_name}.calls")
 
-                # Node-specific counter updates
                 if node_name == "product_search" and result:
                     count = len(result.get("results", []))
                     metrics_store.record_search_count(count)
@@ -281,31 +406,69 @@ class NodeTracer:
 
 
 # ---------------------------------------------------------------------------
-# Request-level span — call once per /api/search request
+# RequestTrace — root MLflow trace per request
 # ---------------------------------------------------------------------------
 
 class RequestTrace:
-    """Context manager that wraps an entire request in an MLflow run + span."""
+    """
+    Context manager that opens a root MLflow trace for one complete request.
 
-    def __init__(self, query: str, user_id: Optional[str] = None):
-        self._query = query[:120]
-        self._user_id = user_id
+    Usage in process_query():
+        with RequestTrace(query, user_id, session_id) as rt:
+            final_state = self.app.invoke(initial_state, config=config)
+            rt.set_result(final_state)
+        trace_id = rt.trace_id
+    """
+
+    def __init__(self, query: str, user_id: Optional[str] = None, session_id: Optional[str] = None):
+        self._query = (query or "")[:200]
+        self._user_id = user_id or "anon"
+        self._session_id = session_id or ""
         self._start = time.time()
-        self._run = None
+        self._span = None
+        self._ctx = None
+        self.trace_id: Optional[str] = None
 
     def __enter__(self):
         metrics_store.increment("request.total")
         if _MLFLOW_AVAILABLE:
             try:
                 import mlflow
-                self._run = mlflow.start_run(
-                    run_name=f"search:{self._query[:40]}",
-                    tags={"source": "shopping_assistant", "user_id": self._user_id or "anon"},
+                self._ctx = mlflow.start_span(
+                    name="shopping_assistant_request",
                 )
-                self._run.__enter__()
+                self._span = self._ctx.__enter__()
+                self._span.set_inputs({
+                    "query":      self._query,
+                    "user_id":    self._user_id,
+                    "session_id": self._session_id,
+                })
+                self._span.set_attribute("source", "shopping_assistant")
             except Exception as exc:
-                logger.debug(f"[OBSERVABILITY] MLflow run start failed: {exc}")
+                logger.debug(f"[OBSERVABILITY] Root trace start failed: {exc}")
         return self
+
+    def set_result(self, final_state: Dict):
+        """Call after invoke() completes to attach outputs to the root span."""
+        if not self._span:
+            return
+        try:
+            elapsed_ms = round((time.time() - self._start) * 1000, 1)
+            resp = final_state.get("safe_response") or final_state.get("generated_response") or ""
+            results = final_state.get("reranked_results") or final_state.get("results") or []
+            self._span.set_outputs({
+                "intent":          final_state.get("intent", ""),
+                "result_count":    len(results),
+                "response_length": len(resp),
+                "guardrail_status": final_state.get("guardrail_status", ""),
+                "total_ms":        elapsed_ms,
+                "error":           final_state.get("error", ""),
+            })
+            self._span.set_attribute("total_ms", elapsed_ms)
+            self._span.set_attribute("intent", final_state.get("intent", ""))
+            self._span.set_attribute("result_count", len(results))
+        except Exception as exc:
+            logger.debug(f"[OBSERVABILITY] set_result failed: {exc}")
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         elapsed_ms = (time.time() - self._start) * 1000
@@ -315,21 +478,26 @@ class RequestTrace:
 
         summary = {
             "query_preview": self._query,
-            "duration_ms": round(elapsed_ms, 1),
-            "error": str(exc_val) if exc_val else None,
+            "duration_ms":   round(elapsed_ms, 1),
+            "error":         str(exc_val) if exc_val else None,
         }
         metrics_store.record_request(summary)
         metrics_store.record_latency("request_total", elapsed_ms)
 
-        if _MLFLOW_AVAILABLE and self._run:
+        if _MLFLOW_AVAILABLE and self._ctx:
             try:
                 import mlflow
-                mlflow.log_metric("request_duration_ms", elapsed_ms)
-                if exc_type:
-                    mlflow.set_tag("error", str(exc_val))
-                self._run.__exit__(exc_type, exc_val, exc_tb)
+                from mlflow.entities import SpanStatusCode
+                if self._span:
+                    status = SpanStatusCode.ERROR if exc_type else SpanStatusCode.OK
+                    self._span.set_status(status, str(exc_val) if exc_val else "")
+                    try:
+                        self.trace_id = str(self._span.request_id)
+                    except Exception:
+                        self.trace_id = None
+                self._ctx.__exit__(exc_type, exc_val, exc_tb)
             except Exception as exc:
-                logger.debug(f"[OBSERVABILITY] MLflow run end failed: {exc}")
+                logger.debug(f"[OBSERVABILITY] Root trace close failed: {exc}")
 
         logger.info(f"🔍 Request done in {elapsed_ms:.0f}ms — '{self._query[:60]}'")
-        return False  # do not suppress exceptions
+        return False
