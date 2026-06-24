@@ -16,6 +16,16 @@ from .performance import track_time
 import json
 
 
+def _mlflow_span(name: str, span_type: str = "LLM"):
+    """Return an mlflow.start_span() context manager, or a no-op if MLflow is unavailable."""
+    try:
+        import mlflow
+        return mlflow.start_span(name=name, span_type=span_type)
+    except Exception:
+        from contextlib import nullcontext
+        return nullcontext()
+
+
 class ResultValidator:
     """
     Node 6: Validates search results and determines routing
@@ -138,16 +148,23 @@ class Reranker:
                 )
                 
                 # Get LLM scores
-                # Use ChatDatabricks invoke method
                 with track_time("llm_call_reranking"):
                     messages = [
                         {"role": "system", "content": "You are a shopping assistant that ranks products based on relevance."},
                         {"role": "user", "content": rerank_prompt}
                     ]
-                    
-                    response = self.llm.invoke(messages)
-                    llm_response = response.content if hasattr(response, 'content') else str(response)
-                    llm_response = llm_response.strip()
+                    with _mlflow_span("reranker_llm_call") as span:
+                        try:
+                            span.set_inputs({"product_count": len(results), "query": query[:200]})
+                        except Exception:
+                            pass
+                        response = self.llm.invoke(messages)
+                        llm_response = response.content if hasattr(response, 'content') else str(response)
+                        llm_response = llm_response.strip()
+                        try:
+                            span.set_outputs({"response_length": len(llm_response)})
+                        except Exception:
+                            pass
                 print(f"[RERANKER] LLM Response (first 200 chars): {llm_response[:200]}...")
                 
                 # Parse scores
@@ -343,11 +360,22 @@ class ResponseGenerator:
                         },
                         {"role": "user", "content": prompt}
                     ]
-
-                    response = self.llm.invoke(messages)
-
-                    generated_text = response.content if hasattr(response, 'content') else str(response)
-                    generated_text = generated_text.strip()
+                    with _mlflow_span("response_generator_llm_call") as span:
+                        try:
+                            span.set_inputs({
+                                "query":         query[:200],
+                                "product_count": product_count,
+                                "intent":        "search_results",
+                            })
+                        except Exception:
+                            pass
+                        response = self.llm.invoke(messages)
+                        generated_text = response.content if hasattr(response, 'content') else str(response)
+                        generated_text = generated_text.strip()
+                        try:
+                            span.set_outputs({"response_length": len(generated_text)})
+                        except Exception:
+                            pass
 
                 # Post-process: strip template remnants
                 import re
@@ -449,8 +477,17 @@ class ResponseGenerator:
                 },
                 {"role": "user", "content": prompt},
             ]
-            response      = self.llm.invoke(messages)
-            response_text = (response.content if hasattr(response, "content") else str(response)).strip()
+            with _mlflow_span("chat_response_llm_call") as span:
+                try:
+                    span.set_inputs({"query": query[:200], "intent": "chat"})
+                except Exception:
+                    pass
+                response      = self.llm.invoke(messages)
+                response_text = (response.content if hasattr(response, "content") else str(response)).strip()
+                try:
+                    span.set_outputs({"response_length": len(response_text)})
+                except Exception:
+                    pass
 
             print(f"[RESPONSE GENERATOR] Chat response ({len(response_text)} chars)")
 
@@ -552,8 +589,22 @@ class ResponseGenerator:
                 },
                 {"role": "user", "content": prompt},
             ]
-            response      = self.llm.invoke(messages)
-            response_text = (response.content if hasattr(response, "content") else str(response)).strip()
+            with _mlflow_span("product_detail_llm_call") as span:
+                try:
+                    span.set_inputs({
+                        "query":        query[:200],
+                        "product_name": product_name,
+                        "product_id":   product_id,
+                        "intent":       "product_detail",
+                    })
+                except Exception:
+                    pass
+                response      = self.llm.invoke(messages)
+                response_text = (response.content if hasattr(response, "content") else str(response)).strip()
+                try:
+                    span.set_outputs({"response_length": len(response_text)})
+                except Exception:
+                    pass
 
             print(f"[RESPONSE GENERATOR] Product detail response ({len(response_text)} chars)")
 

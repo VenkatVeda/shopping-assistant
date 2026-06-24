@@ -18,6 +18,8 @@ Usage in process_query:
 
 import os
 import time
+import hashlib
+import json
 import logging
 import functools
 import statistics
@@ -148,6 +150,37 @@ class MetricsStore:
 
 
 metrics_store = MetricsStore()
+
+
+# ---------------------------------------------------------------------------
+# State hashing — stable fingerprint for DAG replay
+# ---------------------------------------------------------------------------
+
+def _state_hash(state: Dict) -> str:
+    """
+    Deterministic 8-char hex hash of the graph state dict.
+
+    Only scalar + list-length values are hashed (no full product blobs)
+    so the hash is fast and stable across Python runs.
+    """
+    try:
+        fingerprint = {
+            "query":               state.get("query", ""),
+            "intent":              state.get("intent", ""),
+            "history_len":         len(state.get("history", [])),
+            "results_len":         len(state.get("results") or []),
+            "reranked_len":        len(state.get("reranked_results") or []),
+            "relaxation_level":    state.get("relaxation_level", 0),
+            "result_count_status": state.get("result_count_status", ""),
+            "needs_clarification": state.get("needs_clarification", False),
+            "guardrail_status":    state.get("guardrail_status", ""),
+            "error":               state.get("error", ""),
+            "product_discussion":  state.get("product_discussion_mode", False),
+        }
+        raw = json.dumps(fingerprint, sort_keys=True, default=str)
+        return hashlib.md5(raw.encode()).hexdigest()[:8]
+    except Exception:
+        return "--------"
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +363,7 @@ class NodeTracer:
             result: Dict = {}
 
             inputs = _extract_inputs(node_name, state)
+            input_hash = _state_hash(state)
 
             try:
                 if self._mlflow:
@@ -337,13 +371,21 @@ class NodeTracer:
                         import mlflow
                         from mlflow.entities import SpanStatusCode
                         with mlflow.start_span(name=node_name) as span:
-                            span.set_inputs(inputs)
+                            # structured inputs + input state fingerprint
+                            span.set_inputs({**inputs, "input_state_hash": input_hash})
                             result = fn(state)
                             elapsed = time.time() * 1000 - start_ms
+                            # merge output state into result for hashing
+                            merged = {**state, **result}
+                            output_hash = _state_hash(merged)
                             outputs = _extract_outputs(node_name, result)
-                            outputs["latency_ms"] = round(elapsed, 2)
+                            outputs["latency_ms"]        = round(elapsed, 2)
+                            outputs["output_state_hash"] = output_hash
                             span.set_outputs(outputs)
-                            span.set_attribute("node", node_name)
+                            span.set_attribute("node",              node_name)
+                            span.set_attribute("input_state_hash",  input_hash)
+                            span.set_attribute("output_state_hash", output_hash)
+                            span.set_attribute("latency_ms",        round(elapsed, 2))
                             span.set_status(SpanStatusCode.OK)
                     except ImportError:
                         result = fn(state)
