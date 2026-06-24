@@ -33,6 +33,21 @@ from core.evals import EvalRunner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Enable MLflow LangChain autolog — automatically captures prompt_tokens,
+# completion_tokens, and total_tokens from every ChatDatabricks / LangChain
+# llm.invoke() call and attaches them to the active MLflow span.
+try:
+    import mlflow
+    mlflow.langchain.autolog(
+        log_input_examples=False,   # no PII in stored examples
+        log_model_signatures=False, # skip model artifact logging
+        log_models=False,           # skip model artifact logging
+        silent=True,                # suppress verbose autolog warnings
+    )
+    logger.info("[OBSERVABILITY] MLflow LangChain autolog enabled — token usage will be captured per LLM call")
+except Exception as _autolog_err:
+    logger.warning(f"[OBSERVABILITY] MLflow autolog not available: {_autolog_err}")
+
 # Initialize Flask app
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
