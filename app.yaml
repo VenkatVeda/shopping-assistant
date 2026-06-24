@@ -19,7 +19,12 @@ env:
   # JWT Configuration
   - name: JWT_SECRET_KEY
     value: "{{secrets/shopping_assistant/jwt-secret-key}}"
-  
+
+  # Google OAuth — set via Databricks secret scope, never hardcode
+  - name: GOOGLE_CLIENT_ID
+    value: "{{secrets/shopping_assistant/google-client-id}}"
+  - name: GOOGLE_CLIENT_SECRET
+    value: "{{secrets/shopping_assistant/google-client-secret}}"
 
   - name: APP_BASE_URL
     value: "${var.app_base_url}"

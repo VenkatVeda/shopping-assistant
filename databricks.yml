@@ -130,7 +130,7 @@ targets:
     resources:
       apps:
         shopping_assistant:
-          name: "ecom-shop-assistant-dev-swathi"
+          name: "ecom-shop-assistant-dev"
 
   # Test/Staging Environment
   test:
