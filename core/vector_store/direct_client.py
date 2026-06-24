@@ -35,25 +35,36 @@ class DirectVectorClient:
         self,
         vector: List[float],
         top_k: int = 10,
-        filters: Optional[Dict[str, Any]] = None
+        filters: Optional[Dict[str, Any]] = None,
+        audit_context: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search for similar vectors
-        
+
         Args:
             vector: Query embedding
             top_k: Number of results
             filters: Metadata filters
-            
+            audit_context: Optional dict with request_id, user_id, session_id
+
         Returns:
             List of matching products
         """
         try:
-            results = self.adapter.search(
-                vector=vector,
-                top_k=top_k,
-                filters=filters
-            )
+            # Pass audit_context only if the underlying adapter supports it
+            if hasattr(self.adapter, 'search') and audit_context is not None:
+                results = self.adapter.search(
+                    vector=vector,
+                    top_k=top_k,
+                    filters=filters,
+                    audit_context=audit_context,
+                )
+            else:
+                results = self.adapter.search(
+                    vector=vector,
+                    top_k=top_k,
+                    filters=filters,
+                )
             return results
         except Exception as e:
             print(f"[DIRECT CLIENT] Search error: {e}", file=sys.stderr)

@@ -559,8 +559,17 @@ class ShoppingAssistantWorkflow:
                     try:
                         print("[SEARCH] Calling vector_client.search()...", file=sys.stderr)
 
+                        _audit_ctx = {
+                            "request_id": state.get("trace_id", ""),
+                            "user_id": state.get("user_id", ""),
+                            "session_id": str(state.get("session_id", "")),
+                        }
+
                         def _raw_search(vec, k, f):
-                            return self.vector_client.search(vector=vec, top_k=k, filters=f)
+                            return self.vector_client.search(
+                                vector=vec, top_k=k, filters=f,
+                                audit_context=_audit_ctx,
+                            )
 
                         if filters:
                             search_results, cache_hit = self.semantic_cache.search(
@@ -1314,7 +1323,12 @@ class ShoppingAssistantWorkflow:
             response=generated_response,
             query=query,
             products=products_described,  # Only validate the products actually described
-            preferences=preferences
+            preferences=preferences,
+            audit_context={
+                "request_id": state.get("trace_id", ""),
+                "user_id": state.get("user_id", ""),
+                "session_id": str(state.get("session_id", "")),
+            },
         )
         
         print(f"[OUTPUT GUARDRAIL NODE] Status: {validation_result['status']}")
