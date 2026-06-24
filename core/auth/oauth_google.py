@@ -1,4 +1,4 @@
-import requests
+﻿import requests
 import os
 from urllib.parse import urlencode
 from flask import request as flask_request
@@ -6,20 +6,20 @@ from .config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_AUTH_URL, GOO
 
 def get_base_url():
     """Get base URL - dynamically detects from request context or environment"""
-    # Try to get from current request context (most reliable for Databricks Apps)
     try:
         if flask_request:
-            # Databricks Apps provides X-Forwarded-Host header
+            # Databricks Apps provides X-Forwarded-Host
             forwarded_host = flask_request.headers.get('X-Forwarded-Host')
             forwarded_proto = flask_request.headers.get('X-Forwarded-Proto', 'https')
             if forwarded_host:
                 return f"{forwarded_proto}://{forwarded_host}"
+            # Local dev: use the actual host:port the request arrived on
+            return f"{flask_request.scheme}://{flask_request.host}"
     except RuntimeError:
         # Outside request context
         pass
-    
-    # Fallback to environment variable
-    return os.environ.get('APP_BASE_URL', 'https://ecom-shop-assistant-prod-4206962778623078.18.azure.databricksapps.com')
+
+    return os.environ.get('APP_BASE_URL', 'https://ecom-shop-assistant-dev-4206962778623078.18.azure.databricksapps.com')
 
 def get_google_auth_url(state):
     base_url = get_base_url()

@@ -15,18 +15,33 @@ resources:
     shopping_assistant:
       name: "${bundle.target}-ecom-shopping-assistant"
       description: "Smart Shopping Assistant with RAG and Memory"
-      source_code_path: "."
+      source_code_path: ${workspace.root_path}/files
 
       resources:
-        - name: vector-search-index
-          uc_securable:
-            securable_full_name: "sandbox.venkat.bags_embeddings_index_01"
-            securable_type: "TABLE"
-            permission: "SELECT"
         - name: sql-warehouse
           sql_warehouse:
             id: "8eba55b5eb828697"
             permission: "CAN_USE"
+        - name: flask-secret-key
+          secret:
+            scope: shopping_assistant
+            key: flask-secret-key
+            permission: "READ"
+        - name: jwt-secret-key
+          secret:
+            scope: shopping_assistant
+            key: jwt-secret-key
+            permission: "READ"
+        - name: google-client-id
+          secret:
+            scope: shopping_assistant
+            key: google-client-id
+            permission: "READ"
+        - name: google-client-secret
+          secret:
+            scope: shopping_assistant
+            key: google-client-secret
+            permission: "READ"
 
       # App configuration
       config:
@@ -37,7 +52,7 @@ resources:
           
           # Flask Secret Key — set via Databricks secret scope
           - name: FLASK_SECRET_KEY
-            value: "{{secrets/shopping-assistant/flask-secret-key}}"
+            value: "{{secrets/shopping_assistant/flask-secret-key}}"
 
           - name: ENABLE_PERSONALIZATION
             value: "true"
@@ -52,13 +67,8 @@ resources:
           
           # JWT Configuration — set via Databricks secret scope
           - name: JWT_SECRET_KEY
-            value: "{{secrets/shopping-assistant/jwt-secret-key}}"
+            value: "{{secrets/shopping_assistant/jwt-secret-key}}"
 
-          # Google OAuth — set via Databricks secret scope, never hardcode
-          - name: GOOGLE_CLIENT_ID
-            value: "{{secrets/shopping-assistant/google-client-id}}"
-          - name: GOOGLE_CLIENT_SECRET
-            value: "{{secrets/shopping-assistant/google-client-secret}}"
           - name: APP_BASE_URL
             value: "${var.app_base_url}"
           
@@ -102,7 +112,7 @@ variables:
   
   app_base_url:
     description: "Base URL for OAuth callbacks"
-    default: "https://ecom-shop-assistant-prod-4206962778623078.18.azure.databricksapps.com"
+    default: "https://ecom-shop-assistant-dev-4206962778623078.18.azure.databricksapps.com"
 
 targets:
   # Development Environment (Local Testing)
@@ -121,18 +131,18 @@ targets:
       apps:
         shopping_assistant:
           name: "ecom-shop-assistant-dev"
-  
+
   # Test/Staging Environment
   test:
     mode: development
     workspace:
       host: https://adb-4206962778623078.18.azuredatabricks.net
       root_path: "~/.bundle/${bundle.name}/test"
-    
+
     variables:
       pinecone_index: "bags-embeddings-databricks-bge-large-en-test"
       app_base_url: "https://ecom-shop-assistant-test-4206962778623078.18.azure.databricksapps.com"
-    
+
     resources:
       apps:
         shopping_assistant:
@@ -153,6 +163,16 @@ targets:
       apps:
         shopping_assistant:
           name: "ecom-shop-assistant-prod"
+          resources:
+            - name: vector-search-index
+              uc_securable:
+                securable_full_name: "sandbox.venkat.bags_embeddings_index_01"
+                securable_type: "TABLE"
+                permission: "SELECT"
+            - name: sql-warehouse
+              sql_warehouse:
+                id: "8eba55b5eb828697"
+                permission: "CAN_USE"
     
     # Production safeguards
     run_as:
