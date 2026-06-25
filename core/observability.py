@@ -33,21 +33,34 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _init_mlflow():
-    """Attempt to configure MLflow. Returns True when tracing is available."""
+    """Check if MLflow is importable — no network calls at startup."""
+    try:
+        import mlflow  # noqa: F401
+        return True
+    except ImportError:
+        logger.warning("[OBSERVABILITY] MLflow not installed — tracing disabled")
+        return False
+
+
+_MLFLOW_AVAILABLE = _init_mlflow()
+_MLFLOW_EXPERIMENT_SET = False
+
+
+def _ensure_experiment():
+    """Set the MLflow experiment on first use (lazy, not at import time)."""
+    global _MLFLOW_EXPERIMENT_SET
+    if _MLFLOW_EXPERIMENT_SET or not _MLFLOW_AVAILABLE:
+        return
     try:
         import mlflow
         experiment_name = os.getenv(
             "MLFLOW_EXPERIMENT_NAME", "/Shared/shopping-assistant-observability"
         )
         mlflow.set_experiment(experiment_name)
-        logger.info(f"[OBSERVABILITY] MLflow experiment: {experiment_name}")
-        return True
+        logger.info("[OBSERVABILITY] MLflow experiment: %s", experiment_name)
+        _MLFLOW_EXPERIMENT_SET = True
     except Exception as exc:
-        logger.warning(f"[OBSERVABILITY] MLflow unavailable — tracing disabled ({exc})")
-        return False
-
-
-_MLFLOW_AVAILABLE = _init_mlflow()
+        logger.warning("[OBSERVABILITY] MLflow set_experiment failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +383,7 @@ class NodeTracer:
                     try:
                         import mlflow
                         from mlflow.entities import SpanStatusCode
+                        _ensure_experiment()
                         with mlflow.start_span(name=node_name) as span:
                             # structured inputs + input state fingerprint
                             span.set_inputs({**inputs, "input_state_hash": input_hash})
@@ -476,6 +490,7 @@ class RequestTrace:
         if _MLFLOW_AVAILABLE:
             try:
                 import mlflow
+                _ensure_experiment()
                 self._ctx = mlflow.start_span(
                     name="shopping_assistant_request",
                 )
