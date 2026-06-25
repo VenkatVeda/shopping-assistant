@@ -5,6 +5,7 @@ Architecture: Input Guardrail -> Intent Classifier -> Product Search -> RAG Enha
 
 import os
 import sys
+import time
 from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -296,7 +297,6 @@ class ShoppingAssistantWorkflow:
     
     def input_guardrail(self, state: GraphState):
         """Node 1: Input Guardrail with Safety & Relevance Checks + Memory Management"""
-        import time
         _t0 = time.time()
 
         with track_time("node_input_guardrail"):
@@ -304,9 +304,11 @@ class ShoppingAssistantWorkflow:
             history = state.get("history", [])
             summary = state.get("summary", "")
 
-            # Audit context — links this log row to the full request trace
+            # Audit context — links this log row to the request via session_id
+            # (trace_id is set only after graph completes, so we use session_id
+            # as the in-graph correlation key)
             _audit_ctx = {
-                "request_id": state.get("trace_id", ""),
+                "request_id": state.get("session_id", ""),
                 "user_id":    state.get("user_id", "anon") or "anon",
                 "session_id": str(state.get("session_id", "")),
             }
@@ -600,8 +602,17 @@ class ShoppingAssistantWorkflow:
                     try:
                         print("[SEARCH] Calling vector_client.search()...", file=sys.stderr)
 
+                        _audit_ctx = {
+                            "request_id": state.get("session_id", ""),
+                            "user_id": state.get("user_id", "") or "anon",
+                            "session_id": str(state.get("session_id", "")),
+                        }
+
                         def _raw_search(vec, k, f):
-                            return self.vector_client.search(vector=vec, top_k=k, filters=f)
+                            return self.vector_client.search(
+                                vector=vec, top_k=k, filters=f,
+                                audit_context=_audit_ctx,
+                            )
 
                         if filters:
                             search_results, cache_hit = self.semantic_cache.search(
@@ -1355,7 +1366,12 @@ class ShoppingAssistantWorkflow:
             response=generated_response,
             query=query,
             products=products_described,  # Only validate the products actually described
-            preferences=preferences
+            preferences=preferences,
+            audit_context={
+                "request_id": state.get("session_id", ""),
+                "user_id": state.get("user_id", "") or "anon",
+                "session_id": str(state.get("session_id", "")),
+            },
         )
         
         print(f"[OUTPUT GUARDRAIL NODE] Status: {validation_result['status']}")
