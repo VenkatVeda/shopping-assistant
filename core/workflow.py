@@ -5,6 +5,7 @@ Architecture: Input Guardrail -> Intent Classifier -> Product Search -> RAG Enha
 
 import os
 import sys
+import time
 from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -16,6 +17,7 @@ from .guardrails import OutputGuardrail
 from .prompt_loader import load_prompt
 from .performance import track_time, get_tracker
 from .observability import NodeTracer, RequestTrace, metrics_store
+from .audit_logger import log_guardrail
 from .evals import EvalRunner
 from .semantic_cache import build_cache
 
@@ -59,6 +61,7 @@ class GraphState(TypedDict):
     product_discussion_mode: Optional[bool]  # Whether in single-product discussion mode
     product_context: Optional[dict]  # Details of the selected product
     last_discussed_product: Optional[dict]  # Last product discussed (id, name, brand)
+    trace_id: Optional[str]  # Unique ID linking all audit logs for this request
 
 class ShoppingAssistantWorkflow:
     def __init__(self):
@@ -294,17 +297,37 @@ class ShoppingAssistantWorkflow:
     
     def input_guardrail(self, state: GraphState):
         """Node 1: Input Guardrail with Safety & Relevance Checks + Memory Management"""
+        _t0 = time.time()
+
         with track_time("node_input_guardrail"):
             query = state.get("query", "").strip()
             history = state.get("history", [])
             summary = state.get("summary", "")
-            
+
+            # Audit context — links this log row to the request via session_id
+            # (trace_id is set only after graph completes, so we use session_id
+            # as the in-graph correlation key)
+            _audit_ctx = {
+                "request_id": state.get("session_id", ""),
+                "user_id":    state.get("user_id", "anon") or "anon",
+                "session_id": str(state.get("session_id", "")),
+            }
+
             if not query:
                 return {"error": "Please ask me something! I'm here to help you find bags, wallets, and accessories.", 
                         "history": history, "summary": summary}
             
             # Length check
             if len(query) > 500:
+                log_guardrail(
+                    guardrail_type="input",
+                    status="fail",
+                    issues=["Query too long — exceeds 500 characters"],
+                    corrections_made=False,
+                    latency_ms=(time.time() - _t0) * 1000,
+                    query_preview=query[:120],
+                    **_audit_ctx,
+                )
                 return {"error": "That query is too long. Could you please rephrase it more concisely?", 
                         "history": history, "summary": summary}
             
@@ -321,6 +344,15 @@ class ShoppingAssistantWorkflow:
                 
                 if safety_result["status"] == "UNSAFE":
                     print(f"[INPUT GUARDRAIL] Blocked {safety_result['category']}: {safety_result['reason']}")
+                    log_guardrail(
+                        guardrail_type="input",
+                        status="fail",
+                        issues=[f"{safety_result['category']}: {safety_result['reason']}"],
+                        corrections_made=False,
+                        latency_ms=(time.time() - _t0) * 1000,
+                        query_preview=query[:120],
+                        **_audit_ctx,
+                    )
                     return {
                         "error": safety_result["decline_message"],
                         "history": history,
@@ -338,7 +370,18 @@ class ShoppingAssistantWorkflow:
             
             if memory_result["was_summarized"]:
                 print(f"[MEMORY] Summarization triggered - kept last {len(memory_result['history'])} turns")
-            
+
+            # Log pass — every pass must be logged as proof the check ran
+            log_guardrail(
+                guardrail_type="input",
+                status="pass",
+                issues=[],
+                corrections_made=False,
+                latency_ms=(time.time() - _t0) * 1000,
+                query_preview=query[:120],
+                **_audit_ctx,
+            )
+
             return {
                 "query": query,
                 "error": None,
@@ -560,8 +603,8 @@ class ShoppingAssistantWorkflow:
                         print("[SEARCH] Calling vector_client.search()...", file=sys.stderr)
 
                         _audit_ctx = {
-                            "request_id": state.get("trace_id", ""),
-                            "user_id": state.get("user_id", ""),
+                            "request_id": state.get("session_id", ""),
+                            "user_id": state.get("user_id", "") or "anon",
                             "session_id": str(state.get("session_id", "")),
                         }
 
@@ -1325,8 +1368,8 @@ class ShoppingAssistantWorkflow:
             products=products_described,  # Only validate the products actually described
             preferences=preferences,
             audit_context={
-                "request_id": state.get("trace_id", ""),
-                "user_id": state.get("user_id", ""),
+                "request_id": state.get("session_id", ""),
+                "user_id": state.get("user_id", "") or "anon",
                 "session_id": str(state.get("session_id", "")),
             },
         )
@@ -1770,34 +1813,38 @@ class ShoppingAssistantWorkflow:
     def process_query(self, query: str, session_id: str, user_id: str = None) -> dict:
         """Main entry point for the app"""
         config = {"configurable": {"thread_id": session_id}}
-
+        
         # Retrieve previous state from the graph
         try:
             state_snapshot = self.app.get_state(config)
             if state_snapshot and state_snapshot.values:
+                # Merge previous state with new query
                 previous_state = state_snapshot.values
                 initial_state = {
                     "query": query,
-                    "user_id": user_id,
+                    "user_id": user_id,  # Add user_id for personalization
+                    "trace_id": None,  # Will be backfilled after MLflow trace opens
                     "history": previous_state.get("history", []),
                     "summary": previous_state.get("summary", ""),
                     "preferences": previous_state.get("preferences"),
-                    "previous_preferences": previous_state.get("preferences"),
-                    "reranked_results": None,
-                    "results": None,
-                    "last_discussed_product": previous_state.get("last_discussed_product"),
-                    "product_discussion_mode": previous_state.get("product_discussion_mode"),
-                    "product_context": previous_state.get("product_context"),
-                    "selected_product_id": previous_state.get("selected_product_id"),
-                    "clarification_asked_last_turn": previous_state.get("needs_clarification", False),
-                    "new_preferences": previous_state.get("new_preferences") if previous_state.get("needs_clarification", False) else None,
-                    "user_action_choice": None,
-                    "personalization_session": previous_state.get("personalization_session"),
+                    "previous_preferences": previous_state.get("preferences"),  # Track previous preferences for conflict detection
+                    "reranked_results": None,  # Always clear — cards must match current search only
+                    "results": None,  # Always clear — prevents stale results from previous turn
+                    "last_discussed_product": previous_state.get("last_discussed_product"),  # Preserve product interest
+                    "product_discussion_mode": previous_state.get("product_discussion_mode"),  # Preserve discussion mode
+                    "product_context": previous_state.get("product_context"),  # Preserve product context
+                    "selected_product_id": previous_state.get("selected_product_id"),  # Preserve selection
+                    "clarification_asked_last_turn": previous_state.get("needs_clarification", False),  # Track if we just asked clarification
+                    "new_preferences": previous_state.get("new_preferences") if previous_state.get("needs_clarification", False) else None,  # Preserve when user is responding to clarification
+                    "user_action_choice": None,  # Clear any previous choice
+                    "personalization_session": previous_state.get("personalization_session")  # Preserve personalization session
                 }
             else:
+                # New session
                 initial_state = {
                     "query": query,
-                    "user_id": user_id,
+                    "user_id": user_id,  # Add user_id for personalization
+                    "trace_id": None,  # Will be backfilled after MLflow trace opens
                     "history": [],
                     "summary": "",
                 }
@@ -1805,16 +1852,18 @@ class ShoppingAssistantWorkflow:
             print(f"[MEMORY] Warning: Could not retrieve previous state: {e}")
             initial_state = {
                 "query": query,
-                "user_id": user_id,
+                "user_id": user_id,  # Add user_id for personalization
+                "trace_id": None,  # Will be backfilled after MLflow trace opens
                 "history": [],
                 "summary": "",
             }
-
+        
         # Run graph inside a root MLflow trace so all node spans are nested under it
         with RequestTrace(query=query, user_id=user_id, session_id=session_id) as rt:
             final_state = self.app.invoke(initial_state, config=config)
             rt.set_result(final_state)
 
         # Attach trace_id to response so the UI / API can surface it for feedback
-        final_state["trace_id"] = rt.trace_id
+        trace_id = rt.trace_id
+        final_state["trace_id"] = trace_id
         return final_state
