@@ -200,6 +200,17 @@ class ShoppingAssistantWorkflow:
         self.semantic_cache = build_cache(workspace_client=_wc, warehouse_id=_wh)
         print(f"✓ Semantic Cache: {self.semantic_cache.stats().get('backend', 'unknown')} backend")
 
+        # ── Audit Trail ───────────────────────────────────────────────────────
+        try:
+            from audit_wrapper import AuditWrapper
+            self.audit_wrapper = AuditWrapper(
+                catalog = os.getenv("AUDIT_CATALOG", "shopping_assistant"),
+            )
+        except Exception as _e:
+            print(f"[AUDIT] AuditWrapper init failed (non-blocking): {_e}")
+            self.audit_wrapper = None
+        # ─────────────────────────────────────────────────────────────────────
+
         # Build Graph
         self.app = self._build_graph()
         print("✓ Workflow Ready with Pinecone + RAG Enhancement!")
@@ -1866,4 +1877,63 @@ class ShoppingAssistantWorkflow:
         # Attach trace_id to response so the UI / API can surface it for feedback
         trace_id = rt.trace_id
         final_state["trace_id"] = trace_id
+
+        # ── LOG TO AUDIT TRAIL ────────────────────────────────────────────
+        if self.audit_wrapper and user_id:
+            try:
+                _output = (
+                    final_state.get("safe_response") or
+                    final_state.get("generated_response") or
+                    final_state.get("clarification_question") or
+                    final_state.get("error") or
+                    "no_response"
+                )
+                _status = "success"
+                if final_state.get("error"):
+                    _status = "error"
+                elif final_state.get("guardrail_status") == "fail":
+                    _status = "guardrail_blocked"
+
+                _user_country = ""
+                try:
+                    if hasattr(self, 'profile_storage') and user_id:
+                        _profile = self.profile_storage.load_profile(user_id)
+                        if _profile and hasattr(_profile, 'country'):
+                            _user_country = _profile.country or ""
+                except Exception:
+                    pass
+                if not _user_country:
+                    _user_country = os.getenv("DEFAULT_USER_COUNTRY", "")
+
+                _result = self.audit_wrapper.log_interaction(
+                    user_email            = user_id,
+                    user_input            = query,
+                    model_output          = str(_output),
+                    model_name            = os.getenv(
+                        "DATABRICKS_CHAT_ENDPOINT",
+                        "databricks-meta-llama-3-1-8b-instruct"
+                    ),
+                    status                = _status,
+                    session_id            = session_id,
+                    user_country          = _user_country,
+                    system_prompt_version = "v1.0",
+                    mlflow_trace_id       = trace_id,
+                    final_state           = final_state,
+                )
+
+                if final_state.get("guardrail_status"):
+                    self.audit_wrapper.log_guardrail(
+                        trace_id        = _result.get("trace_id", ""),
+                        policy_name     = "output_content_safety",
+                        score           = 1.0 if final_state.get("guardrail_status") == "pass" else 0.0,
+                        result          = final_state.get("guardrail_status", "pass"),
+                        triggered_block = final_state.get("guardrail_status") == "fail",
+                        subject_ref     = _result.get("subject_ref"),
+                    )
+
+            except Exception as _e:
+                print(f"[AUDIT] Logging failed (non-blocking): {_e}")
+        # ─────────────────────────────────────────────────────────────────
+
+      
         return final_state
