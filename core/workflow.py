@@ -200,6 +200,17 @@ class ShoppingAssistantWorkflow:
         self.semantic_cache = build_cache(workspace_client=_wc, warehouse_id=_wh)
         print(f"✓ Semantic Cache: {self.semantic_cache.stats().get('backend', 'unknown')} backend")
 
+        # ── Audit Trail ───────────────────────────────────────────────────────
+        try:
+            from audit_wrapper import AuditWrapper
+            self.audit_wrapper = AuditWrapper(
+                catalog = os.getenv("AUDIT_CATALOG", "shopping_assistant"),
+            )
+        except Exception as _e:
+            print(f"[AUDIT] AuditWrapper init failed (non-blocking): {_e}")
+            self.audit_wrapper = None
+        # ─────────────────────────────────────────────────────────────────────
+
         # Build Graph
         self.app = self._build_graph()
         print("✓ Workflow Ready with Pinecone + RAG Enhancement!")
@@ -1812,19 +1823,6 @@ class ShoppingAssistantWorkflow:
 
     def process_query(self, query: str, session_id: str, user_id: str = None) -> dict:
         """Main entry point for the app"""
-        # ── AUDIT TRAIL INTEGRATION ───────────────────────────────────────
-        # user_id is always an email from Google OAuth (confirmed in app.py)
-        from audit_wrapper import AuditWrapper
-        _wrapper     = None
-        _audit_email = user_id or "anonymous@myre.internal"
-        try:
-            _wrapper = AuditWrapper(
-                app_id  = "myre_app",
-                catalog = "shopping_assistant"
-            )
-        except Exception as _e:
-            print(f"[AUDIT] Wrapper init failed (non-blocking): {_e}")
-        # ─────────────────────────────────────────────────────────────────
         config = {"configurable": {"thread_id": session_id}}
         
         # Retrieve previous state from the graph
@@ -1879,8 +1877,9 @@ class ShoppingAssistantWorkflow:
         # Attach trace_id to response so the UI / API can surface it for feedback
         trace_id = rt.trace_id
         final_state["trace_id"] = trace_id
+
         # ── LOG TO AUDIT TRAIL ────────────────────────────────────────────
-        if _wrapper:
+        if self.audit_wrapper and user_id:
             try:
                 _output = (
                     final_state.get("safe_response") or
@@ -1895,8 +1894,19 @@ class ShoppingAssistantWorkflow:
                 elif final_state.get("guardrail_status") == "fail":
                     _status = "guardrail_blocked"
 
-                _result = _wrapper.log_interaction(
-                    user_email            = _audit_email,
+                _user_country = ""
+                try:
+                    if hasattr(self, 'profile_storage') and user_id:
+                        _profile = self.profile_storage.load_profile(user_id)
+                        if _profile and hasattr(_profile, 'country'):
+                            _user_country = _profile.country or ""
+                except Exception:
+                    pass
+                if not _user_country:
+                    _user_country = os.getenv("DEFAULT_USER_COUNTRY", "")
+
+                _result = self.audit_wrapper.log_interaction(
+                    user_email            = user_id,
                     user_input            = query,
                     model_output          = str(_output),
                     model_name            = os.getenv(
@@ -1905,28 +1915,21 @@ class ShoppingAssistantWorkflow:
                     ),
                     status                = _status,
                     session_id            = session_id,
-                    user_country          = "IN",
+                    user_country          = _user_country,
                     system_prompt_version = "v1.0",
-                    app_metadata          = {
-                        "intent":           final_state.get("intent"),
-                        "result_count":     len(final_state.get("reranked_results") or []),
-                        "guardrail_status": final_state.get("guardrail_status"),
-                        "mlflow_trace_id":  trace_id,
-                    }
+                    mlflow_trace_id       = trace_id,
+                    final_state           = final_state,
                 )
-                _audit_trace_id = _result.get("trace_id")
-                _subject_ref    = _result.get("subject_ref")
 
                 if final_state.get("guardrail_status"):
-                    _wrapper.log_guardrail(
-                        trace_id        = _audit_trace_id,
+                    self.audit_wrapper.log_guardrail(
+                        trace_id        = _result.get("trace_id", ""),
                         policy_name     = "output_content_safety",
                         score           = 1.0 if final_state.get("guardrail_status") == "pass" else 0.0,
                         result          = final_state.get("guardrail_status", "pass"),
                         triggered_block = final_state.get("guardrail_status") == "fail",
-                        subject_ref     = _subject_ref,
+                        subject_ref     = _result.get("subject_ref"),
                     )
-                print(f"[AUDIT] Logged: audit_trace={_audit_trace_id} mlflow_trace={trace_id}")
 
             except Exception as _e:
                 print(f"[AUDIT] Logging failed (non-blocking): {_e}")

@@ -1,103 +1,74 @@
-# Databricks notebook source
-# MAGIC %md
-# MAGIC # Component 4 · The Logging Wrapper
-# MAGIC # AI Audit Trail Platform — The Engine
-# MAGIC
-# MAGIC **Component:** 4 of 7 | **Type:** Core library notebook | **Run:** Once to define, then imported by apps | **Requires:** Components 1, 2, 3 complete
-# MAGIC
-# MAGIC ---
-# MAGIC
-# MAGIC ## What this notebook builds
-# MAGIC
-# MAGIC The `AuditWrapper` class — the single thing any app imports to become fully audit-ready.
-# MAGIC
-# MAGIC **What it does automatically on every AI call:**
-# MAGIC 1. Validates `app_id` is registered and active in `app_registry`
-# MAGIC 2. Retrieves HMAC key from secret scope
-# MAGIC 3. Computes `subject_id` + `subject_ref` from user email (two-step pseudonymisation)
-# MAGIC 4. Generates `trace_id` (UUID4) and manages `session_id`
-# MAGIC 5. Determines `regulation_at_time` from user country
-# MAGIC 6. Redacts PII from input text and output text before any write
-# MAGIC 7. Writes all 6 capture categories to correct tables
-# MAGIC 8. Captures node executions for pipeline steps
-# MAGIC 9. Logs its own failures to `logging_failures` — never fails silently
-# MAGIC 10. Always returns the AI response regardless of logging outcome
-# MAGIC
-# MAGIC **App team experience — 3 lines:**
-# MAGIC ```python
-# MAGIC wrapper = AuditWrapper(app_id="shopping_assistant_app", catalog="shopping_assistant")
-# MAGIC response = wrapper.log_interaction(user_email=..., user_input=..., model_output=..., ...)
-# MAGIC ```
-# MAGIC
-# MAGIC ---
-# MAGIC
-# MAGIC ## Notebook structure
-# MAGIC - **Step 1** — imports and config
-# MAGIC - **Step 2** — PII redactor (regex + placeholder replacement)
-# MAGIC - **Step 3** — jurisdiction mapper (country → regulation)
-# MAGIC - **Step 4** — `AuditWrapper` class (the full wrapper)
-# MAGIC - **Step 5** — save wrapper as a reusable Python file in DBFS
-# MAGIC - **Step 6** — end-to-end smoke test (simulated AI call)
-# MAGIC - **Step 7** — verification
+"""
+AuditWrapper — writes AI interaction audit events to Delta tables
+in the shopping_assistant catalog on Databricks.
 
-# COMMAND ----------
+Follows the same pattern as core/audit_logger.py:
+  - pure Python, no PySpark, no spark globals
+  - databricks.sdk WorkspaceClient + statement_execution for all writes
+  - background threads (fire-and-forget) — zero latency impact on requests
+  - instantiate once in ShoppingAssistantWorkflow.__init__(), not per request
 
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 1 — Imports and config
+Usage in workflow.py:
+    # in __init__:
+    from audit_wrapper import AuditWrapper
+    self.audit_wrapper = AuditWrapper(
+        catalog = os.getenv("AUDIT_CATALOG", "shopping_assistant"),
+    )
 
-# COMMAND ----------
+    # in process_query, after final_state["trace_id"] = trace_id:
+    self.audit_wrapper.log_interaction(
+        user_email      = user_id,
+        user_input      = query,
+        model_output    = final_state.get("safe_response") or "",
+        model_name      = os.getenv("DATABRICKS_CHAT_ENDPOINT", ""),
+        status          = "success",
+        session_id      = session_id,
+        user_country    = _user_country,
+        mlflow_trace_id = trace_id,
+        final_state     = final_state,
+    )
 
-# ============================================================
-# STEP 1 — IMPORTS AND CONFIG
-# ============================================================
-import uuid, json, hmac as hmac_lib, hashlib, re, base64
+Required .env variables:
+    AUDIT_APP_ID=myre_app
+    AUDIT_CATALOG=shopping_assistant
+    AUDIT_SECRET_SCOPE=audit_trail_secrets
+    DATABRICKS_SQL_WAREHOUSE_ID=...
+    DATABRICKS_HOST=https://...
+    DATABRICKS_TOKEN=dapi...
+"""
+
+import os
+import re
+import json
+import hmac as hmac_lib
+import hashlib
+import logging
+import threading
+import uuid
 from datetime import datetime, timezone
-from pyspark.sql.types import (
-    StructType, StructField, StringType, TimestampType,
-    BooleanType, DoubleType, LongType, IntegerType
-)
-from databricks.sdk import WorkspaceClient
+from typing import Optional
 
-BOOTSTRAP_CATALOG = "shopping_assistant"
+logger = logging.getLogger(__name__)
 
-cfg_rows = spark.sql(f"""
-    SELECT config_key, config_value
-    FROM {BOOTSTRAP_CATALOG}.raw_logs.bundle_config
-""").collect()
-CONFIG = {r["config_key"]: r["config_value"] for r in cfg_rows}
+# ── jurisdiction mapper ────────────────────────────────────────────────────
+_EU_COUNTRIES = {
+    "AT","BE","BG","CY","CZ","DE","DK","EE","ES","FI",
+    "FR","GR","HR","HU","IE","IT","LT","LU","LV","MT",
+    "NL","PL","PT","RO","SE","SI","SK","GB"
+}
 
-CATALOG      = CONFIG["catalog_name"]
-RAW          = CONFIG["schema_raw"]
-CURATED      = CONFIG["schema_curated"]
-REPORT       = CONFIG["schema_reporting"]
-SECRET_SCOPE = CONFIG["secret_scope"]
-SCHEMA_VER   = CONFIG["schema_version"]
+def _determine_regulation(country: str = "", state: str = "", sector: str = "") -> str:
+    country = (country or "").upper().strip()
+    state   = (state   or "").upper().strip()
+    sector  = (sector  or "").lower().strip()
+    if sector == "health":                return "HIPAA"
+    if country in _EU_COUNTRIES:          return "GDPR"
+    if country == "US" and state == "CA": return "CCPA"
+    if country == "IN":                   return "DPDP"
+    return "INTERNAL_POLICY"
 
-def tbl(schema, name): return f"{CATALOG}.{schema}.{name}"
-
-spark.sql(f"USE CATALOG {CATALOG}")
-print(f"Config loaded. Catalog: {CATALOG}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 2 — PII Redactor
-# MAGIC
-# MAGIC Scans free text before it touches any table. Two passes:
-# MAGIC - **Pass 1 — regex patterns:** emails, phones, Aadhaar, PAN, credit cards — anything with a fixed format. Fast and deterministic.
-# MAGIC - **Pass 2 — name patterns:** simple heuristic for capitalised words after greeting words (Hi, I am, My name is). Not perfect — that's why vacuum and encryption are backup layers.
-# MAGIC
-# MAGIC Returns the sanitised text and a list of PII types found.
-
-# COMMAND ----------
-
-# ============================================================
-# STEP 2 — PII REDACTOR
-# ============================================================
-
-PII_PATTERNS = [
+# ── PII redactor ───────────────────────────────────────────────────────────
+_PII_PATTERNS = [
     ("EMAIL",   r'\b[\w\.-]+@[\w\.-]+\.\w{2,}\b'),
     ("PHONE",   r'\b(\+?\d{1,3}[\s-]?)?\d{10}\b'),
     ("AADHAAR", r'\b\d{4}\s?\d{4}\s?\d{4}\b'),
@@ -105,395 +76,358 @@ PII_PATTERNS = [
     ("CARD",    r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'),
     ("SSN",     r'\b\d{3}-\d{2}-\d{4}\b'),
 ]
-
-NAME_TRIGGERS = [
+_NAME_TRIGGERS = [
     r'(?:i am|my name is|this is|hi,?\s+i.?m)\s+([A-Z][a-z]+(\s+[A-Z][a-z]+)?)',
 ]
 
-def redact_pii(text: str) -> tuple:
-    """
-    Redact PII from text before writing to audit tables.
-    Returns (sanitised_text, list_of_pii_types_found)
-    """
+def _redact_pii(text: str) -> str:
     if not text:
-        return text, []
-
-    found = []
+        return text
     result = text
+    for label, pattern in _PII_PATTERNS:
+        result = re.sub(pattern, f'[{label}]', result)
+    for pattern in _NAME_TRIGGERS:
+        def _rep(m):
+            return m.group(0).replace(m.group(1), '[NAME]')
+        result = re.sub(pattern, _rep, result, flags=re.IGNORECASE)
+    return result
 
-    # pass 1 — structured PII patterns
-    for label, pattern in PII_PATTERNS:
-        replaced, count = re.subn(pattern, f'[{label}]', result)
-        if count > 0:
-            found.append(label)
-            result = replaced
+# ── low-level writer ───────────────────────────────────────────────────────
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    # pass 2 — name heuristics
-    for pattern in NAME_TRIGGERS:
-        def replace_name(m):
-            found.append("PERSON")
-            return m.group(0).replace(m.group(1), "[NAME]")
-        result = re.sub(pattern, replace_name, result, flags=re.IGNORECASE)
-
-    return result, list(set(found))
-
-
-# quick self-test
-_test = "Hi I am Nupur, email nupur@gmail.com phone 9876543210"
-_out, _types = redact_pii(_test)
-print(f"Redactor test:")
-print(f"  input : {_test}")
-print(f"  output: {_out}")
-print(f"  found : {_types}")
-assert "[EMAIL]" in _out
-assert "[PHONE]" in _out
-print("  Redactor OK")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 3 — Jurisdiction mapper
-# MAGIC
-# MAGIC Determines which regulation applies at the moment of the interaction.
-# MAGIC This is stored as `regulation_at_time` on every audit row — locked at call time,
-# MAGIC not re-evaluated later. This solves the Delhi→US→Germany jurisdiction problem.
-
-# COMMAND ----------
-
-# ============================================================
-# STEP 3 — JURISDICTION MAPPER
-# ============================================================
-
-EU_COUNTRIES = {
-    "AT","BE","BG","CY","CZ","DE","DK","EE","ES","FI",
-    "FR","GR","HR","HU","IE","IT","LT","LU","LV","MT",
-    "NL","PL","PT","RO","SE","SI","SK","GB"
-}
-
-US_CCPA_STATES = {"CA"}
-
-def determine_regulation(country: str, state: str = None,
-                         sector: str = None) -> str:
+def _write_row(table: str, row: dict) -> None:
     """
-    Returns the primary regulation for a user interaction.
-    Priority: HIPAA (sector) > GDPR (EU) > CCPA (CA) > DPDP (IN) > INTERNAL
+    Write one row to a Delta table via Databricks SQL Warehouse.
+    Columns with None or empty string are omitted from the INSERT
+    so Delta uses the column default (NULL) — this avoids CAST errors
+    when trying to insert '' into DOUBLE or BIGINT columns.
     """
-    if not country:
-        return "INTERNAL_POLICY"
+    try:
+        from databricks.sdk import WorkspaceClient
+        from databricks.sdk.service.sql import StatementParameterListItem
 
-    country = country.upper().strip()
-    state   = (state or "").upper().strip()
-    sector  = (sector or "").lower().strip()
+        warehouse_id = os.getenv("DATABRICKS_SQL_WAREHOUSE_ID")
+        if not warehouse_id:
+            logger.warning("[AUDIT] DATABRICKS_SQL_WAREHOUSE_ID not set — skipping write to %s", table)
+            return
 
-    if sector == "health":
-        return "HIPAA"
-    if country in EU_COUNTRIES:
-        return "GDPR"
-    if country == "US" and state in US_CCPA_STATES:
-        return "CCPA"
-    if country == "IN":
-        return "DPDP"
-    return "INTERNAL_POLICY"
+        # only include columns that have a real value
+        # omitting empty strings prevents CAST errors on DOUBLE/BIGINT columns
+        cols_to_insert = [
+            c for c in row.keys()
+            if row[c] is not None and row[c] != ""
+        ]
+
+        if not cols_to_insert:
+            logger.warning("[AUDIT] No columns to insert for table %s", table)
+            return
+
+        col_list     = ", ".join(cols_to_insert)
+        placeholders = ", ".join(f":{c}" for c in cols_to_insert)
+        sql          = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})"
+
+        params = [
+            StatementParameterListItem(
+                name  = c,
+                value = str(row[c])
+            )
+            for c in cols_to_insert
+        ]
+
+        w = WorkspaceClient()
+        result = w.statement_execution.execute_statement(
+            warehouse_id = warehouse_id,
+            statement    = sql,
+            parameters   = params,
+            wait_timeout = "10s",
+        )
+
+        if result.status.error:
+            logger.warning("[AUDIT] Write failed for %s: %s", table, result.status.error.message)
+        else:
+            logger.debug("[AUDIT] Row written to %s", table)
+
+    except Exception as exc:
+        logger.warning("[AUDIT] Failed to write to %s: %s", table, exc)
 
 
-# self-test
-assert determine_regulation("DE")         == "GDPR"
-assert determine_regulation("IN")         == "DPDP"
-assert determine_regulation("US", "CA")   == "CCPA"
-assert determine_regulation("US", "NY")   == "INTERNAL_POLICY"
-assert determine_regulation("US", sector="health") == "HIPAA"
-print("Jurisdiction mapper OK")
-print(f"  DE → {determine_regulation('DE')}")
-print(f"  IN → {determine_regulation('IN')}")
-print(f"  US/CA → {determine_regulation('US','CA')}")
-print(f"  US/NY → {determine_regulation('US','NY')}")
+def _fire(table: str, row: dict) -> None:
+    """Fire-and-forget background write — never blocks the caller."""
+    threading.Thread(target=_write_row, args=(table, row), daemon=True).start()
 
-# COMMAND ----------
 
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 4 — AuditWrapper class
-# MAGIC
-# MAGIC The complete wrapper. Every method is documented inline.
-
-# COMMAND ----------
-
-# ============================================================
-# STEP 4 — AUDIT WRAPPER CLASS
-# ============================================================
+# ── AuditWrapper ───────────────────────────────────────────────────────────
 
 class AuditWrapper:
     """
     Drop-in audit logging wrapper for any AI app on the platform.
 
-    Usage:
-        wrapper = AuditWrapper(
-            app_id  = "shopping_assistant_app",
-            catalog = "shopping_assistant"
-        )
-        result = wrapper.log_interaction(
-            user_email   = "nupur@xponent.ai",
-            user_input   = "show me red kurtas under 2000",
-            model_output = "here are 5 options...",
-            model_name   = "gpt-4",
-            status       = "success"
-        )
+    Instantiate ONCE in ShoppingAssistantWorkflow.__init__():
+        self.audit_wrapper = AuditWrapper()
+
+    Then call in process_query() after the graph completes:
+        self.audit_wrapper.log_interaction(...)
     """
 
-    def __init__(self, app_id: str, catalog: str,
-                 secret_scope: str = "audit_trail_secrets",
-                 schema_raw: str = "raw_logs",
-                 schema_version: str = "1.0"):
+    def __init__(
+        self,
+        app_id:         str = None,
+        catalog:        str = "shopping_assistant",
+        schema_version: str = "1.0",
+    ):
+        # app_id: explicit value > env var > error (no silent default in production)
+        self.app_id = app_id or os.getenv("AUDIT_APP_ID")
+        if not self.app_id:
+            raise ValueError(
+                "AUDIT_APP_ID is not configured. "
+                "Set it in .env or pass app_id explicitly to AuditWrapper()."
+            )
 
-        self.app_id         = app_id
-        self.catalog        = catalog
-        self.scope          = secret_scope
-        self.raw            = schema_raw
+        self.catalog        = catalog or os.getenv("AUDIT_CATALOG", "shopping_assistant")
         self.schema_version = schema_version
-        self._w             = WorkspaceClient()
-        self._key_cache     = {}
+        self._key_cache: dict = {}
 
-        # validate on init — fail fast
+        # validate app is registered — runs once at startup, not per request
         self._validate_app()
-        print(f"AuditWrapper ready. app_id={app_id}")
+        logger.info("[AUDIT] AuditWrapper ready. app_id=%s", self.app_id)
 
-    # ── private helpers ───────────────────────────────────────
+    # ── private helpers ───────────────────────────────────────────────────
 
-    def _tbl(self, name): return f"{self.catalog}.{self.raw}.{name}"
-
-    def _now(self): return datetime.now(timezone.utc)
+    def _tbl(self, name: str) -> str:
+        return f"{self.catalog}.{name}"
 
     def _get_key(self) -> bytes:
+        """
+        Retrieve HMAC key from Databricks secret scope. Cached after first call.
+        Raises RuntimeError if key cannot be loaded — fail fast rather than
+        producing incorrect subject_ref values that would break erasure lookups.
+        """
         if self.app_id not in self._key_cache:
+            scope    = os.getenv("AUDIT_SECRET_SCOPE", "audit_trail_secrets")
             key_name = f"hmac_key_{self.app_id}"
-            secret   = self._w.secrets.get_secret(
-                scope=self.scope, key=key_name
-            )
             try:
-                raw_key = base64.b64decode(secret.value).decode("utf-8")
-            except Exception:
-                raw_key = secret.value
-            self._key_cache[self.app_id] = raw_key.encode()
+                from databricks.sdk import WorkspaceClient
+                import base64
+                w      = WorkspaceClient()
+                secret = w.secrets.get_secret(scope=scope, key=key_name)
+                try:
+                    raw = base64.b64decode(secret.value).decode("utf-8")
+                except Exception:
+                    raw = secret.value
+                self._key_cache[self.app_id] = raw.encode()
+            except Exception as e:
+                raise RuntimeError(
+                    f"[AUDIT] Unable to load HMAC key '{key_name}' from scope '{scope}'. "
+                    f"Check AUDIT_SECRET_SCOPE and Databricks Secrets access. "
+                    f"Error: {e}"
+                )
         return self._key_cache[self.app_id]
 
     def _hmac(self, value: str) -> str:
         return hmac_lib.new(
-            self._get_key(), value.encode(), hashlib.sha256
+            self._get_key(),
+            value.encode(),
+            hashlib.sha256
         ).hexdigest()
 
     def _compute_refs(self, email: str) -> tuple:
+        """
+        Two-step pseudonymisation: email → subject_id → subject_ref.
+        Raises ValueError if email is None or empty.
+        """
+        if not email:
+            raise ValueError(
+                "user_email is required and cannot be None or empty. "
+                "Every audit record must be linked to a user."
+            )
         subject_id  = self._hmac(email.lower().strip())
         subject_ref = self._hmac(subject_id)
         return subject_id, subject_ref
 
-    def _validate_app(self):
-        spark.sql(f"USE CATALOG {self.catalog}")
-        rows = spark.sql(f"""
-            SELECT status FROM {self._tbl('app_registry')}
-            WHERE app_id = '{self.app_id}'
-            ORDER BY entry_created_at DESC LIMIT 1
-        """).collect()
-        if not rows:
-            raise ValueError(
-                f"app_id '{self.app_id}' not in app_registry. "
-                f"Run Component 3 onboarding first."
-            )
-        if rows[0]["status"] != "active":
-            raise ValueError(
-                f"app '{self.app_id}' is '{rows[0]['status']}', not active."
-            )
-
-    def _log_failure(self, trace_id, failed_table, error, payload_hash=None):
-        """Write to logging_failures — never raises, never loses the error."""
+    def _validate_app(self) -> None:
+        """Check app is registered and active in app_registry. Runs once at init."""
         try:
-            schema = StructType([
-                StructField("failure_id",    StringType(),   False),
-                StructField("app_id",        StringType(),   True),
-                StructField("trace_id",      StringType(),   True),
-                StructField("failed_table",  StringType(),   True),
-                StructField("error_message", StringType(),   True),
-                StructField("payload_hash",  StringType(),   True),
-                StructField("occurred_at",   TimestampType(),False),
-                StructField("recovered",     BooleanType(),  True),
-                StructField("created_at",    TimestampType(),False),
-                StructField("schema_version",StringType(),   False),
-            ])
-            now = self._now()
-            data = [(
-                str(uuid.uuid4()), self.app_id, trace_id,
-                failed_table, str(error)[:2000], payload_hash,
-                now, False, now, self.schema_version
-            )]
-            (spark.createDataFrame(data, schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("logging_failures")))
-        except Exception:
-            pass  # logging_failures itself failed — nothing we can do
+            from databricks.sdk import WorkspaceClient
+            from databricks.sdk.service.sql import StatementState
 
-    # ── public methods ────────────────────────────────────────
+            warehouse_id = os.getenv("DATABRICKS_SQL_WAREHOUSE_ID")
+            if not warehouse_id:
+                logger.warning("[AUDIT] No warehouse ID — skipping app_registry validation")
+                return
 
-    def start_session(self, user_email: str,
-                      channel: str = "api",
-                      device_type: str = None) -> str:
-        """
-        Start a new session. Returns session_id.
-        Call once per conversation, then pass session_id to log_interaction.
-        """
-        session_id  = str(uuid.uuid4())
-        _, subject_ref = self._compute_refs(user_email)
-        now = self._now()
-        schema = StructType([
-            StructField("session_id",        StringType(),   False),
-            StructField("app_id",            StringType(),   False),
-            StructField("subject_ref",       StringType(),   True),
-            StructField("channel",           StringType(),   True),
-            StructField("device_type",       StringType(),   True),
-            StructField("started_at",        TimestampType(),False),
-            StructField("ended_at",          TimestampType(),True),
-            StructField("interaction_count", IntegerType(),  True),
-            StructField("is_erasure_flag",   BooleanType(),  False),
-            StructField("session_metadata",  StringType(),   True),
-            StructField("created_at",        TimestampType(),False),
-            StructField("schema_version",    StringType(),   False),
-        ])
-        data = [(
-            session_id, self.app_id, subject_ref,
-            channel, device_type, now, None, 0,
-            False, None, now, self.schema_version
-        )]
-        try:
-            (spark.createDataFrame(data, schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("sessions_raw")))
+            w      = WorkspaceClient()
+            result = w.statement_execution.execute_statement(
+                warehouse_id = warehouse_id,
+                statement    = f"""
+                    SELECT status FROM {self._tbl('raw_logs.app_registry')}
+                    WHERE app_id = '{self.app_id}'
+                    ORDER BY entry_created_at DESC
+                    LIMIT 1
+                """,
+                wait_timeout = "10s",
+            )
+
+            if result.status.state != StatementState.SUCCEEDED:
+                logger.warning("[AUDIT] app_registry check failed: %s", result.status.error)
+                return
+
+            if (
+                not result.result
+                or not result.result.data_array
+                or len(result.result.data_array) == 0
+            ):
+                raise ValueError(
+                    f"[AUDIT] app_id '{self.app_id}' not found in app_registry. "
+                    f"Run the onboarding notebook first."
+                )
+
+            status = result.result.data_array[0][0]
+            if status != "active":
+                raise ValueError(
+                    f"[AUDIT] app '{self.app_id}' status is '{status}', not 'active'."
+                )
+
+        except ValueError:
+            raise
         except Exception as e:
-            self._log_failure(None, "sessions_raw", e)
+            logger.warning("[AUDIT] app_registry validation error (non-blocking): %s", e)
+
+    # ── public methods ────────────────────────────────────────────────────
+
+    def start_session(
+        self,
+        user_email:  str,
+        channel:     Optional[str] = None,
+        device_type: Optional[str] = None,
+    ) -> str:
+        """Start a new session. Returns session_id. Call once per conversation."""
+        session_id = str(uuid.uuid4())
+        _, sref    = self._compute_refs(user_email)
+        now        = _now_iso()
+        row = {
+            "session_id":        session_id,
+            "app_id":            self.app_id,
+            "subject_ref":       sref,
+            "channel":           channel     or None,
+            "device_type":       device_type or None,
+            "started_at":        now,
+            "is_erasure_flag":   "false",
+            "created_at":        now,
+            "schema_version":    self.schema_version,
+        }
+        _fire(self._tbl("raw_logs.sessions_raw"), row)
         return session_id
 
-    def log_interaction(self,
-        user_email:           str,
-        user_input:           str,
-        model_output:         str,
-        model_name:           str,
-        status:               str,
-        session_id:           str  = None,
-        model_version:        str  = None,
-        provider:             str  = None,
-        region:               str  = None,
-        run_id:               str  = None,
-        confidence_score:     float = None,
-        latency_ms:           int   = None,
-        user_country:         str   = None,
-        user_state:           str   = None,
-        sector:               str   = None,
-        system_prompt_hash:   str   = None,
-        system_prompt_version:str   = None,
-        consent_version:      str   = None,
-        app_metadata:         dict  = None,
+    def log_interaction(
+        self,
+        user_email:             str,
+        user_input:             str,
+        model_output:           str,
+        model_name:             str,
+        status:                 str,
+        session_id:             Optional[str]  = None,
+        model_version:          Optional[str]  = None,
+        user_country:           Optional[str]  = None,
+        user_state:             Optional[str]  = None,
+        system_prompt_version:  Optional[str]  = None,
+        consent_version:        Optional[str]  = None,
+        mlflow_trace_id:        Optional[str]  = None,
+        final_state:            Optional[dict] = None,
     ) -> dict:
         """
-        Core method. Call once per AI interaction.
-        Writes to ai_interactions_raw and model_outputs_raw.
-        Returns dict with trace_id and subject_ref for chaining
-        tool/guardrail/feedback logs.
+        Core method. Call once per AI interaction after the graph completes.
+        Fire-and-forget — never blocks the request.
+        user_email must be a valid non-empty string.
+        user_country must be passed by the caller from the user profile.
+        Returns dict with trace_id and subject_ref for chaining.
         """
-        trace_id    = str(uuid.uuid4())
-        now         = self._now()
-        result      = {"trace_id": trace_id, "status": "ok"}
+        trace_id = str(uuid.uuid4())
+        result   = {"trace_id": trace_id, "status": "ok"}
 
         try:
-            subject_id, subject_ref = self._compute_refs(user_email)
-            regulation = determine_regulation(
-                user_country or "", user_state or "", sector or ""
+            # guard — user_email must be provided
+            if not user_email:
+                raise ValueError(
+                    "user_email is required for log_interaction. "
+                    "Pass the authenticated user's email."
+                )
+
+            _, sref    = self._compute_refs(user_email)
+            regulation = _determine_regulation(
+                user_country or "",
+                user_state   or "",
             )
 
-            # redact PII from input and output
-            input_san,  input_pii_types  = redact_pii(user_input  or "")
-            output_san, output_pii_types = redact_pii(model_output or "")
-
-            # hash raw input for tamper evidence
+            input_san  = _redact_pii(user_input  or "")
+            output_san = _redact_pii(model_output or "")
             input_hash = self._hmac(user_input or "")
 
-            result["subject_ref"] = subject_ref
+            result["subject_ref"] = sref
             result["regulation"]  = regulation
 
-            # ── write ai_interactions_raw ─────────────────────
-            int_schema = StructType([
-                StructField("trace_id",              StringType(),   False),
-                StructField("session_id",            StringType(),   True),
-                StructField("app_id",                StringType(),   False),
-                StructField("subject_ref",           StringType(),   True),
-                StructField("request_timestamp",     TimestampType(),False),
-                StructField("user_country",          StringType(),   True),
-                StructField("user_state",            StringType(),   True),
-                StructField("regulation_at_time",    StringType(),   True),
-                StructField("input_text_sanitised",  StringType(),   True),
-                StructField("input_hash",            StringType(),   True),
-                StructField("system_prompt_hash",    StringType(),   True),
-                StructField("system_prompt_version", StringType(),   True),
-                StructField("model_name",            StringType(),   False),
-                StructField("model_version",         StringType(),   True),
-                StructField("provider",              StringType(),   True),
-                StructField("region",                StringType(),   True),
-                StructField("run_id",                StringType(),   True),
-                StructField("status",                StringType(),   False),
-                StructField("confidence_score",      DoubleType(),   True),
-                StructField("latency_ms",            LongType(),     True),
-                StructField("consent_version",       StringType(),   True),
-                StructField("is_erasure_flag",       BooleanType(),  False),
-                StructField("app_metadata",          StringType(),   True),
-                StructField("created_at",            TimestampType(),False),
-                StructField("schema_version",        StringType(),   False),
-            ])
-            int_data = [(
-                trace_id, session_id, self.app_id, subject_ref,
-                now, user_country, user_state, regulation,
-                input_san, input_hash, system_prompt_hash,
-                system_prompt_version, model_name, model_version,
-                provider, region, run_id, status,
-                confidence_score,
-                int(latency_ms) if latency_ms is not None else None,
-                consent_version, False,
-                json.dumps(app_metadata) if app_metadata else None,
-                now, self.schema_version
-            )]
-            (spark.createDataFrame(int_data, int_schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("ai_interactions_raw")))
+            intent       = (final_state or {}).get("intent")
+            result_count = len((final_state or {}).get("reranked_results") or [])
+            g_status     = (final_state or {}).get("guardrail_status")
+            now          = _now_iso()
 
-            # ── write model_outputs_raw ───────────────────────
-            out_schema = StructType([
-                StructField("output_id",             StringType(),   False),
-                StructField("trace_id",              StringType(),   False),
-                StructField("app_id",                StringType(),   False),
-                StructField("subject_ref",           StringType(),   True),
-                StructField("output_text_sanitised", StringType(),   True),
-                StructField("output_hash",           StringType(),   True),
-                StructField("output_type",           StringType(),   True),
-                StructField("recommended_items",     StringType(),   True),
-                StructField("confidence_score",      DoubleType(),   True),
-                StructField("tokens_used",           LongType(),     True),
-                StructField("finish_reason",         StringType(),   True),
-                StructField("contains_pii_flag",     BooleanType(),  True),
-                StructField("pii_types_found",       StringType(),   True),
-                StructField("generated_at",          TimestampType(),False),
-                StructField("is_erasure_flag",       BooleanType(),  False),
-                StructField("app_metadata",          StringType(),   True),
-                StructField("created_at",            TimestampType(),False),
-                StructField("schema_version",        StringType(),   False),
-            ])
-            has_pii = bool(output_pii_types)
-            out_data = [(
-                str(uuid.uuid4()), trace_id, self.app_id, subject_ref,
-                output_san, self._hmac(model_output or ""),
-                "recommendation", None, confidence_score,
-                None, "stop", has_pii,
-                json.dumps(output_pii_types) if output_pii_types else None,
-                now, False, None, now, self.schema_version
-            )]
-            (spark.createDataFrame(out_data, out_schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("model_outputs_raw")))
+            # ── ai_interactions_raw ──────────────────────────────────────
+            # None values are omitted from INSERT to avoid CAST errors
+            # on DOUBLE/BIGINT columns (confidence_score, latency_ms)
+            int_row = {
+                "trace_id":              trace_id,
+                "app_id":                self.app_id,
+                "subject_ref":           sref,
+                "request_timestamp":     now,
+                "regulation_at_time":    regulation,
+                "input_text_sanitised":  input_san,
+                "input_hash":            input_hash,
+                "system_prompt_version": system_prompt_version or "v1.0",
+                "model_name":            model_name,
+                "provider":              "databricks",
+                "status":                status,
+                "is_erasure_flag":       "false",
+                "app_metadata":          json.dumps({
+                    "intent":           intent,
+                    "result_count":     result_count,
+                    "guardrail_status": g_status,
+                    "mlflow_trace_id":  mlflow_trace_id,
+                }),
+                "created_at":            now,
+                "schema_version":        self.schema_version,
+                # optional — only include if provided
+                "session_id":            session_id     or None,
+                "user_country":          user_country   or None,
+                "user_state":            user_state     or None,
+                "model_version":         model_version  or None,
+                "run_id":                mlflow_trace_id or None,
+                "consent_version":       consent_version or None,
+                # numeric columns — None means omit from INSERT (no CAST error)
+                "confidence_score":      None,
+                "latency_ms":            None,
+            }
+            _fire(self._tbl("raw_logs.ai_interactions_raw"), int_row)
+
+            # ── model_outputs_raw ────────────────────────────────────────
+            out_row = {
+                "output_id":             str(uuid.uuid4()),
+                "trace_id":              trace_id,
+                "app_id":                self.app_id,
+                "subject_ref":           sref,
+                "output_text_sanitised": output_san,
+                "output_hash":           self._hmac(model_output or ""),
+                "output_type":           "recommendation",
+                "finish_reason":         "stop",
+                "contains_pii_flag":     "false",
+                "generated_at":          now,
+                "is_erasure_flag":       "false",
+                "created_at":            now,
+                "schema_version":        self.schema_version,
+                # numeric columns — omitted (None) to avoid CAST errors
+                "confidence_score":      None,
+                "tokens_used":           None,
+            }
+            _fire(self._tbl("raw_logs.model_outputs_raw"), out_row)
 
         except Exception as e:
             result["status"] = "logging_failed"
@@ -502,547 +436,85 @@ class AuditWrapper:
 
         return result
 
-    def log_tool_call(self, trace_id: str, tool_name: str,
-                      tool_inputs: dict, tool_outputs: dict,
-                      status: str, latency_ms: int = None,
-                      error_message: str = None,
-                      node_execution_id: str = None,
-                      subject_ref: str = None) -> None:
-        """Log one tool/API call. Call once per tool invocation."""
-        now = self._now()
-        schema = StructType([
-            StructField("tool_call_id",      StringType(),   False),
-            StructField("trace_id",          StringType(),   False),
-            StructField("node_execution_id", StringType(),   True),
-            StructField("app_id",            StringType(),   False),
-            StructField("subject_ref",       StringType(),   True),
-            StructField("tool_name",         StringType(),   False),
-            StructField("tool_inputs",       StringType(),   True),
-            StructField("tool_outputs",      StringType(),   True),
-            StructField("status",            StringType(),   False),
-            StructField("latency_ms",        LongType(),     True),
-            StructField("error_message",     StringType(),   True),
-            StructField("called_at",         TimestampType(),False),
-            StructField("is_erasure_flag",   BooleanType(),  False),
-            StructField("tool_metadata",     StringType(),   True),
-            StructField("created_at",        TimestampType(),False),
-            StructField("schema_version",    StringType(),   False),
-        ])
-        # sanitise tool inputs/outputs
-        inputs_str,  _ = redact_pii(json.dumps(tool_inputs  or {}))
-        outputs_str, _ = redact_pii(json.dumps(tool_outputs or {}))
-        data = [(
-            str(uuid.uuid4()), trace_id, node_execution_id,
-            self.app_id, subject_ref, tool_name,
-            inputs_str, outputs_str, status,
-            int(latency_ms) if latency_ms else None,
-            error_message, now, False, None, now, self.schema_version
-        )]
+    def log_guardrail(
+        self,
+        trace_id:        str,
+        policy_name:     str,
+        score:           float,
+        result:          str,
+        triggered_block: bool,
+        subject_ref:     Optional[str] = None,
+    ) -> None:
+        """Log one guardrail check. Fire-and-forget."""
+        now = _now_iso()
+        row = {
+            "guardrail_id":    str(uuid.uuid4()),
+            "trace_id":        trace_id,
+            "app_id":          self.app_id,
+            "policy_name":     policy_name,
+            "result":          result,
+            "triggered_block": str(triggered_block).lower(),
+            "checked_at":      now,
+            "is_erasure_flag": "false",
+            "created_at":      now,
+            "schema_version":  self.schema_version,
+            # optional
+            "subject_ref":     subject_ref or None,
+            # numeric — omit if None to avoid CAST errors
+            "score":           str(round(score, 4)) if score is not None else None,
+        }
+        _fire(self._tbl("raw_logs.guardrail_results_raw"), row)
+
+    def log_tool_call(
+        self,
+        trace_id:      str,
+        tool_name:     str,
+        tool_inputs:   Optional[dict]  = None,
+        tool_outputs:  Optional[dict]  = None,
+        status:        str             = "success",
+        latency_ms:    Optional[float] = None,
+        error_message: Optional[str]   = None,
+        subject_ref:   Optional[str]   = None,
+    ) -> None:
+        """Log one tool/API call. Fire-and-forget."""
+        now         = _now_iso()
+        inputs_san  = _redact_pii(json.dumps(tool_inputs  or {}))
+        outputs_san = _redact_pii(json.dumps(tool_outputs or {}))
+        row = {
+            "tool_call_id":    str(uuid.uuid4()),
+            "trace_id":        trace_id,
+            "app_id":          self.app_id,
+            "tool_name":       tool_name,
+            "tool_inputs":     inputs_san,
+            "tool_outputs":    outputs_san,
+            "status":          status,
+            "called_at":       now,
+            "is_erasure_flag": "false",
+            "created_at":      now,
+            "schema_version":  self.schema_version,
+            # optional
+            "subject_ref":     subject_ref   or None,
+            "error_message":   error_message or None,
+            # numeric — omit if None
+            "latency_ms":      str(round(latency_ms, 2)) if latency_ms else None,
+        }
+        _fire(self._tbl("raw_logs.tool_calls_raw"), row)
+
+    def _log_failure(self, trace_id: str, failed_table: str, error: Exception) -> None:
+        """Log wrapper failures to logging_failures table. Never raises."""
         try:
-            (spark.createDataFrame(data, schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("tool_calls_raw")))
-        except Exception as e:
-            self._log_failure(trace_id, "tool_calls_raw", e)
-
-    def log_guardrail(self, trace_id: str, policy_name: str,
-                      score: float, result: str,
-                      triggered_block: bool,
-                      subject_ref: str = None) -> None:
-        """Log one guardrail check result."""
-        now = self._now()
-        schema = StructType([
-            StructField("guardrail_id",      StringType(),   False),
-            StructField("trace_id",          StringType(),   False),
-            StructField("app_id",            StringType(),   False),
-            StructField("subject_ref",       StringType(),   True),
-            StructField("policy_name",       StringType(),   False),
-            StructField("score",             DoubleType(),   True),
-            StructField("result",            StringType(),   False),
-            StructField("triggered_block",   BooleanType(),  False),
-            StructField("checked_at",        TimestampType(),False),
-            StructField("is_erasure_flag",   BooleanType(),  False),
-            StructField("guardrail_metadata",StringType(),   True),
-            StructField("created_at",        TimestampType(),False),
-            StructField("schema_version",    StringType(),   False),
-        ])
-        data = [(
-            str(uuid.uuid4()), trace_id, self.app_id, subject_ref,
-            policy_name, float(score) if score is not None else None,
-            result, triggered_block, now, False, None, now, self.schema_version
-        )]
-        try:
-            (spark.createDataFrame(data, schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("guardrail_results_raw")))
-        except Exception as e:
-            self._log_failure(trace_id, "guardrail_results_raw", e)
-
-    def log_node_execution(self, trace_id: str, node_name: str,
-                           node_type: str, node_order: int,
-                           status: str,
-                           input_summary: str  = None,
-                           output_summary: str = None,
-                           model_name: str     = None,
-                           tokens_used: int    = None,
-                           latency_ms: int     = None,
-                           error_message: str  = None,
-                           subject_ref: str    = None) -> str:
-        """Log one pipeline node execution. Returns node_execution_id."""
-        node_id = str(uuid.uuid4())
-        now     = self._now()
-        input_san,  _ = redact_pii(input_summary  or "")
-        output_san, _ = redact_pii(output_summary or "")
-        schema = StructType([
-            StructField("node_execution_id", StringType(),   False),
-            StructField("trace_id",          StringType(),   False),
-            StructField("app_id",            StringType(),   False),
-            StructField("subject_ref",       StringType(),   True),
-            StructField("node_name",         StringType(),   False),
-            StructField("node_type",         StringType(),   True),
-            StructField("node_order",        IntegerType(),  True),
-            StructField("parent_node_id",    StringType(),   True),
-            StructField("status",            StringType(),   False),
-            StructField("input_summary",     StringType(),   True),
-            StructField("output_summary",    StringType(),   True),
-            StructField("error_message",     StringType(),   True),
-            StructField("model_name",        StringType(),   True),
-            StructField("model_version",     StringType(),   True),
-            StructField("tokens_used",       LongType(),     True),
-            StructField("latency_ms",        LongType(),     True),
-            StructField("retry_count",       IntegerType(),  True),
-            StructField("started_at",        TimestampType(),False),
-            StructField("ended_at",          TimestampType(),True),
-            StructField("is_erasure_flag",   BooleanType(),  False),
-            StructField("node_metadata",     StringType(),   True),
-            StructField("created_at",        TimestampType(),False),
-            StructField("schema_version",    StringType(),   False),
-        ])
-        data = [(
-            node_id, trace_id, self.app_id, subject_ref,
-            node_name, node_type, node_order, None,
-            status, input_san, output_san, error_message,
-            model_name, None,
-            int(tokens_used) if tokens_used else None,
-            int(latency_ms)  if latency_ms  else None,
-            0, now, now, False, None, now, self.schema_version
-        )]
-        try:
-            (spark.createDataFrame(data, schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("node_executions_raw")))
-        except Exception as e:
-            self._log_failure(trace_id, "node_executions_raw", e)
-        return node_id
-
-    def log_human_feedback(self, trace_id: str, feedback_type: str,
-                           action: str, subject_ref: str = None,
-                           reviewer_email: str = None,
-                           rationale: str = None,
-                           rating: int = None,
-                           app_metadata: dict = None) -> None:
-        """Log human review or override. Async — call any time after interaction."""
-        now = self._now()
-        reviewer_ref = None
-        if reviewer_email:
-            _, reviewer_ref = self._compute_refs(reviewer_email)
-        rationale_san, rat_pii = redact_pii(rationale or "")
-        rat_hash = self._hmac(rationale or "") if rationale else None
-        schema = StructType([
-            StructField("feedback_id",          StringType(),   False),
-            StructField("trace_id",             StringType(),   False),
-            StructField("app_id",               StringType(),   False),
-            StructField("subject_ref",          StringType(),   True),
-            StructField("reviewer_subject_ref", StringType(),   True),
-            StructField("feedback_type",        StringType(),   False),
-            StructField("action",               StringType(),   True),
-            StructField("rationale_sanitised",  StringType(),   True),
-            StructField("rationale_hash",       StringType(),   True),
-            StructField("rating",               IntegerType(),  True),
-            StructField("contains_pii_flag",    BooleanType(),  True),
-            StructField("feedback_at",          TimestampType(),False),
-            StructField("is_erasure_flag",      BooleanType(),  False),
-            StructField("app_metadata",         StringType(),   True),
-            StructField("created_at",           TimestampType(),False),
-            StructField("schema_version",       StringType(),   False),
-        ])
-        data = [(
-            str(uuid.uuid4()), trace_id, self.app_id,
-            subject_ref, reviewer_ref, feedback_type, action,
-            rationale_san, rat_hash, rating,
-            bool(rat_pii), now, False,
-            json.dumps(app_metadata) if app_metadata else None,
-            now, self.schema_version
-        )]
-        try:
-            (spark.createDataFrame(data, schema)
-                  .write.format("delta").mode("append")
-                  .saveAsTable(self._tbl("human_feedback_raw")))
-        except Exception as e:
-            self._log_failure(trace_id, "human_feedback_raw", e)
-
-print("AuditWrapper class defined.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 5 — Save wrapper to DBFS
-# MAGIC
-# MAGIC Saves the wrapper as a Python file so any notebook can import it with:
-# MAGIC ```python
-# MAGIC import sys
-# MAGIC sys.path.insert(0, "/dbfs/audit_trail/")
-# MAGIC from audit_wrapper import AuditWrapper
-# MAGIC ```
-
-# COMMAND ----------
-
-# ============================================================
-# STEP 5 — SAVE WRAPPER TO DBFS
-# ============================================================
-
-WRAPPER_CODE = '''
-import uuid, json, hmac as hmac_lib, hashlib, re, base64
-from datetime import datetime, timezone
-from pyspark.sql.types import (
-    StructType, StructField, StringType, TimestampType,
-    BooleanType, DoubleType, LongType, IntegerType
-)
-from databricks.sdk import WorkspaceClient
-
-EU_COUNTRIES = {
-    "AT","BE","BG","CY","CZ","DE","DK","EE","ES","FI",
-    "FR","GR","HR","HU","IE","IT","LT","LU","LV","MT",
-    "NL","PL","PT","RO","SE","SI","SK","GB"
-}
-
-PII_PATTERNS = [
-    ("EMAIL",   r"\\b[\\w\\.-]+@[\\w\\.-]+\\.\\w{2,}\\b"),
-    ("PHONE",   r"\\b(\\+?\\d{1,3}[\\s-]?)?\\d{10}\\b"),
-    ("AADHAAR", r"\\b\\d{4}\\s?\\d{4}\\s?\\d{4}\\b"),
-    ("PAN",     r"\\b[A-Z]{5}\\d{4}[A-Z]\\b"),
-    ("CARD",    r"\\b\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}\\b"),
-    ("SSN",     r"\\b\\d{3}-\\d{2}-\\d{4}\\b"),
-]
-
-def redact_pii(text):
-    if not text: return text, []
-    found, result = [], text
-    for label, pattern in PII_PATTERNS:
-        replaced, count = re.subn(pattern, f"[{label}]", result)
-        if count > 0:
-            found.append(label)
-            result = replaced
-    return result, list(set(found))
-
-def determine_regulation(country="", state="", sector=""):
-    country = (country or "").upper().strip()
-    state   = (state   or "").upper().strip()
-    sector  = (sector  or "").lower().strip()
-    if sector == "health":    return "HIPAA"
-    if country in EU_COUNTRIES: return "GDPR"
-    if country == "US" and state == "CA": return "CCPA"
-    if country == "IN":       return "DPDP"
-    return "INTERNAL_POLICY"
-'''
-
-dbutils.fs.mkdirs("dbfs:/audit_trail/")
-dbutils.fs.put(
-    "dbfs:/audit_trail/audit_wrapper.py",
-    WRAPPER_CODE,
-    overwrite=True
-)
-print("Wrapper saved to: dbfs:/audit_trail/audit_wrapper.py")
-print("Import in any notebook with:")
-print("  import sys")
-print("  sys.path.insert(0, '/dbfs/audit_trail/')")
-print("  from audit_wrapper import AuditWrapper")
-
-# COMMAND ----------
-
-# ============================================================
-# STEP 5 — SAVE WRAPPER (DBFS not available on serverless)
-# skipping DBFS save — wrapper is defined in Step 4 above
-# To use in another notebook: copy the AuditWrapper class
-# definition from Step 4 into your notebook, or use
-# %run /path/to/04_logging_wrapper to import it
-# ============================================================
-
-print("Wrapper defined in memory — ready to use in this session.")
-print()
-print("To use in another notebook, either:")
-print("  1. %run /Workspace/path/to/04_logging_wrapper")
-print("     (then AuditWrapper is available in that notebook's scope)")
-print()
-print("  2. Copy the AuditWrapper class from Step 4 directly.")
-print()
-print("Continuing to smoke test...")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 6 — End-to-end smoke test
-# MAGIC
-# MAGIC Simulates a real shopping assistant interaction with:
-# MAGIC - one session
-# MAGIC - one interaction (with PII in the input to prove redaction)
-# MAGIC - two node executions (pipeline steps)
-# MAGIC - one tool call (product search)
-# MAGIC - one guardrail check
-# MAGIC - one human feedback (stylist override)
-
-# COMMAND ----------
-
-# ============================================================
-# STEP 6 — END-TO-END SMOKE TEST
-# ============================================================
-
-print("=" * 60)
-print("  SMOKE TEST — simulated shopping assistant interaction")
-print("=" * 60 + "\n")
-
-# initialise wrapper
-w_test = AuditWrapper(
-    app_id   = "shopping_assistant_app",
-    catalog  = CATALOG,
-)
-
-# 1 — start session
-session_id = w_test.start_session(
-    user_email  = "testuser@example.com",
-    channel     = "web",
-    device_type = "desktop"
-)
-print(f"  Session started  : {session_id[:8]}...")
-
-# 2 — log interaction (PII in input — proves redaction)
-result = w_test.log_interaction(
-    user_email    = "testuser@example.com",
-    user_input    = "Hi I am Priya, email priya@test.com. Show me red kurtas under 2000",
-    model_output  = "Here are 5 red kurtas under Rs.2000 for you.",
-    model_name    = "gpt-4",
-    model_version = "turbo",
-    provider      = "openai",
-    region        = "eastus",
-    status        = "success",
-    confidence_score = 0.94,
-    latency_ms    = 1240,
-    user_country  = "IN",
-    session_id    = session_id,
-    system_prompt_version = "v1.0",
-    consent_version = "tnc_v2.1",
-    app_metadata  = {"occasion": "casual", "budget": 2000},
-)
-trace_id    = result["trace_id"]
-subject_ref = result.get("subject_ref")
-print(f"  Interaction logged: trace={trace_id[:8]}... status={result['status']}")
-
-# 3 — log node executions (pipeline steps)
-nid1 = w_test.log_node_execution(
-    trace_id     = trace_id,
-    node_name    = "intent_classifier",
-    node_type    = "llm",
-    node_order   = 1,
-    status       = "success",
-    input_summary  = "user query about kurtas",
-    output_summary = "intent: product_search, category: kurta, color: red",
-    model_name   = "gpt-4",
-    tokens_used  = 85,
-    latency_ms   = 210,
-    subject_ref  = subject_ref,
-)
-nid2 = w_test.log_node_execution(
-    trace_id     = trace_id,
-    node_name    = "product_ranker",
-    node_type    = "tool",
-    node_order   = 2,
-    status       = "success",
-    input_summary  = "5 products from catalogue",
-    output_summary = "ranked by relevance score",
-    latency_ms   = 95,
-    subject_ref  = subject_ref,
-)
-print(f"  Node executions  : intent_classifier, product_ranker")
-
-# 4 — log tool call
-w_test.log_tool_call(
-    trace_id          = trace_id,
-    tool_name         = "product_catalogue_search",
-    tool_inputs       = {"query": "red kurta", "max_price": 2000, "limit": 10},
-    tool_outputs      = {"results_count": 5, "top_product_id": "SKU_001"},
-    status            = "success",
-    latency_ms        = 380,
-    node_execution_id = nid1,
-    subject_ref       = subject_ref,
-)
-print(f"  Tool call        : product_catalogue_search")
-
-# 5 — log guardrail
-w_test.log_guardrail(
-    trace_id       = trace_id,
-    policy_name    = "body_neutrality_check",
-    score          = 0.97,
-    result         = "pass",
-    triggered_block= False,
-    subject_ref    = subject_ref,
-)
-print(f"  Guardrail        : body_neutrality_check → pass")
-
-# 6 — log human feedback (async - stylist override)
-w_test.log_human_feedback(
-    trace_id      = trace_id,
-    feedback_type = "override",
-    action        = "override",
-    subject_ref   = subject_ref,
-    reviewer_email= "stylist@xponent.ai",
-    rationale     = "Added dupatta set option for festive season",
-    rating        = 4,
-)
-print(f"  Human feedback   : stylist override logged")
-
-print("\n  Smoke test complete. Verifying what was written...\n")
-
-# verify written data
-spark.sql(f"USE CATALOG {CATALOG}")
-
-print("  ai_interactions_raw (input sanitised):")
-spark.sql(f"""
-    SELECT trace_id, input_text_sanitised, regulation_at_time,
-           status, confidence_score
-    FROM {tbl(RAW, 'ai_interactions_raw')}
-    WHERE trace_id = '{trace_id}'
-""").show(truncate=False)
-
-print("  node_executions_raw:")
-spark.sql(f"""
-    SELECT node_name, node_type, node_order, status, latency_ms
-    FROM {tbl(RAW, 'node_executions_raw')}
-    WHERE trace_id = '{trace_id}'
-    ORDER BY node_order
-""").show(truncate=False)
-
-print("  tool_calls_raw:")
-spark.sql(f"""
-    SELECT tool_name, status, latency_ms, tool_inputs
-    FROM {tbl(RAW, 'tool_calls_raw')}
-    WHERE trace_id = '{trace_id}'
-""").show(truncate=False)
-
-print("  guardrail_results_raw:")
-spark.sql(f"""
-    SELECT policy_name, score, result, triggered_block
-    FROM {tbl(RAW, 'guardrail_results_raw')}
-    WHERE trace_id = '{trace_id}'
-""").show(truncate=False)
-
-print("  human_feedback_raw:")
-spark.sql(f"""
-    SELECT feedback_type, action, rationale_sanitised, rating
-    FROM {tbl(RAW, 'human_feedback_raw')}
-    WHERE trace_id = '{trace_id}'
-""").show(truncate=False)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Step 7 — Final verification
-
-# COMMAND ----------
-
-# ============================================================
-# STEP 7 — VERIFICATION
-# ============================================================
-
-print("=" * 60)
-print("  COMPONENT 4 VERIFICATION")
-print("=" * 60 + "\n")
-
-all_ok = True
-spark.sql(f"USE CATALOG {CATALOG}")
-
-checks = {
-    "ai_interactions_raw has data":
-        f"SELECT COUNT(*) AS c FROM {tbl(RAW,'ai_interactions_raw')} WHERE is_erasure_flag=false",
-    "model_outputs_raw has data":
-        f"SELECT COUNT(*) AS c FROM {tbl(RAW,'model_outputs_raw')} WHERE is_erasure_flag=false",
-    "node_executions_raw has data":
-        f"SELECT COUNT(*) AS c FROM {tbl(RAW,'node_executions_raw')} WHERE is_erasure_flag=false",
-    "tool_calls_raw has data":
-        f"SELECT COUNT(*) AS c FROM {tbl(RAW,'tool_calls_raw')} WHERE is_erasure_flag=false",
-    "guardrail_results_raw has data":
-        f"SELECT COUNT(*) AS c FROM {tbl(RAW,'guardrail_results_raw')} WHERE is_erasure_flag=false",
-    "human_feedback_raw has data":
-        f"SELECT COUNT(*) AS c FROM {tbl(RAW,'human_feedback_raw')} WHERE is_erasure_flag=false",
-    "sessions_raw has data":
-        f"SELECT COUNT(*) AS c FROM {tbl(RAW,'sessions_raw')} WHERE is_erasure_flag=false",
-    "logging_failures is empty (no errors)":
-        None,
-}
-
-for check, query in checks.items():
-    if query is None:
-        cnt = spark.sql(
-            f"SELECT COUNT(*) AS c FROM {tbl(RAW,'logging_failures')}"
-        ).first()["c"]
-        ok  = (cnt == 0)
-        print(f"  [{'OK' if ok else 'WARN'}] {check} ({cnt} failures)")
-    else:
-        cnt = spark.sql(query).first()["c"]
-        ok  = (cnt > 0)
-        all_ok &= ok
-        print(f"  [{'OK' if ok else 'FAIL'}] {check} ({cnt} rows)")
-
-# PII redaction check
-rows = spark.sql(f"""
-    SELECT input_text_sanitised FROM {tbl(RAW,'ai_interactions_raw')}
-    WHERE trace_id = '{trace_id}'
-""").collect()
-if rows:
-    text = rows[0]["input_text_sanitised"]
-    pii_gone  = "priya@test.com" not in text.lower()
-    pii_gone &= "priya" not in text.lower()
-    all_ok &= pii_gone
-    print(f"  [{'OK' if pii_gone else 'FAIL'}] PII redacted from input text")
-    print(f"    stored as: {text}")
-
-print("\n" + "=" * 60)
-if all_ok:
-    print("  COMPONENT 4 COMPLETE — logging wrapper is live.")
-    print("  Next: Component 5 — synthetic data + full pipeline test.")
-else:
-    print("  SOMETHING FAILED — check items above.")
-print("=" * 60)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ---
-# MAGIC ## Component 4 complete
-# MAGIC
-# MAGIC ```
-# MAGIC AuditWrapper is live. Any app imports it with 3 lines:
-# MAGIC
-# MAGIC     import sys
-# MAGIC     sys.path.insert(0, '/dbfs/audit_trail/')
-# MAGIC     from audit_wrapper import AuditWrapper
-# MAGIC
-# MAGIC     wrapper = AuditWrapper(
-# MAGIC         app_id  = "shopping_assistant_app",
-# MAGIC         catalog = "shopping_assistant"
-# MAGIC     )
-# MAGIC
-# MAGIC Methods available:
-# MAGIC     wrapper.start_session()        → returns session_id
-# MAGIC     wrapper.log_interaction()      → writes to 2 tables, returns trace_id
-# MAGIC     wrapper.log_node_execution()   → writes to node_executions_raw
-# MAGIC     wrapper.log_tool_call()        → writes to tool_calls_raw
-# MAGIC     wrapper.log_guardrail()        → writes to guardrail_results_raw
-# MAGIC     wrapper.log_human_feedback()   → writes to human_feedback_raw (async)
-# MAGIC ```
-# MAGIC
-# MAGIC **Next → Component 5:** synthetic data generator — pushes 500 realistic
-# MAGIC interactions through the wrapper to populate all tables for
-# MAGIC dashboard and erasure testing.
+            now = _now_iso()
+            row = {
+                "failure_id":    str(uuid.uuid4()),
+                "app_id":        self.app_id,
+                "trace_id":      trace_id      or None,
+                "failed_table":  failed_table,
+                "error_message": str(error)[:2000],
+                "occurred_at":   now,
+                "recovered":     "false",
+                "created_at":    now,
+                "schema_version":self.schema_version,
+            }
+            _fire(self._tbl("raw_logs.logging_failures"), row)
+        except Exception:
+            pass
