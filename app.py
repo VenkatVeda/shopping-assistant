@@ -390,6 +390,18 @@ def oauth_callback():
         name = user_info.get("name", email.split("@")[0])
         picture = user_info.get("picture", "")
 
+# ── AUDIT: register customer in customer_pii on every login ──
+        try:
+            if workflow and workflow.audit_wrapper:
+                workflow.audit_wrapper.register_customer(
+                    user_email      = email,
+                    full_name       = name,
+                    user_country    = user_info.get("locale", "")[:2].upper() or os.getenv("DEFAULT_USER_COUNTRY", ""),
+                    consent_version = "tnc_v2.1",
+                )
+        except Exception as _re:
+            logger.warning(f"[AUDIT] register_customer failed (non-blocking): {_re}")
+        # ─────────────────────────────────────────────────────────────
         # Generate JWT tokens
         access_token = generate_access_token(user_id, email, name)
         refresh_token = generate_refresh_token(user_id, email, name)
@@ -474,7 +486,7 @@ def search():
     # Parse early so RequestTrace gets the query string
     data = request.json or {}
     query = data.get('query', '').strip()
-    session_id = data.get('session_id', str(uuid.uuid4()))
+    session_id = data.get('session_id') or str(uuid.uuid4())
     user_id = getattr(request, 'user_id', None)
 
     with RequestTrace(query=query, user_id=user_id):

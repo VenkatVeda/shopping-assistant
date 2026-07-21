@@ -20,6 +20,8 @@ from .observability import NodeTracer, RequestTrace, metrics_store
 from .audit_logger import log_guardrail
 from .evals import EvalRunner
 from .semantic_cache import build_cache
+from contextvars import ContextVar
+_current_trace_id: ContextVar[str] = ContextVar('_current_trace_id', default='')
 
 class GraphState(TypedDict):
     """State definition for the graph"""
@@ -393,6 +395,20 @@ class ShoppingAssistantWorkflow:
                 **_audit_ctx,
             )
 
+            # ── AUDIT: node execution log ──
+            _node_latency = (time.time() - _t0) * 1000
+            if self.audit_wrapper:
+                self.audit_wrapper.log_node_execution(
+                    trace_id   = _current_trace_id.get(),
+                    node_name  = "input_guardrail",
+                    status     = "success",
+                    node_input = query[:500],
+                    node_output= "pass",
+                    latency_ms = _node_latency,
+                    node_type  = "guardrail",
+                    node_order = 1,
+                )
+
             return {
                 "query": query,
                 "error": None,
@@ -721,10 +737,32 @@ class ShoppingAssistantWorkflow:
                 
                 print(f"[SEARCH] Found {len(results)} unique products (after post-filtering and deduplication)")
                 print(f"[PRICE FILTER] Total filtered by price: {filtered_by_price}/{len(search_results)}", file=sys.stderr)
+
+                # ── AUDIT: node execution log ──
+                if self.audit_wrapper:
+                    self.audit_wrapper.log_node_execution(
+                        trace_id   = _current_trace_id.get(),
+                        node_name  = "product_search_node",
+                        status     = "success",
+                        node_input = str(preferences)[:500] if preferences else "",
+                        node_output= f"{len(results)} products found",
+                        node_type  = "retriever",
+                        node_order = 3,
+                    )
                 return {"results": results}
                 
             except Exception as e:
                 print(f"[ERROR] Vector search failed: {e}")
+                # ── AUDIT: node execution log (error path) ──
+                if self.audit_wrapper:
+                    self.audit_wrapper.log_node_execution(
+                        trace_id   = _current_trace_id.get(),
+                        node_name  = "product_search_node",
+                        status     = "error",
+                        error_msg  = str(e)[:500],
+                        node_type  = "retriever",
+                        node_order = 3,
+                    )
                 return {"results": [], "error": str(e)}
 
     # --- Conditional Logic ---
@@ -1390,7 +1428,19 @@ class ShoppingAssistantWorkflow:
             print(f"[OUTPUT GUARDRAIL NODE] Issues found: {validation_result['issues']}")
         if validation_result['corrections_made']:
             print("[OUTPUT GUARDRAIL NODE] Response was corrected ✓")
-        
+
+        # ── AUDIT: node execution log ──
+        if self.audit_wrapper:
+            self.audit_wrapper.log_node_execution(
+                trace_id   = _current_trace_id.get(),
+                node_name  = "output_guardrail_node",
+                status     = validation_result["status"],
+                node_input = generated_response[:500] if generated_response else "",
+                node_output= str(validation_result.get("issues", [])),
+                node_type  = "guardrail",
+                node_order = 6,
+            )
+
         return {
             "safe_response": validation_result["safe_response"],
             "guardrail_status": validation_result["status"],
@@ -1869,13 +1919,32 @@ class ShoppingAssistantWorkflow:
                 "summary": "",
             }
         
+        # ── AUDIT: generate trace_id before graph runs so nodes can log
+        #    to node_executions_raw with a consistent trace_id ──
+        import uuid as _uuid
+        pre_trace_id = str(_uuid.uuid4())
+        initial_state["trace_id"] = pre_trace_id
+        _current_trace_id.set(pre_trace_id)
+
+        # ── AUDIT: log session start once per new conversation ──
+        _is_new_session = not (
+            initial_state.get("history") or initial_state.get("summary")
+        )
+        if self.audit_wrapper and user_id and _is_new_session:
+            self.audit_wrapper.log_session(
+                session_id  = session_id,
+                user_email  = user_id,
+                channel     = "web",
+                device_type = "unknown",
+            )
+
         # Run graph inside a root MLflow trace so all node spans are nested under it
         with RequestTrace(query=query, user_id=user_id, session_id=session_id) as rt:
             final_state = self.app.invoke(initial_state, config=config)
             rt.set_result(final_state)
 
         # Attach trace_id to response so the UI / API can surface it for feedback
-        trace_id = rt.trace_id
+        trace_id = rt.trace_id or pre_trace_id
         final_state["trace_id"] = trace_id
 
         # ── LOG TO AUDIT TRAIL ────────────────────────────────────────────
