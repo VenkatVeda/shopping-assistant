@@ -383,9 +383,10 @@ class AuditWrapper:
         tokens_used   : only for LLM nodes — token count
         """
         try:
-            now        = _now_iso()
+            started    = _now_iso()
             input_san  = _redact_pii(str(node_input  or ""))
             output_san = _redact_pii(str(node_output or ""))
+            ended      = _now_iso()
             row = {
                 "node_execution_id": str(uuid.uuid4()),
                 "trace_id":          trace_id,
@@ -395,10 +396,10 @@ class AuditWrapper:
                 "input_summary":     input_san  or None,
                 "output_summary":    output_san or None,
                 "error_message":     error_msg  or None,
-                "started_at":        now,
-                "ended_at":          now,
+                "started_at":        started,
+                "ended_at":          ended,
                 "is_erasure_flag":   "false",
-                "created_at":        now,
+                "created_at":        ended,
                 "schema_version":    self.schema_version,
                 # optional identity columns
                 "subject_ref":       subject_ref    or None,
@@ -619,11 +620,11 @@ class AuditWrapper:
         design (this IS the PII table — it's the only place email lives).
         """
         try:
-            subject_id, subject_ref = self._compute_refs(user_email)
+            _, subject_ref = self._compute_refs(user_email)
             regulation = _determine_regulation(user_country or "", user_state or "")
             now = _now_iso()
             row = {
-                "subject_id":      subject_id,
+               
                 "subject_ref":     subject_ref,
                 "app_id":          self.app_id,
                 "email":           user_email,

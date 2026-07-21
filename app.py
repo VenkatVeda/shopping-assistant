@@ -396,7 +396,7 @@ def oauth_callback():
                 workflow.audit_wrapper.register_customer(
                     user_email      = email,
                     full_name       = name,
-                    user_country    = "",
+                    user_country    = user_info.get("locale", "")[:2].upper() or os.getenv("DEFAULT_USER_COUNTRY", ""),
                     consent_version = "tnc_v2.1",
                 )
         except Exception as _re:
