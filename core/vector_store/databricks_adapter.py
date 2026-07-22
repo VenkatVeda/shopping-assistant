@@ -77,7 +77,10 @@ class DatabricksAdapter(VectorStoreInterface):
             else:
                 # Databricks notebooks/clusters use default auth
                 print(f"[DATABRICKS ADAPTER] Using default workspace credentials", file=sys.stderr)
-                self.client = VectorSearchClient(disable_notice=True)
+                self.client = VectorSearchClient(
+                    workspace_url=self.host,
+                    disable_notice=True
+                    )
             
             # Get the index
             self.index = self.client.get_index(
