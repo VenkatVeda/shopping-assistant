@@ -115,15 +115,8 @@ class ShoppingAssistantWorkflow:
                 print(f"✓ Connected to Vector Search (Direct): {stats.get('index_name', 'unknown')}")
             except Exception as e:
                 print(f"⚠ Direct adapter failed: {e}")
-                # Last resort: Legacy Pinecone mode
-                from pinecone import Pinecone
-                pinecone_api_key = os.getenv("PINECONE_API_KEY")
-                if not pinecone_api_key:
-                    raise ValueError("PINECONE_API_KEY environment variable is required")
-                pc = Pinecone(api_key=pinecone_api_key)
-                pinecone_index_name = os.getenv("PINECONE_INDEX_NAME", "bags-index")
-                self.vector_client = pc.Index(pinecone_index_name)
-                print(f"✓ Connected to Pinecone index (legacy mode): {pinecone_index_name}")
+                print("⚠ No fallback available — vector_client set to None")
+                self.vector_client = None
         
         # Initialize Memory
         self.memory = MemorySaver()
