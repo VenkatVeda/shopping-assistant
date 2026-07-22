@@ -54,3 +54,18 @@ env:
   #   value: "{{secrets/shopping-assistant/pinecone-api-key}}"
   # - name: PINECONE_INDEX_NAME
   #   value: "bags-image-url-embeddings"
+# Pinecone Configuration (dummy values — app uses Databricks vector search)
+  - name: PINECONE_API_KEY
+    value: "dummy"
+  - name: PINECONE_INDEX_NAME
+    value: "dummy"
+
+  # Audit Trail Configuration
+  - name: AUDIT_APP_ID
+    value: "myre_app"
+  - name: AUDIT_CATALOG
+    value: "shopping_assistant"
+  - name: AUDIT_SECRET_SCOPE
+    value: "audit_trail_secrets"
+  - name: DATABRICKS_SQL_WAREHOUSE_ID
+    value: "8eba55b5eb828697"
