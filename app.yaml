@@ -69,3 +69,6 @@ env:
     value: "audit_trail_secrets"
   - name: DATABRICKS_SQL_WAREHOUSE_ID
     value: "8eba55b5eb828697"
+
+  - name: DATABRICKS_HOST
+    value: "https://adb-4206962778623078.18.azuredatabricks.net"
