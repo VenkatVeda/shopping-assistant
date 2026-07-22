@@ -88,9 +88,18 @@ def _redact_pii(text: str) -> str:
         result = re.sub(pattern, f'[{label}]', result)
     for pattern in _NAME_TRIGGERS:
         def _rep(m):
-            return m.group(0).replace(m.group(1), '[NAME]')
+            name = m.group(1)
+            if name is None:
+                return m.group(0)
+            return m.group(0).replace(name, '[NAME]')
         result = re.sub(pattern, _rep, result, flags=re.IGNORECASE)
     return result
+
+def _detect_pii_types(text: str) -> list:
+    """Return the list of PII pattern labels found in text (for pii_types_found)."""
+    if not text:
+        return []
+    return [label for label, pattern in _PII_PATTERNS if re.search(pattern, text)]
 
 # ── low-level writer ───────────────────────────────────────────────────────
 def _now_iso() -> str:
@@ -210,12 +219,28 @@ class AuditWrapper:
                 from databricks.sdk import WorkspaceClient
                 import base64
                 w      = WorkspaceClient()
-                secret = w.secrets.get_secret(scope=scope, key=key_name)
+                # Try primary scope first, then fallback to audit_trail_secrets
+                secret = None
+                scopes_to_try = [scope]
+                if scope != "audit_trail_secrets":
+                    scopes_to_try.append("audit_trail_secrets")
+                last_error = None
+                for try_scope in scopes_to_try:
+                    try:
+                        secret = w.secrets.get_secret(scope=try_scope, key=key_name)
+                        scope = try_scope  # remember which worked
+                        break
+                    except Exception as se:
+                        last_error = se
+                if secret is None:
+                    raise RuntimeError(f"Key not found in any scope: {last_error}")
                 try:
                     raw = base64.b64decode(secret.value).decode("utf-8")
                 except Exception:
                     raw = secret.value
                 self._key_cache[self.app_id] = raw.encode()
+            except RuntimeError:
+                raise
             except Exception as e:
                 raise RuntimeError(
                     f"[AUDIT] Unable to load HMAC key '{key_name}' from scope '{scope}'. "
@@ -227,7 +252,7 @@ class AuditWrapper:
     def _hmac(self, value: str) -> str:
         return hmac_lib.new(
             self._get_key(),
-            value.encode(),
+            (value or "").encode(),
             hashlib.sha256
         ).hexdigest()
 
@@ -369,7 +394,7 @@ class AuditWrapper:
         model_version:  Optional[str]   = None,
         tokens_used:    Optional[int]   = None,
         retry_count:    Optional[int]   = None,
-    ) -> None:
+    ) -> Optional[str]:
         """
         Log one LangGraph node execution to node_executions_raw. Fire-and-forget.
         Call from inside each node function in workflow.py after the node completes.
@@ -381,14 +406,17 @@ class AuditWrapper:
         parent_node_id: node_execution_id of triggering node (branching pipelines)
         model_name    : only for LLM nodes — which model was called
         tokens_used   : only for LLM nodes — token count
+
+        Returns the generated node_execution_id, or None if logging failed.
         """
         try:
+            node_execution_id = str(uuid.uuid4())
             started    = _now_iso()
             input_san  = _redact_pii(str(node_input  or ""))
             output_san = _redact_pii(str(node_output or ""))
             ended      = _now_iso()
             row = {
-                "node_execution_id": str(uuid.uuid4()),
+                "node_execution_id": node_execution_id,
                 "trace_id":          trace_id,
                 "app_id":            self.app_id,
                 "node_name":         node_name,
@@ -401,21 +429,21 @@ class AuditWrapper:
                 "is_erasure_flag":   "false",
                 "created_at":        ended,
                 "schema_version":    self.schema_version,
-                # optional identity columns
                 "subject_ref":       subject_ref    or None,
                 "node_type":         node_type      or None,
                 "parent_node_id":    parent_node_id or None,
                 "model_name":        model_name     or None,
                 "model_version":     model_version  or None,
-                # numeric — use `is not None` so 0 values are not dropped
                 "latency_ms":        str(int(round(latency_ms))) if latency_ms is not None else None,
                 "node_order":        str(node_order)  if node_order  is not None else None,
                 "tokens_used":       str(tokens_used) if tokens_used is not None else None,
                 "retry_count":       str(retry_count) if retry_count is not None else None,
             }
             _fire(self._tbl("raw_logs.node_executions_raw"), row)
+            return node_execution_id
         except Exception as e:
             self._log_failure(trace_id, "node_executions_raw", e)
+            return None
 
     def log_interaction(
         self,
@@ -424,6 +452,7 @@ class AuditWrapper:
         model_output:           str,
         model_name:             str,
         status:                 str,
+        trace_id:               Optional[str]  = None,
         session_id:             Optional[str]  = None,
         model_version:          Optional[str]  = None,
         user_country:           Optional[str]  = None,
@@ -438,9 +467,14 @@ class AuditWrapper:
         Fire-and-forget — never blocks the request.
         user_email must be a valid non-empty string.
         user_country must be passed by the caller from the user profile.
+        trace_id should be the caller's pre-generated request trace_id — only a
+        fallback UUID is minted when trace_id is None, so every audit row for
+        one request shares the same trace_id.
+        Writes only to ai_interactions_raw — model output is logged separately
+        via log_model_output().
         Returns dict with trace_id and subject_ref for chaining.
         """
-        trace_id = str(uuid.uuid4())
+        trace_id = trace_id or str(uuid.uuid4())
         result   = {"trace_id": trace_id, "status": "ok"}
 
         try:
@@ -458,7 +492,6 @@ class AuditWrapper:
             )
 
             input_san  = _redact_pii(user_input  or "")
-            output_san = _redact_pii(model_output or "")
             input_hash = self._hmac(user_input or "")
 
             result["subject_ref"] = sref
@@ -506,17 +539,46 @@ class AuditWrapper:
             }
             _fire(self._tbl("raw_logs.ai_interactions_raw"), int_row)
 
-            # ── model_outputs_raw ────────────────────────────────────────
-            out_row = {
+        except Exception as e:
+            result["status"] = "logging_failed"
+            result["error"]  = str(e)
+            self._log_failure(trace_id, "ai_interactions_raw", e)
+
+        return result
+
+    def log_model_output(
+        self,
+        trace_id:           str,
+        output_text:        str,
+        recommended_items:  Optional[list] = None,
+        subject_ref:        Optional[str]  = None,
+        output_type:        str            = "recommendation",
+        finish_reason:      str            = "stop",
+    ) -> None:
+        """
+        Log one generated model output to model_outputs_raw. Fire-and-forget.
+        Call once from response_generator_node after the response text is produced.
+
+        output_text is PII-redacted before storage; the raw text is HMAC-hashed
+        (output_hash) for tamper evidence but never stored unredacted.
+        recommended_items must contain product IDs only — never product names.
+        """
+        try:
+            now         = _now_iso()
+            output_san  = _redact_pii(output_text or "")
+            pii_types   = _detect_pii_types(output_text or "")
+            row = {
                 "output_id":             str(uuid.uuid4()),
                 "trace_id":              trace_id,
                 "app_id":                self.app_id,
-                "subject_ref":           sref,
+                "subject_ref":           subject_ref or None,
                 "output_text_sanitised": output_san,
-                "output_hash":           self._hmac(model_output or ""),
-                "output_type":           "recommendation",
-                "finish_reason":         "stop",
-                "contains_pii_flag":     "false",
+                "output_hash":           self._hmac(output_text or ""),
+                "output_type":           output_type,
+                "finish_reason":         finish_reason,
+                "recommended_items":     json.dumps(recommended_items or []),
+                "contains_pii_flag":     "true" if pii_types else "false",
+                "pii_types_found":       json.dumps(pii_types) if pii_types else None,
                 "generated_at":          now,
                 "is_erasure_flag":       "false",
                 "created_at":            now,
@@ -525,14 +587,9 @@ class AuditWrapper:
                 "confidence_score":      None,
                 "tokens_used":           None,
             }
-            _fire(self._tbl("raw_logs.model_outputs_raw"), out_row)
-
+            _fire(self._tbl("raw_logs.model_outputs_raw"), row)
         except Exception as e:
-            result["status"] = "logging_failed"
-            result["error"]  = str(e)
-            self._log_failure(trace_id, "ai_interactions_raw", e)
-
-        return result
+            self._log_failure(trace_id, "model_outputs_raw", e)
 
     def log_guardrail(
         self,
@@ -594,7 +651,7 @@ class AuditWrapper:
             "subject_ref":     subject_ref   or None,
             "error_message":   error_message or None,
             # numeric — omit if None
-            "latency_ms":      str(round(latency_ms, 2)) if latency_ms is not None else None,
+            "latency_ms":      str(round(latency_ms, 2)) if latency_ms else None,
         }
         _fire(self._tbl("raw_logs.tool_calls_raw"), row)
 
@@ -620,11 +677,11 @@ class AuditWrapper:
         design (this IS the PII table — it's the only place email lives).
         """
         try:
-            _, subject_ref = self._compute_refs(user_email)
+            subject_id, subject_ref = self._compute_refs(user_email)
             regulation = _determine_regulation(user_country or "", user_state or "")
             now = _now_iso()
             row = {
-               
+                "subject_id":      subject_id,
                 "subject_ref":     subject_ref,
                 "app_id":          self.app_id,
                 "email":           user_email,

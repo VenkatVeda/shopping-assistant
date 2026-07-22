@@ -6,6 +6,7 @@ Architecture: Input Guardrail -> Intent Classifier -> Product Search -> RAG Enha
 import os
 import sys
 import time
+import threading
 from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -22,6 +23,7 @@ from .evals import EvalRunner
 from .semantic_cache import build_cache
 from contextvars import ContextVar
 _current_trace_id: ContextVar[str] = ContextVar('_current_trace_id', default='')
+_current_subject_ref: ContextVar[str] = ContextVar('_current_subject_ref', default='')
 
 class GraphState(TypedDict):
     """State definition for the graph"""
@@ -341,7 +343,8 @@ class ShoppingAssistantWorkflow:
                     query_preview=query[:120],
                     **_audit_ctx,
                 )
-                return {"error": "That query is too long. Could you please rephrase it more concisely?", 
+                self._log_input_guardrail(status="fail", score=0.0, triggered_block=True)
+                return {"error": "That query is too long. Could you please rephrase it more concisely?",
                         "history": history, "summary": summary}
             
             # Skip safety check for very short/common queries to save tokens
@@ -366,6 +369,7 @@ class ShoppingAssistantWorkflow:
                         query_preview=query[:120],
                         **_audit_ctx,
                     )
+                    self._log_input_guardrail(status="fail", score=0.0, triggered_block=True)
                     return {
                         "error": safety_result["decline_message"],
                         "history": history,
@@ -394,20 +398,7 @@ class ShoppingAssistantWorkflow:
                 query_preview=query[:120],
                 **_audit_ctx,
             )
-
-            # ── AUDIT: node execution log ──
-            _node_latency = (time.time() - _t0) * 1000
-            if self.audit_wrapper:
-                self.audit_wrapper.log_node_execution(
-                    trace_id   = _current_trace_id.get(),
-                    node_name  = "input_guardrail",
-                    status     = "success",
-                    node_input = query[:500],
-                    node_output= "pass",
-                    latency_ms = _node_latency,
-                    node_type  = "guardrail",
-                    node_order = 1,
-                )
+            self._log_input_guardrail(status="pass", score=1.0, triggered_block=False)
 
             return {
                 "query": query,
@@ -415,6 +406,23 @@ class ShoppingAssistantWorkflow:
                 "history": memory_result["history"],
                 "summary": memory_result["summary"]
             }
+
+    def _log_input_guardrail(self, status: str, score: float, triggered_block: bool) -> None:
+        """Fire-and-forget AuditWrapper.log_guardrail() call for the input_content_safety policy."""
+        if not self.audit_wrapper:
+            return
+        threading.Thread(
+            target=self.audit_wrapper.log_guardrail,
+            kwargs={
+                "trace_id":        _current_trace_id.get(),
+                "policy_name":     "input_content_safety",
+                "score":           score,
+                "result":          status,
+                "triggered_block": triggered_block,
+                "subject_ref":     _current_subject_ref.get() or None,
+            },
+            daemon=True,
+        ).start()
 
     def intent_classifier_node(self, state: GraphState):
         """Node 2: Intent Classifier with Preference Merging and Product-Detail Detection.
@@ -426,6 +434,30 @@ class ShoppingAssistantWorkflow:
             through to normal shopping / chat classification
           • Everything else → normal LLM classification (shopping / preference_update / chat)
         """
+        _t0 = time.time()
+        _trace_id = _current_trace_id.get()
+        _subject_ref = _current_subject_ref.get() or None
+
+        def _audit_return(return_val: dict) -> dict:
+            # The logged intent always comes from the return value being sent back
+            # to LangGraph — never from stale state — so the row reflects this turn.
+            if self.audit_wrapper:
+                threading.Thread(
+                    target=self.audit_wrapper.log_node_execution,
+                    kwargs={
+                        "trace_id":   _trace_id,
+                        "node_name":  "intent_classifier",
+                        "node_type":  "router",
+                        "node_order": 2,
+                        "status":     "success",
+                        "node_output": return_val.get("intent"),
+                        "latency_ms": (time.time() - _t0) * 1000,
+                        "subject_ref": _subject_ref,
+                    },
+                    daemon=True,
+                ).start()
+            return return_val
+
         with track_time("node_intent_classifier"):
             query = state["query"]
             history = state.get("history", [])
@@ -448,7 +480,7 @@ class ShoppingAssistantWorkflow:
                 }
             elif product_result is not None:
                 # Explicit product selection or confirmed follow-up in discussion mode.
-                return product_result
+                return _audit_return(product_result)
             
             # Format context for intent classifier
             context = self.memory_manager.format_context_for_llm(history, summary)
@@ -516,7 +548,7 @@ class ShoppingAssistantWorkflow:
                         final_preferences = self._merge_preferences(previous_preferences, pending_new_preferences, "shopping")
                     
                     # Return with the action APPLIED - no need to go through clarification node again
-                    return {
+                    return _audit_return({
                         "intent": "shopping",
                         "query": original_query,
                         "preferences": final_preferences,  # Already applied the choice
@@ -524,7 +556,7 @@ class ShoppingAssistantWorkflow:
                         "previous_preferences": final_preferences,  # Update so next query doesn't conflict
                         "user_action_choice": None,  # Clear since we already applied it
                         "clarification_asked_last_turn": False  # Clear flag
-                    }
+                    })
             
             # Process query with context
             with track_time("intent_classification"):
@@ -555,7 +587,7 @@ class ShoppingAssistantWorkflow:
             and user_query.intent in ("shopping", "preference_update")
         )
 
-        return {
+        return _audit_return({
             "intent":               user_query.intent,
             "preferences":          merged_preferences,
             "new_preferences":      new_preferences,
@@ -569,7 +601,7 @@ class ShoppingAssistantWorkflow:
                 }
                 if clear_discussion else {}
             ),
-        }
+        })
     
     def _detect_clarification_response(self, query: str, previous_preferences) -> str:
         """Detect if user is responding with START_FRESH, MERGE, or REPLACE choice"""
@@ -608,9 +640,10 @@ class ShoppingAssistantWorkflow:
     def product_search_node(self, state: GraphState):
         """Node 3: Product Search using Vector Search (MCP)"""
         with track_time("node_product_search"):
+            _t0 = time.time()
             preferences = state["preferences"]
             query = state["query"]
-            
+
             try:
                 # Build search query embedding
                 with track_time("embedding_generation"):
@@ -738,31 +771,47 @@ class ShoppingAssistantWorkflow:
                 print(f"[SEARCH] Found {len(results)} unique products (after post-filtering and deduplication)")
                 print(f"[PRICE FILTER] Total filtered by price: {filtered_by_price}/{len(search_results)}", file=sys.stderr)
 
-                # ── AUDIT: node execution log ──
+                # ── AUDIT: tool call log (structured metadata only — no raw query text) ──
                 if self.audit_wrapper:
-                    self.audit_wrapper.log_node_execution(
-                        trace_id   = _current_trace_id.get(),
-                        node_name  = "product_search_node",
-                        status     = "success",
-                        node_input = str(preferences)[:500] if preferences else "",
-                        node_output= f"{len(results)} products found",
-                        node_type  = "retriever",
-                        node_order = 3,
-                    )
+                    threading.Thread(
+                        target=self.audit_wrapper.log_tool_call,
+                        kwargs={
+                            "trace_id":    _current_trace_id.get(),
+                            "tool_name":   "product_search",
+                            "tool_inputs": {
+                                "query_length": len(search_query),
+                                "filters":      filters,
+                                "top_k":        50,
+                                "cache_hit":    cache_hit,
+                            },
+                            "tool_outputs": {
+                                "result_count": len(results),
+                            },
+                            "status":      "success",
+                            "latency_ms":  (time.time() - _t0) * 1000,
+                            "subject_ref": _current_subject_ref.get() or None,
+                        },
+                        daemon=True,
+                    ).start()
                 return {"results": results}
-                
+
             except Exception as e:
                 print(f"[ERROR] Vector search failed: {e}")
-                # ── AUDIT: node execution log (error path) ──
+                # ── AUDIT: tool call log (error path) ──
                 if self.audit_wrapper:
-                    self.audit_wrapper.log_node_execution(
-                        trace_id   = _current_trace_id.get(),
-                        node_name  = "product_search_node",
-                        status     = "error",
-                        error_msg  = str(e)[:500],
-                        node_type  = "retriever",
-                        node_order = 3,
-                    )
+                    threading.Thread(
+                        target=self.audit_wrapper.log_tool_call,
+                        kwargs={
+                            "trace_id":      _current_trace_id.get(),
+                            "tool_name":     "product_search",
+                            "tool_inputs":   {"query_length": len(query) if query else 0},
+                            "status":        "error",
+                            "error_message": str(e)[:500],
+                            "latency_ms":    (time.time() - _t0) * 1000,
+                            "subject_ref":   _current_subject_ref.get() or None,
+                        },
+                        daemon=True,
+                    ).start()
                 return {"results": [], "error": str(e)}
 
     # --- Conditional Logic ---
@@ -1065,11 +1114,35 @@ class ShoppingAssistantWorkflow:
     
     def personalization_node(self, state: GraphState):
         """Node: Generate personalized context from history and user profile"""
-        
+        _t0 = time.time()
+        _trace_id = _current_trace_id.get()
+        _subject_ref = _current_subject_ref.get() or None
+
+        def _log(status: str, output_summary: str) -> None:
+            # Exactly one call per invocation regardless of which path below is
+            # taken — _legacy_personalization() itself never logs its own row.
+            if self.audit_wrapper:
+                threading.Thread(
+                    target=self.audit_wrapper.log_node_execution,
+                    kwargs={
+                        "trace_id":   _trace_id,
+                        "node_name":  "personalization",
+                        "node_type":  "llm",
+                        "node_order": 3,
+                        "status":     status,
+                        "node_output": output_summary,
+                        "latency_ms": (time.time() - _t0) * 1000,
+                        "subject_ref": _subject_ref,
+                    },
+                    daemon=True,
+                ).start()
+
         # If personalization engine is not enabled, use legacy simple personalization
         if not self.personalization_enabled:
-            return self._legacy_personalization(state)
-        
+            result = self._legacy_personalization(state)
+            _log("success", "legacy_personalization")
+            return result
+
         # New personalization with profile learning
         user_id = state.get("user_id")
         query = state.get("query", "")
@@ -1078,24 +1151,26 @@ class ShoppingAssistantWorkflow:
         preferences = state.get("preferences")
         last_discussed_product = state.get("last_discussed_product")
         personalization_session = state.get("personalization_session")
-        
+
         # If no user_id, fall back to legacy
         if not user_id:
             print("[PERSONALIZATION] No user_id provided, using legacy personalization")
-            return self._legacy_personalization(state)
-        
+            result = self._legacy_personalization(state)
+            _log("success", "legacy_personalization_no_user_id")
+            return result
+
         try:
             from .personalization.models import UserProfile, SessionState
             from .personalization.engine import RateLimitExceeded
-            
+
             # Load user profile from storage
             current_profile = self.profile_storage.load_profile(user_id)
-            
+
             # Deserialize session state if exists
             current_session = None
             if personalization_session:
                 current_session = SessionState.from_dict(personalization_session)
-            
+
             # Process message with personalization engine
             try:
                 updated_profile, updated_session, context = self.personalization_engine.process_message(
@@ -1104,47 +1179,53 @@ class ShoppingAssistantWorkflow:
                     current_profile=current_profile,
                     current_session=current_session
                 )
-                
+
                 # Save updated profile
                 self.profile_storage.save_profile(updated_profile)
-                
+
                 # Build personalization context for LLM
                 personalization_context = context.get("profile_summary", "")
-                
+
                 # Enhance context with product interests
                 if last_discussed_product:
                     personalization_context += f". Recently discussed: {last_discussed_product.get('name')} by {last_discussed_product.get('brand')}"
-                
+
                 # Merge personalization insights with existing preferences
                 merged_preferences = self._merge_personalization_with_preferences(
                     current_preferences=preferences,
                     personalization_context=context,
                     updated_profile=updated_profile
                 )
-                
+
                 print(f"[PERSONALIZATION] Profile updated for user {user_id}")
                 print(f"[PERSONALIZATION] Context: {personalization_context}")
-                
-                return {
+
+                result = {
                     "personalization_context": personalization_context,
                     "personalization_session": updated_session.to_dict(),
                     "preferences": merged_preferences or preferences  # Use merged if available
                 }
-                
+                _log("success", (personalization_context or "")[:500])
+                return result
+
             except RateLimitExceeded as e:
                 print(f"[PERSONALIZATION] Rate limit exceeded for user {user_id}: {e}")
                 # Don't update profile, but continue with existing state
-                return {
+                result = {
                     "personalization_context": "Rate limit reached. Using previous preferences.",
                     "personalization_session": personalization_session
                 }
-                
+                _log("skipped", "rate_limited")
+                return result
+
         except Exception as e:
             print(f"[PERSONALIZATION] Error: {e}")
             import traceback
             print(f"[PERSONALIZATION] Traceback: {traceback.format_exc()}")
             # Fall back to legacy on error
-            return self._legacy_personalization(state)
+            result = self._legacy_personalization(state)
+            _log("success", "legacy_personalization_fallback")
+            return result
     
     def _legacy_personalization(self, state: GraphState):
         """Legacy personalization implementation (simple history-based)"""
@@ -1301,7 +1382,24 @@ class ShoppingAssistantWorkflow:
     
     def result_validator_node(self, state: GraphState):
         """Node: Validate search results"""
-        return self.result_validator.process(state)
+        _t0 = time.time()
+        result = self.result_validator.process(state)
+        if self.audit_wrapper:
+            threading.Thread(
+                target=self.audit_wrapper.log_node_execution,
+                kwargs={
+                    "trace_id":    _current_trace_id.get(),
+                    "node_name":   "result_validator",
+                    "node_type":   "router",
+                    "node_order":  5,
+                    "status":      "success",
+                    "node_output": result.get("result_count_status"),
+                    "latency_ms":  (time.time() - _t0) * 1000,
+                    "subject_ref": _current_subject_ref.get() or None,
+                },
+                daemon=True,
+            ).start()
+        return result
     
     def constraint_relaxer_node(self, state: GraphState):
         """Node: Relax search constraints for better results"""
@@ -1371,12 +1469,48 @@ class ShoppingAssistantWorkflow:
     def reranker_node(self, state: GraphState):
         """Node: Rerank products using LLM"""
         with track_time("node_reranker"):
-            return self.reranker.process(state)
-    
+            _t0 = time.time()
+            result = self.reranker.process(state)
+        if self.audit_wrapper:
+            threading.Thread(
+                target=self.audit_wrapper.log_node_execution,
+                kwargs={
+                    "trace_id":    _current_trace_id.get(),
+                    "node_name":   "reranker",
+                    "node_type":   "llm",
+                    "node_order":  6,
+                    "status":      "success",
+                    "node_output": f"{len(result.get('reranked_results') or [])} products",
+                    "latency_ms":  (time.time() - _t0) * 1000,
+                    "subject_ref": _current_subject_ref.get() or None,
+                },
+                daemon=True,
+            ).start()
+        return result
+
     def response_generator_node(self, state: GraphState):
         """Node: Generate conversational response"""
         with track_time("node_response_generator"):
-            return self.response_generator.process(state)
+            result = self.response_generator.process(state)
+
+        # ── AUDIT: model output log (only writer of model_outputs_raw) ──
+        if self.audit_wrapper:
+            products = state.get("reranked_results") or state.get("results") or []
+            recommended_ids = [
+                p.get("id") for p in products[:3] if isinstance(p, dict) and p.get("id")
+            ]
+            threading.Thread(
+                target=self.audit_wrapper.log_model_output,
+                kwargs={
+                    "trace_id":          _current_trace_id.get(),
+                    "output_text":       result.get("generated_response", ""),
+                    "recommended_items": recommended_ids,
+                    "subject_ref":       _current_subject_ref.get() or None,
+                },
+                daemon=True,
+            ).start()
+
+        return result
     
     def output_guardrail_node(self, state: GraphState):
         """Node: Validate output response for safety and accuracy"""
@@ -1429,17 +1563,9 @@ class ShoppingAssistantWorkflow:
         if validation_result['corrections_made']:
             print("[OUTPUT GUARDRAIL NODE] Response was corrected ✓")
 
-        # ── AUDIT: node execution log ──
-        if self.audit_wrapper:
-            self.audit_wrapper.log_node_execution(
-                trace_id   = _current_trace_id.get(),
-                node_name  = "output_guardrail_node",
-                status     = validation_result["status"],
-                node_input = generated_response[:500] if generated_response else "",
-                node_output= str(validation_result.get("issues", [])),
-                node_type  = "guardrail",
-                node_order = 6,
-            )
+        # Output guardrail result is logged once to guardrail_results_raw from
+        # process_query (policy_name="output_content_safety") — not here, to
+        # avoid a duplicate row in node_executions_raw.
 
         return {
             "safe_response": validation_result["safe_response"],
@@ -1926,17 +2052,34 @@ class ShoppingAssistantWorkflow:
         initial_state["trace_id"] = pre_trace_id
         _current_trace_id.set(pre_trace_id)
 
+        # ── AUDIT: compute subject_ref once per request — every node/guardrail/
+        #    tool-call audit event reads it from the ContextVar instead of each
+        #    calling _compute_refs() itself ──
+        try:
+            if self.audit_wrapper and user_id:
+                _subj = self.audit_wrapper._compute_refs(user_id)[1]
+            else:
+                _subj = ''
+        except Exception as _e:
+            print(f"[AUDIT] subject_ref computation failed (non-blocking): {_e}")
+            _subj = ''
+        _current_subject_ref.set(_subj)
+
         # ── AUDIT: log session start once per new conversation ──
         _is_new_session = not (
             initial_state.get("history") or initial_state.get("summary")
         )
         if self.audit_wrapper and user_id and _is_new_session:
-            self.audit_wrapper.log_session(
-                session_id  = session_id,
-                user_email  = user_id,
-                channel     = "web",
-                device_type = "unknown",
-            )
+            threading.Thread(
+                target=self.audit_wrapper.log_session,
+                kwargs={
+                    "session_id":  session_id,
+                    "user_email":  user_id,
+                    "channel":     "web",
+                    "device_type": "unknown",
+                },
+                daemon=True,
+            ).start()
 
         # Run graph inside a root MLflow trace so all node spans are nested under it
         with RequestTrace(query=query, user_id=user_id, session_id=session_id) as rt:
@@ -1974,31 +2117,40 @@ class ShoppingAssistantWorkflow:
                 if not _user_country:
                     _user_country = os.getenv("DEFAULT_USER_COUNTRY", "")
 
-                _result = self.audit_wrapper.log_interaction(
-                    user_email            = user_id,
-                    user_input            = query,
-                    model_output          = str(_output),
-                    model_name            = os.getenv(
-                        "DATABRICKS_CHAT_ENDPOINT",
-                        "databricks-meta-llama-3-1-8b-instruct"
-                    ),
-                    status                = _status,
-                    session_id            = session_id,
-                    user_country          = _user_country,
-                    system_prompt_version = "v1.0",
-                    mlflow_trace_id       = trace_id,
-                    final_state           = final_state,
-                )
+                threading.Thread(
+                    target=self.audit_wrapper.log_interaction,
+                    kwargs={
+                        "user_email":            user_id,
+                        "user_input":            query,
+                        "model_output":          str(_output),
+                        "model_name":            os.getenv(
+                            "DATABRICKS_CHAT_ENDPOINT",
+                            "databricks-meta-llama-3-1-8b-instruct"
+                        ),
+                        "status":                _status,
+                        "trace_id":              pre_trace_id,
+                        "session_id":            session_id,
+                        "user_country":          _user_country,
+                        "system_prompt_version": "v1.0",
+                        "mlflow_trace_id":       trace_id,
+                        "final_state":           final_state,
+                    },
+                    daemon=True,
+                ).start()
 
                 if final_state.get("guardrail_status"):
-                    self.audit_wrapper.log_guardrail(
-                        trace_id        = _result.get("trace_id", ""),
-                        policy_name     = "output_content_safety",
-                        score           = 1.0 if final_state.get("guardrail_status") == "pass" else 0.0,
-                        result          = final_state.get("guardrail_status", "pass"),
-                        triggered_block = final_state.get("guardrail_status") == "fail",
-                        subject_ref     = _result.get("subject_ref"),
-                    )
+                    threading.Thread(
+                        target=self.audit_wrapper.log_guardrail,
+                        kwargs={
+                            "trace_id":        pre_trace_id,
+                            "policy_name":     "output_content_safety",
+                            "score":           1.0 if final_state.get("guardrail_status") == "pass" else 0.0,
+                            "result":          final_state.get("guardrail_status", "pass"),
+                            "triggered_block": final_state.get("guardrail_status") == "fail",
+                            "subject_ref":     _current_subject_ref.get() or None,
+                        },
+                        daemon=True,
+                    ).start()
 
             except Exception as _e:
                 print(f"[AUDIT] Logging failed (non-blocking): {_e}")
