@@ -632,6 +632,9 @@ class ShoppingAssistantWorkflow:
 
     def product_search_node(self, state: GraphState):
         """Node 3: Product Search using Vector Search (MCP)"""
+        if self.vector_client is None:
+            print("[SEARCH] vector_client is None", file=sys.stderr)
+            return {"results": [], "error": "Vector search unavailable", "result_count_status": "zero"}
         with track_time("node_product_search"):
             _t0 = time.time()
             preferences = state["preferences"]
