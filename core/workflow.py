@@ -755,7 +755,15 @@ class ShoppingAssistantWorkflow:
                             # If price conversion fails, include the product (don't skip)
                             print(f"[SEARCH] Price conversion warning for {product_id}: {e}", file=sys.stderr)
                             pass
-                    
+
+                    # Post-filter by category (substring match against the
+                    # category_clean taxonomy path — see _category_matches)
+                    category_clean = metadata.get('category', '')
+                    if preferences.categories and not self._category_matches(category_clean, preferences.categories):
+                        continue
+                    if preferences.excluded_categories and self._category_matches(category_clean, preferences.excluded_categories):
+                        continue
+
                     # Add to results and mark as seen
                     results.append({
                         'id': product_id,
@@ -1882,61 +1890,12 @@ class ShoppingAssistantWorkflow:
         # Note: Price is stored as string in Pinecone, so we skip numeric comparisons
         # You may need to filter results after retrieval or convert in Pinecone upload
         
-        # Category filter (inclusion) - uses "category" field
-        if preferences.categories:
-            # Map friendly names and create variations for better matching
-            category_variations = []
-            for cat in preferences.categories:
-                cat_lower = cat.lower()
-                # Add original
-                category_variations.append(cat)
-                # Add lowercase
-                category_variations.append(cat_lower)
-                # Add capitalized
-                category_variations.append(cat.title())
-                # Add without 's' or with 's'
-                if cat_lower.endswith('s'):
-                    category_variations.append(cat_lower[:-1])  # "tote bags" -> "tote bag"
-                    category_variations.append(cat_lower[:-1].title())  # "Tote Bag"
-                else:
-                    category_variations.append(cat_lower + 's')  # "tote" -> "totes"
-                    category_variations.append((cat_lower + 's').title())  # "Totes"
-                
-                # Add common mappings
-                if 'tote' in cat_lower:
-                    category_variations.extend(['tote', 'Tote', 'tote bag', 'Tote Bag', 'tote bags', 'Tote Bags'])
-                elif 'shoulder' in cat_lower:
-                    category_variations.extend(['shoulder', 'Shoulder', 'shoulder bag', 'Shoulder Bag'])
-                elif 'crossbody' in cat_lower or 'cross-body' in cat_lower:
-                    category_variations.extend(['crossbody', 'Crossbody', 'cross-body', 'Cross-Body'])
-                elif 'backpack' in cat_lower:
-                    category_variations.extend(['backpack', 'Backpack', 'backpacks', 'Backpacks'])
-            
-            # Remove duplicates
-            category_variations = list(set(category_variations))
-            
-            print(f"[FILTER DEBUG] Original categories: {preferences.categories}")
-            print(f"[FILTER DEBUG] Category variations for matching: {category_variations[:10]}...")  # Show first 10
-            
-            # Always use $in for flexibility, even with one category
-            conditions.append({"category": {"$in": category_variations}})
-        
-        # Category filter (exclusion)
-        if preferences.excluded_categories:
-            category_map = {
-                "tote bags": "tote",
-                "shoulder bags": "shoulder",
-                "crossbody bags": "crossbody",
-                "backpacks": "backpack",
-                "clutches": "clutch"
-            }
-            mapped_excluded = [category_map.get(cat.lower(), cat) for cat in preferences.excluded_categories]
-            
-            if len(mapped_excluded) == 1:
-                conditions.append({"category": {"$ne": mapped_excluded[0]}})
-            else:
-                conditions.append({"category": {"$nin": mapped_excluded}})
-        
+        # Category filter: NOT sent as an index-level filter. category_clean
+        # stores full taxonomy paths (e.g. "women/handbags/totes--1"), which
+        # can never match an exact/IN filter against a bare keyword like
+        # "tote". Category matching is instead applied as a substring
+        # post-filter in product_search_node() via _category_matches().
+
         # Color filter (inclusion) - uses "primary_color" field
         if preferences.colors:
             # Create color variations (lowercase, title case)
@@ -1975,12 +1934,12 @@ class ShoppingAssistantWorkflow:
             else:
                 conditions.append({"material_type": {"$nin": preferences.excluded_materials}})
         
-        # Brand filter (exclusion) - uses "brand" field
+        # Brand filter (exclusion) - uses "brand_clean" field
         if preferences.excluded_brands:
             if len(preferences.excluded_brands) == 1:
-                conditions.append({"brand": {"$ne": preferences.excluded_brands[0]}})
+                conditions.append({"brand_clean": {"$ne": preferences.excluded_brands[0]}})
             else:
-                conditions.append({"brand": {"$nin": preferences.excluded_brands}})
+                conditions.append({"brand_clean": {"$nin": preferences.excluded_brands}})
         
         # Filter only available products (commented out for debugging)
         # conditions.append({"available": {"$eq": "true"}})
@@ -1992,6 +1951,37 @@ class ShoppingAssistantWorkflow:
             return conditions[0]
         else:
             return {"$and": conditions}
+
+    @staticmethod
+    def _generate_category_variations(categories: List[str]) -> List[str]:
+        """Build lowercase keyword variations (e.g. "tote bags" -> "tote",
+        "cross-body") used for substring matching against category_clean."""
+        category_variations = []
+        for cat in categories:
+            cat_lower = cat.lower()
+            category_variations.append(cat_lower)
+            if cat_lower.endswith('s'):
+                category_variations.append(cat_lower[:-1])
+            else:
+                category_variations.append(cat_lower + 's')
+
+            if 'tote' in cat_lower:
+                category_variations.append('tote')
+            elif 'shoulder' in cat_lower:
+                category_variations.append('shoulder')
+            elif 'crossbody' in cat_lower or 'cross-body' in cat_lower:
+                category_variations.extend(['crossbody', 'cross-body'])
+            elif 'backpack' in cat_lower:
+                category_variations.append('backpack')
+        return list(set(category_variations))
+
+    def _category_matches(self, category_clean: Optional[str], categories: List[str]) -> bool:
+        """Substring match against the category_clean taxonomy path (e.g.
+        "women/handbags/totes--1"), since exact/IN filtering can't work here."""
+        if not category_clean or not categories:
+            return False
+        haystack = category_clean.lower()
+        return any(kw in haystack for kw in self._generate_category_variations(categories))
 
     def process_query(self, query: str, session_id: str, user_id: str = None) -> dict:
         """Main entry point for the app"""

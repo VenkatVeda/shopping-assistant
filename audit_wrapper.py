@@ -65,6 +65,7 @@ def _determine_regulation(country: str = "", state: str = "", sector: str = "") 
     if country in _EU_COUNTRIES:          return "GDPR"
     if country == "US" and state == "CA": return "CCPA"
     if country == "IN":                   return "DPDP"
+    if country == "AU":                   return "AUS"
     return "INTERNAL_POLICY"
 
 # ── PII redactor ───────────────────────────────────────────────────────────
@@ -473,6 +474,7 @@ class AuditWrapper:
         Writes only to ai_interactions_raw — model output is logged separately
         via log_model_output().
         Returns dict with trace_id and subject_ref for chaining.
+
         """
         trace_id = trace_id or str(uuid.uuid4())
         result   = {"trace_id": trace_id, "status": "ok"}
@@ -664,13 +666,13 @@ class AuditWrapper:
         consent_version: Optional[str] = "tnc_v2.1",
     ) -> None:
         """
-        Register a customer in customer_pii on first login.
+        Register a customer in customer_pii on first login ONLY.
         Call from oauth_callback in app.py after Google login succeeds.
         Fire-and-forget — never blocks the login flow.
 
-        Safe to call on EVERY login — not just first time. The table is
-        append-only so repeat logins just add a new row with updated
-        consent timestamp. Erasure deletes ALL rows for that subject_ref.
+        Safe to call on EVERY login. If a row already exists for this
+        subject_id, the call is a no-op — repeat logins do NOT create
+        duplicate rows. Erasure deletes the row for that subject_ref.
 
         PII is handled entirely inside this method — the caller never
         sees subject_id or subject_ref. Raw email is stored here by
@@ -678,6 +680,17 @@ class AuditWrapper:
         """
         try:
             subject_id, subject_ref = self._compute_refs(user_email)
+
+            # ── check if this customer already exists ──
+            existing = spark.sql(f"""
+                SELECT COUNT(*) AS c
+                FROM {self._tbl('raw_logs.customer_pii')}
+                WHERE subject_id = '{subject_id}'
+            """).first()["c"]
+
+            if existing > 0:
+                return  # already registered — skip, no duplicate row
+
             regulation = _determine_regulation(user_country or "", user_state or "")
             now = _now_iso()
             row = {
