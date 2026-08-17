@@ -1592,6 +1592,91 @@ def metrics_dashboard():
 
 
 # ============================================================================
+# WISHLIST API ROUTES
+# ============================================================================
+
+@app.route('/api/wishlist', methods=['GET'])
+@token_required
+def wishlist_get():
+    """Fetch all active wishlist items for the authenticated user."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.wishlist_store is None:
+        return jsonify({'error': 'Wishlist unavailable'}), 503
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    items = workflow.wishlist_store.fetch(subject_ref)
+    return jsonify({'items': items, 'count': len(items)})
+
+
+@app.route('/api/wishlist/add', methods=['POST'])
+@token_required
+def wishlist_add():
+    """Add a product to the authenticated user's wishlist."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.wishlist_store is None:
+        return jsonify({'error': 'Wishlist unavailable'}), 503
+
+    data = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+
+    if workflow.wishlist_store.is_in_wishlist(subject_ref, product_id):
+        return jsonify({'status': 'already_exists', 'product_id': product_id}), 200
+
+    wishlist_id = workflow.wishlist_store.add(
+        subject_ref=subject_ref,
+        product_id=product_id,
+        product_name=data.get('product_name'),
+        brand=data.get('brand'),
+        price=data.get('price'),
+        image_url=data.get('image_url'),
+        retailer_url=data.get('retailer_url'),
+    )
+    workflow.audit_wrapper.log_wishlist_action(
+        trace_id=str(uuid.uuid4()),
+        action='add_to_wishlist',
+        product_id=product_id,
+        status='success',
+        subject_ref=subject_ref,
+    )
+    return jsonify({'status': 'added', 'wishlist_id': wishlist_id, 'product_id': product_id}), 201
+
+
+@app.route('/api/wishlist/remove', methods=['DELETE'])
+@token_required
+def wishlist_remove():
+    """Remove a product from the authenticated user's wishlist (soft delete)."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.wishlist_store is None:
+        return jsonify({'error': 'Wishlist unavailable'}), 503
+
+    data = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    workflow.wishlist_store.remove(subject_ref, product_id)
+    workflow.audit_wrapper.log_wishlist_action(
+        trace_id=str(uuid.uuid4()),
+        action='remove_from_wishlist',
+        product_id=product_id,
+        status='success',
+        subject_ref=subject_ref,
+    )
+    return jsonify({'status': 'removed', 'product_id': product_id}), 200
+
+
+# ============================================================================
 # APPLICATION ENTRY POINT
 # ============================================================================
 

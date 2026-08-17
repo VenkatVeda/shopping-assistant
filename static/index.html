@@ -44,12 +44,28 @@
             </div>
         </div>
 
-        <!-- Right Column - Products -->
-        <div class="right-column" id="resultsContainer">
-            <div class="empty-state">
-                <div class="empty-icon">🛍️</div>
-                <h3>Start searching</h3>
-                <p>Enter your preferences to find the perfect bag</p>
+        <!-- Right Column - Products / Wishlist -->
+        <div class="right-column">
+            <!-- Tab bar -->
+            <div class="panel-tabs">
+                <button id="tabProducts" class="panel-tab active" onclick="switchTab('products')">Products</button>
+                <button id="tabWishlist" class="panel-tab" onclick="switchTab('wishlist')">
+                    ♡ Wishlist <span id="wishlistBadge" class="wishlist-badge" style="display:none">0</span>
+                </button>
+            </div>
+            <div id="resultsContainer">
+                <div class="empty-state">
+                    <div class="empty-icon">🛍️</div>
+                    <h3>Start searching</h3>
+                    <p>Enter your preferences to find the perfect bag</p>
+                </div>
+            </div>
+            <div id="wishlistContainer" style="display:none">
+                <div class="empty-state">
+                    <div class="empty-icon">♡</div>
+                    <h3>Your wishlist is empty</h3>
+                    <p>Tap the heart on any product to save it here</p>
+                </div>
             </div>
         </div>
     </div>

@@ -65,6 +65,11 @@ class GraphState(TypedDict):
     last_discussed_product: Optional[dict]  # Last product discussed (id, name, brand)
     trace_id: Optional[str]  # Unique ID linking all audit logs for this request
 
+    # Wishlist Fields
+    wishlist_items:    Optional[List[dict]]  # Loaded wishlist items for current turn
+    action_product_id: Optional[str]         # Product ID targeted by wishlist/cart action
+    action_status:     Optional[str]         # Result: success / already_exists / not_found / error
+
 class ShoppingAssistantWorkflow:
     def __init__(self):
         print("Initializing Shopping Assistant Workflow...")
@@ -213,6 +218,19 @@ class ShoppingAssistantWorkflow:
             self.audit_wrapper = None
         # ─────────────────────────────────────────────────────────────────────
 
+        # ── Wishlist Store ────────────────────────────────────────────────────
+        try:
+            from .wishlist_store import WishlistStore, ensure_table
+            self.wishlist_store = WishlistStore(
+                app_id=os.getenv("AUDIT_APP_ID", "myre_app")
+            )
+            ensure_table()
+            print("✓ WishlistStore initialised")
+        except Exception as _we:
+            print(f"[WISHLIST] WishlistStore init failed (non-blocking): {_we}")
+            self.wishlist_store = None
+        # ─────────────────────────────────────────────────────────────────────
+
         # Build Graph
         self.app = self._build_graph()
         print("✓ Workflow Ready with Pinecone + RAG Enhancement!")
@@ -233,6 +251,7 @@ class ShoppingAssistantWorkflow:
         workflow.add_node("reranker",                t("reranker",                self.reranker_node))
         workflow.add_node("response_generator",      t("response_generator",      self.response_generator_node))
         workflow.add_node("output_guardrail",        t("output_guardrail",        self.output_guardrail_node))
+        workflow.add_node("wishlist_action",         t("wishlist_action",         self.wishlist_action_node))
         
         # Set Entry Point
         workflow.set_entry_point("input_guardrail")
@@ -255,8 +274,14 @@ class ShoppingAssistantWorkflow:
                 "shopping_conflict": "clarification",       # pause: ask START_FRESH/MERGE/REPLACE
                 "chat":              "response_generator",  # LLM chat reply → guardrail → END
                 "product_detail":    "response_generator",  # skip search pipeline entirely
+                "add_to_wishlist":   "wishlist_action",     # save product to wishlist
+                "remove_from_wishlist": "wishlist_action",  # remove product from wishlist
+                "view_wishlist":     "wishlist_action",     # fetch and display wishlist
             }
         )
+
+        # Wishlist action always routes to response_generator for confirmation message
+        workflow.add_edge("wishlist_action", "response_generator")
 
         # Clarification is a deliberate pause node — it always stops for user input.
         # The "continue" branch is a safety valve; in normal operation the node
@@ -787,6 +812,8 @@ class ShoppingAssistantWorkflow:
         intent = state.get("intent")
         if intent == "product_detail":
             return "product_detail"
+        if intent in ("add_to_wishlist", "remove_from_wishlist", "view_wishlist"):
+            return intent
         if intent in ("shopping", "preference_update"):
             prev = state.get("preferences")
             new  = state.get("new_preferences")
@@ -1448,6 +1475,81 @@ class ShoppingAssistantWorkflow:
             "generated_response": validation_result["safe_response"]  # Update with safe version
         }
     
+    def wishlist_action_node(self, state: GraphState):
+        """Node: Handle add_to_wishlist, remove_from_wishlist, view_wishlist intents."""
+        intent      = state.get("intent", "")
+        user_id     = state.get("user_id")
+        product_id  = state.get("action_product_id") or state.get("selected_product_id")
+        trace_id    = _current_trace_id.get()
+
+        # Compute subject_ref for Delta writes (reuse AuditWrapper's HMAC chain)
+        subject_ref = None
+        if self.audit_wrapper and user_id:
+            try:
+                _, subject_ref = self.audit_wrapper._compute_refs(user_id)
+            except Exception:
+                pass
+
+        wishlist_items = []
+        action_status  = "error"
+
+        try:
+            if intent == "view_wishlist":
+                if self.wishlist_store and subject_ref:
+                    wishlist_items = self.wishlist_store.fetch(subject_ref)
+                action_status = "success"
+                if self.audit_wrapper:
+                    self.audit_wrapper.log_wishlist_action(
+                        trace_id=trace_id, action="view",
+                        product_id="", status=action_status, subject_ref=subject_ref
+                    )
+
+            elif intent == "add_to_wishlist":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.wishlist_store and subject_ref:
+                    if self.wishlist_store.is_in_wishlist(subject_ref, product_id):
+                        action_status = "already_exists"
+                    else:
+                        product_ctx = state.get("product_context") or {}
+                        last_product = state.get("last_discussed_product") or {}
+                        self.wishlist_store.add(
+                            subject_ref  = subject_ref,
+                            product_id   = product_id,
+                            product_name = product_ctx.get("name") or last_product.get("name"),
+                            brand        = product_ctx.get("brand") or last_product.get("brand"),
+                            price        = product_ctx.get("price"),
+                            image_url    = product_ctx.get("primary_image_url") or product_ctx.get("image_url"),
+                            retailer_url = product_ctx.get("url_full") or product_ctx.get("url"),
+                        )
+                        action_status = "success"
+                    if self.audit_wrapper:
+                        self.audit_wrapper.log_wishlist_action(
+                            trace_id=trace_id, action="add",
+                            product_id=product_id, status=action_status, subject_ref=subject_ref
+                        )
+
+            elif intent == "remove_from_wishlist":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.wishlist_store and subject_ref:
+                    self.wishlist_store.remove(subject_ref, product_id)
+                    action_status = "success"
+                    if self.audit_wrapper:
+                        self.audit_wrapper.log_wishlist_action(
+                            trace_id=trace_id, action="remove",
+                            product_id=product_id, status=action_status, subject_ref=subject_ref
+                        )
+
+        except Exception as e:
+            print(f"[WISHLIST NODE] Error: {e}")
+            action_status = "error"
+
+        return {
+            "wishlist_items": wishlist_items,
+            "action_status":  action_status,
+        }
+
     def _detect_product_intent(self, state: GraphState):
         """Determine whether this turn is a product-detail interaction.
 

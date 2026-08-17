@@ -640,6 +640,33 @@ class AuditWrapper:
         except Exception as e:
             self._log_failure("register", "customer_pii", e)
 
+    def log_wishlist_action(
+        self,
+        trace_id:   str,
+        action:     str,
+        product_id: str,
+        status:     str,
+        subject_ref: Optional[str] = None,
+    ) -> None:
+        """Log a wishlist add/remove/view event to raw_logs.wishlist_events_raw. Fire-and-forget."""
+        try:
+            now = _now_iso()
+            row = {
+                "event_id":       str(uuid.uuid4()),
+                "trace_id":       trace_id    or None,
+                "app_id":         self.app_id,
+                "subject_ref":    subject_ref or None,
+                "action":         action,
+                "product_id":     product_id  or None,
+                "status":         status,
+                "is_erasure_flag":"false",
+                "created_at":     now,
+                "schema_version": self.schema_version,
+            }
+            _fire(self._tbl("raw_logs.wishlist_events_raw"), row)
+        except Exception as e:
+            self._log_failure(trace_id, "wishlist_events_raw", e)
+
     def _log_failure(self, trace_id: str, failed_table: str, error: Exception) -> None:
         """Log wrapper failures to logging_failures table. Never raises."""
         try:

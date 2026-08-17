@@ -10,13 +10,15 @@ let sessionId = generateSessionId();
 let currentProducts = [];  // Store current products for reference
 let selectedProductId = null;  // Track selected product
 let searchPerformed = false;  // Track if any search has been performed
+let wishlistItems = [];       // Cached wishlist from server
+let wishlistIds = new Set();  // product_id set for O(1) lookup
+let activeTab = 'products';   // 'products' | 'wishlist'
 
 // Check authentication on page load
 document.addEventListener('DOMContentLoaded', () => {
-    // Authentication is now handled by backend redirect
-    // Just display user info if cookies exist
     displayUserInfo();
-    
+    loadWishlist();
+
     const sendBtn = document.getElementById('sendBtn');
     const clearBtn = document.getElementById('clearBtn');
     const userInput = document.getElementById('userInput');
@@ -443,11 +445,20 @@ function createProductCard(product, index) {
         ? `<img src="${imageUrl}" alt="${name}" class="product-image" onerror="this.onerror=null; this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22200%22><rect width=%22200%22 height=%22200%22 fill=%22%23f0f0f0%22/><text x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 font-size=%2260%22>🛍️</text></svg>';">`
         : `<div class="product-image-placeholder">🛍️</div>`;
 
+    const inWishlist = wishlistIds.has(String(productId));
+    const heartIcon = inWishlist ? '♥' : '♡';
+    const heartClass = inWishlist ? 'wishlist-heart-btn in-wishlist' : 'wishlist-heart-btn';
+    const heartTitle = inWishlist ? 'Remove from wishlist' : 'Add to wishlist';
+
     return `
         <div class="product-card" data-product-id="${productId}">
-            <div class="product-image-container">
+            <div class="product-image-container" style="position:relative">
                 ${imageHtml}
                 <div class="product-number">${index + 1}</div>
+                <button class="${heartClass}" data-product-id="${productId}" title="${heartTitle}"
+                    onclick="toggleWishlistItem(currentProducts[${index}],this);event.stopPropagation()">
+                    ${heartIcon}
+                </button>
             </div>
             <div class="product-info">
                 <h3 class="product-name">${name}</h3>
@@ -461,6 +472,168 @@ function createProductCard(product, index) {
             </div>
         </div>
     `;
+}
+
+// ── Wishlist helpers ──────────────────────────────────────────────────────
+
+async function loadWishlist() {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/wishlist`, { credentials: 'include' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        wishlistItems = data.items || [];
+        wishlistIds = new Set(wishlistItems.map(i => String(i.product_id)));
+        updateWishlistBadge();
+        if (activeTab === 'wishlist') renderWishlistPanel();
+        refreshHeartButtons();
+    } catch (_) {}
+}
+
+function updateWishlistBadge() {
+    const badge = document.getElementById('wishlistBadge');
+    if (!badge) return;
+    if (wishlistIds.size > 0) {
+        badge.textContent = wishlistIds.size;
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+    // Update tab label heart
+    const tab = document.getElementById('tabWishlist');
+    if (tab) tab.childNodes[0].textContent = wishlistIds.size > 0 ? '♥ Wishlist ' : '♡ Wishlist ';
+}
+
+function refreshHeartButtons() {
+    document.querySelectorAll('.wishlist-heart-btn').forEach(btn => {
+        const pid = String(btn.dataset.productId);
+        const inList = wishlistIds.has(pid);
+        btn.textContent = inList ? '♥' : '♡';
+        btn.classList.toggle('in-wishlist', inList);
+        btn.title = inList ? 'Remove from wishlist' : 'Add to wishlist';
+    });
+}
+
+async function toggleWishlistItem(product, btnEl) {
+    const pid = String(product.id);
+    const inList = wishlistIds.has(pid);
+
+    // Optimistic update
+    if (inList) {
+        wishlistIds.delete(pid);
+        wishlistItems = wishlistItems.filter(i => String(i.product_id) !== pid);
+    } else {
+        wishlistIds.add(pid);
+        wishlistItems.push({
+            product_id:   pid,
+            product_name: product.name,
+            brand:        product.brand,
+            price:        product.price,
+            image_url:    product.image,
+            retailer_url: product.url,
+        });
+    }
+    updateWishlistBadge();
+    if (btnEl) {
+        btnEl.textContent = wishlistIds.has(pid) ? '♥' : '♡';
+        btnEl.classList.toggle('in-wishlist', wishlistIds.has(pid));
+    }
+    if (activeTab === 'wishlist') renderWishlistPanel();
+
+    // Server sync
+    try {
+        const method = inList ? 'DELETE' : 'POST';
+        const endpoint = inList ? '/wishlist/remove' : '/wishlist/add';
+        await fetch(`${API_BASE_URL}${endpoint}`, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                product_id:   pid,
+                product_name: product.name,
+                brand:        product.brand,
+                price:        product.price,
+                image_url:    product.image,
+                retailer_url: product.url,
+            }),
+        });
+    } catch (err) {
+        console.warn('Wishlist sync failed:', err);
+    }
+}
+
+async function removeWishlistItem(productId) {
+    const pid = String(productId);
+    wishlistIds.delete(pid);
+    wishlistItems = wishlistItems.filter(i => String(i.product_id) !== pid);
+    updateWishlistBadge();
+    refreshHeartButtons();
+    renderWishlistPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/wishlist/remove`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ product_id: pid }),
+        });
+    } catch (err) {
+        console.warn('Wishlist remove failed:', err);
+    }
+}
+
+function renderWishlistPanel() {
+    const container = document.getElementById('wishlistContainer');
+    if (!container) return;
+    if (wishlistItems.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">♡</div>
+                <h3>Your wishlist is empty</h3>
+                <p>Tap the heart on any product to save it here</p>
+            </div>`;
+        return;
+    }
+    const items = wishlistItems.map(item => {
+        const pid = escapeHtml(String(item.product_id));
+        const name = escapeHtml(item.product_name || 'Product');
+        const brand = escapeHtml(item.brand || '');
+        const price = item.price ? `$${parseFloat(item.price).toFixed(2)}` : '';
+        const imgSrc = item.image_url || '';
+        const imgEl = imgSrc
+            ? `<img src="${imgSrc}" alt="${name}" class="wishlist-item-img" onerror="this.style.display='none'">`
+            : `<div class="wishlist-item-img" style="display:flex;align-items:center;justify-content:center;font-size:28px">🛍️</div>`;
+        return `
+            <div class="wishlist-item">
+                ${imgEl}
+                <div class="wishlist-item-info">
+                    <div class="wishlist-item-name" title="${name}">${name}</div>
+                    ${brand ? `<div class="wishlist-item-brand">${brand}</div>` : ''}
+                    ${price ? `<div class="wishlist-item-price">${price}</div>` : ''}
+                </div>
+                <button class="wishlist-item-remove" title="Remove" onclick="removeWishlistItem('${pid}')">✕</button>
+            </div>`;
+    }).join('');
+    container.innerHTML = `<div class="wishlist-panel-header">${wishlistItems.length} saved item${wishlistItems.length !== 1 ? 's' : ''}</div>${items}`;
+}
+
+function switchTab(tab) {
+    activeTab = tab;
+    const products = document.getElementById('resultsContainer');
+    const wishlist = document.getElementById('wishlistContainer');
+    const tabP = document.getElementById('tabProducts');
+    const tabW = document.getElementById('tabWishlist');
+    if (tab === 'products') {
+        products.style.display = '';
+        wishlist.style.display = 'none';
+        tabP.classList.add('active');
+        tabW.classList.remove('active');
+    } else {
+        products.style.display = 'none';
+        wishlist.style.display = '';
+        tabP.classList.remove('active');
+        tabW.classList.add('active');
+        renderWishlistPanel();
+    }
 }
 
 // Handle clear chat
