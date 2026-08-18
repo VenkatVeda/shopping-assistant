@@ -120,12 +120,11 @@ class DatabricksAdapter(VectorStoreInterface):
         _t0 = time.time()
         _error = ""
         try:
-            # Convert filters to Databricks SQL WHERE clause if provided
-            filter_clause = None
-            if filters:
-                filter_clause = self._build_filter_clause(filters)
-            
-            # Columns available in sandbox.venkat.bags_embeddings table
+            # Build filter dict for the Python client (dict format required,
+            # SQL strings are only for REST API calls — not the Python SDK)
+            filter_dict = self._build_filter_dict(filters) if filters else None
+
+            # Columns available in sandbox.venkat.bags_embeddings_v2 table
             columns_to_retrieve = [
                 "product_id",
                 "name_clean",
@@ -139,16 +138,16 @@ class DatabricksAdapter(VectorStoreInterface):
                 "is_available",
                 "on_sale",
                 "primary_image_url",
-                "url_full",  # Myer product page URL
+                "url_full",
                 "embedding_text"
             ]
-            
+
             # Execute vector search
             results = self.index.similarity_search(
                 query_vector=vector,
                 columns=columns_to_retrieve,
                 num_results=top_k,
-                filters=filter_clause
+                filters=filter_dict
             )
             
             # Debug: Print raw response
@@ -443,6 +442,31 @@ class DatabricksAdapter(VectorStoreInterface):
         """
         return self.get_index_stats()
     
+    def _build_filter_dict(self, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Convert internal filter dict to the format expected by the Databricks Vector Search
+        Python client: {"column_name OP value": None} or simple {"column": value}.
+
+        The Python SDK accepts filters as a plain dict where each key is a column name
+        and the value is the expected scalar, list ($in), or operator dict ($gt etc.).
+        We flatten $and lists and pass the dict directly — the SDK handles the rest.
+        """
+        if not filters:
+            return None
+
+        result = {}
+        for key, value in filters.items():
+            if key == "$and" and isinstance(value, list):
+                for sub in value:
+                    if isinstance(sub, dict):
+                        merged = self._build_filter_dict(sub)
+                        if merged:
+                            result.update(merged)
+            else:
+                result[key] = value
+
+        return result if result else None
+
     def _build_filter_clause(self, filters: Dict[str, Any]) -> Optional[str]:
         """
         Convert a MongoDB-style filters dict to a Databricks SQL WHERE clause string.
