@@ -3,56 +3,71 @@ env:
 
   - name: FLASK_ENV
     value: production
-  
 
-  # Flask Secret Key for sessions — set via Databricks secret scope in production
   - name: FLASK_SECRET_KEY
-    value: "{{secrets/shopping_assistant/flask-secret-key}}"
+    valueFrom: flask-secret-key
 
   - name: ENABLE_PERSONALIZATION
     value: "true"
-  
+
+  # JWT Configuration
+  - name: JWT_SECRET_KEY
+    valueFrom: jwt-secret-key
+
   # SQL Warehouse for persistent storage
   - name: DATABRICKS_WAREHOUSE_ID
     value: "8eba55b5eb828697"
   - name: DATABRICKS_SQL_WAREHOUSE_ID
     valueFrom: databricks-sql-warehouse-id
-  
-  # JWT Configuration
-  - name: JWT_SECRET_KEY
-    value: "{{secrets/shopping_assistant/jwt-secret-key}}"
-
 
   # Databricks Foundation Model Endpoints
   - name: DATABRICKS_EMBEDDING_ENDPOINT
-    value: "databricks-bge-large-en"  # Or your custom embedding endpoint
+    value: "databricks-bge-large-en"
   - name: DATABRICKS_CHAT_ENDPOINT
-    value: "databricks-meta-llama-3-1-8b-instruct"  # For memory summarization
+    value: "databricks-meta-llama-3-1-8b-instruct"
   - name: DATABRICKS_INTENT_ENDPOINT
-    value: "databricks-meta-llama-3-1-8b-instruct"  # For intent classification
-  
+    value: "databricks-meta-llama-3-1-8b-instruct"
+
   # MCP Vector Store Configuration
   - name: USE_MCP_VECTOR_SEARCH
-    value: "false"  # Disabled for Databricks Apps - use DirectVectorClient instead
+    value: "false"
   - name: VECTOR_STORE_TYPE
     value: "databricks"
 
-  # Databricks Vector Search Configuration (In-House)
+  # Databricks Vector Search Configuration
   - name: DATABRICKS_VECTOR_ENDPOINT
     value: "bags-vector-search-endpoint"
   - name: DATABRICKS_VECTOR_INDEX
-    value: "sandbox.venkat.bags_embeddings_index_01"
+    value: "sandbox.venkat.bags_embeddings_v2_index"
   - name: DATABRICKS_SOURCE_TABLE
-    value: "sandbox.venkat.bags_embeddings"
+    value: "sandbox.venkat.bags_embeddings_v2"
   - name: VECTOR_EMBEDDING_DIMENSION
     value: "1024"
   - name: VECTOR_PRIMARY_KEY
     value: "product_id"
   - name: VECTOR_EMBEDDING_COLUMN
     value: "embedding"
-  
-  # Pinecone Configuration (Backup - kept for easy switching)
-  # - name: PINECONE_API_KEY
-  #   value: "{{secrets/shopping-assistant/pinecone-api-key}}"
-  # - name: PINECONE_INDEX_NAME
-  #   value: "bags-image-url-embeddings"
+
+  # Pinecone (dummy — app uses Databricks vector search)
+  - name: PINECONE_API_KEY
+    value: "dummy"
+  - name: PINECONE_INDEX_NAME
+    value: "dummy"
+
+  # Audit Trail Configuration
+  - name: AUDIT_APP_ID
+    valueFrom: audit-app-id
+  - name: AUDIT_CATALOG
+    valueFrom: audit-catalog
+  - name: AUDIT_SECRET_SCOPE
+    valueFrom: audit-secret-scope
+
+  # User defaults
+  - name: DEFAULT_USER_COUNTRY
+    valueFrom: default-user-country
+
+  # Google OAuth
+  - name: GOOGLE_CLIENT_ID
+    valueFrom: google-client-id
+  - name: GOOGLE_CLIENT_SECRET
+    valueFrom: google-client-secret
