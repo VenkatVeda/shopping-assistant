@@ -31,7 +31,11 @@ class DatabricksAdapter(VectorStoreInterface):
             index_name: Vector search index name (defaults to env var DATABRICKS_VECTOR_INDEX)
             endpoint_name: Vector search endpoint (defaults to env var DATABRICKS_VECTOR_ENDPOINT)
         """
-        self.host = host or os.getenv("DATABRICKS_HOST")
+        raw_host = host or os.getenv("DATABRICKS_HOST", "")
+        # Databricks Apps injects DATABRICKS_HOST without the https:// scheme
+        if raw_host and not raw_host.startswith("http"):
+            raw_host = f"https://{raw_host}"
+        self.host = raw_host or None
         self.token = token or os.getenv("DATABRICKS_TOKEN")
         self.index_name = index_name or os.getenv("DATABRICKS_VECTOR_INDEX", "bags_embeddings_index")
         self.endpoint_name = endpoint_name or os.getenv("DATABRICKS_VECTOR_ENDPOINT")

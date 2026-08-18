@@ -14,6 +14,10 @@ env:
   - name: JWT_SECRET_KEY
     valueFrom: jwt-secret-key
 
+  # Databricks workspace URL — must include https:// scheme
+  - name: DATABRICKS_HOST
+    value: "https://adb-4206962778623078.18.azuredatabricks.net"
+
   # SQL Warehouse for persistent storage
   - name: DATABRICKS_WAREHOUSE_ID
     value: "8eba55b5eb828697"
@@ -56,7 +60,7 @@ env:
 
   # Audit Trail Configuration
   - name: AUDIT_APP_ID
-    valueFrom: audit-app-id
+    value: "ecom-shop-assistant-dev"
   - name: AUDIT_CATALOG
     valueFrom: audit-catalog
   - name: AUDIT_SECRET_SCOPE
@@ -64,7 +68,7 @@ env:
 
   # User defaults
   - name: DEFAULT_USER_COUNTRY
-    valueFrom: default-user-country
+    value: "US"
 
   # Google OAuth
   - name: GOOGLE_CLIENT_ID
