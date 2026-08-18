@@ -444,17 +444,43 @@ class DatabricksAdapter(VectorStoreInterface):
     
     def _build_filter_dict(self, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Convert internal filter dict to the format expected by the Databricks Vector Search
-        Python client: {"column_name OP value": None} or simple {"column": value}.
+        Convert Pinecone/MongoDB-style filters to Databricks Vector Search Python SDK format.
 
-        The Python SDK accepts filters as a plain dict where each key is a column name
-        and the value is the expected scalar, list ($in), or operator dict ($gt etc.).
-        We flatten $and lists and pass the dict directly — the SDK handles the rest.
+        Databricks SDK filter format:
+          {"col": value}          equality
+          {"col": [v1, v2]}       IN list
+          {"col NOT": value}      not-equal
+          {"col NOT": [v1, v2]}   NOT IN list
+          {"col >": value}        greater-than  (also >=, <, <=)
+          Multiple keys = AND
         """
         if not filters:
             return None
 
         result = {}
+
+        def _convert_one(col: str, expr: Any):
+            if isinstance(expr, (str, int, float, bool)):
+                result[col] = expr
+            elif isinstance(expr, list):
+                result[col] = expr
+            elif isinstance(expr, dict):
+                for op, val in expr.items():
+                    if op == "$in":
+                        result[col] = val if isinstance(val, list) else [val]
+                    elif op == "$nin":
+                        result[f"{col} NOT"] = val if isinstance(val, list) else [val]
+                    elif op == "$ne":
+                        result[f"{col} NOT"] = val
+                    elif op == "$gt":
+                        result[f"{col} >"] = val
+                    elif op == "$gte":
+                        result[f"{col} >="] = val
+                    elif op == "$lt":
+                        result[f"{col} <"] = val
+                    elif op == "$lte":
+                        result[f"{col} <="] = val
+
         for key, value in filters.items():
             if key == "$and" and isinstance(value, list):
                 for sub in value:
@@ -463,7 +489,7 @@ class DatabricksAdapter(VectorStoreInterface):
                         if merged:
                             result.update(merged)
             else:
-                result[key] = value
+                _convert_one(key, value)
 
         return result if result else None
 

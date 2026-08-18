@@ -1899,7 +1899,7 @@ class ShoppingAssistantWorkflow:
             print(f"[FILTER DEBUG] Category variations for matching: {category_variations[:10]}...")  # Show first 10
             
             # Always use $in for flexibility, even with one category
-            conditions.append({"category": {"$in": category_variations}})
+            conditions.append({"category_clean": {"$in": category_variations}})
         
         # Category filter (exclusion)
         if preferences.excluded_categories:
@@ -1913,9 +1913,9 @@ class ShoppingAssistantWorkflow:
             mapped_excluded = [category_map.get(cat.lower(), cat) for cat in preferences.excluded_categories]
             
             if len(mapped_excluded) == 1:
-                conditions.append({"category": {"$ne": mapped_excluded[0]}})
+                conditions.append({"category_clean": {"$ne": mapped_excluded[0]}})
             else:
-                conditions.append({"category": {"$nin": mapped_excluded}})
+                conditions.append({"category_clean": {"$nin": mapped_excluded}})
         
         # Color filter (inclusion) - uses "primary_color" field
         if preferences.colors:
@@ -1955,12 +1955,12 @@ class ShoppingAssistantWorkflow:
             else:
                 conditions.append({"material_type": {"$nin": preferences.excluded_materials}})
         
-        # Brand filter (exclusion) - uses "brand" field
+        # Brand filter (exclusion) - uses "brand_clean" field
         if preferences.excluded_brands:
             if len(preferences.excluded_brands) == 1:
-                conditions.append({"brand": {"$ne": preferences.excluded_brands[0]}})
+                conditions.append({"brand_clean": {"$ne": preferences.excluded_brands[0]}})
             else:
-                conditions.append({"brand": {"$nin": preferences.excluded_brands}})
+                conditions.append({"brand_clean": {"$nin": preferences.excluded_brands}})
         
         # Filter only available products (commented out for debugging)
         # conditions.append({"available": {"$eq": "true"}})
