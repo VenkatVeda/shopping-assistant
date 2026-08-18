@@ -15,6 +15,8 @@ env:
   # SQL Warehouse for persistent storage
   - name: DATABRICKS_WAREHOUSE_ID
     value: "8eba55b5eb828697"
+  - name: DATABRICKS_SQL_WAREHOUSE_ID
+    valueFrom: databricks-sql-warehouse-id
   
   # JWT Configuration
   - name: JWT_SECRET_KEY
