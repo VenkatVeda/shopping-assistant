@@ -1,3 +1,4 @@
+
 """
 AuditWrapper — writes AI interaction audit events to Delta tables
 in the shopping_assistant catalog on Databricks.
@@ -10,12 +11,18 @@ Follows the same pattern as core/audit_logger.py:
 
 Usage in workflow.py:
     # in __init__:
-    from audit_wrapper import AuditWrapper
-    self.audit_wrapper = AuditWrapper(
-        catalog = os.getenv("AUDIT_CATALOG", "shopping_assistant"),
-    )
+    from audit_wrapper import AuditWrapper, AuditTrailCallback
+    from audit_wrapper import _current_trace_id, _current_subject_ref
 
-    # in process_query, after final_state["trace_id"] = trace_id:
+    self.audit_wrapper  = AuditWrapper(catalog=os.getenv("AUDIT_CATALOG", "shopping_assistant"))
+    self.audit_callback = AuditTrailCallback(self.audit_wrapper)
+
+    # in _build_graph, after compile:
+    app = workflow.compile(checkpointer=self.memory)
+    if self.audit_callback:
+        app = app.with_config({"callbacks": [self.audit_callback]})
+
+    # in process_query, after the graph completes:
     self.audit_wrapper.log_interaction(
         user_email      = user_id,
         user_input      = query,
@@ -40,15 +47,30 @@ Required .env variables:
 import os
 import re
 import json
+import time
 import hmac as hmac_lib
 import hashlib
 import logging
 import threading
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Optional
 
+try:
+    from langchain_core.callbacks import BaseCallbackHandler
+except ImportError:
+    BaseCallbackHandler = object  # graceful fallback if langchain_core not installed
+
 logger = logging.getLogger(__name__)
+
+# ── shared ContextVars — set once per request in process_query ────────────
+# AuditTrailCallback reads these so every auto-logged node row
+# gets the same trace_id and subject_ref as the manual rows.
+# Import these in workflow.py instead of redefining them there:
+#   from audit_wrapper import _current_trace_id, _current_subject_ref
+_current_trace_id:    ContextVar[str] = ContextVar('_current_trace_id',    default='')
+_current_subject_ref: ContextVar[str] = ContextVar('_current_subject_ref', default='')
 
 # ── jurisdiction mapper ────────────────────────────────────────────────────
 _EU_COUNTRIES = {
@@ -104,7 +126,7 @@ def _detect_pii_types(text: str) -> list:
 
 # ── low-level writer ───────────────────────────────────────────────────────
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 def _write_row(table: str, row: dict) -> None:
     """
@@ -345,7 +367,6 @@ class AuditWrapper:
         _fire(self._tbl("raw_logs.sessions_raw"), row)
         return session_id
 
-    # ── NEW: log_session ──────────────────────────────────────────────────
     def log_session(
         self,
         session_id:  str,
@@ -377,7 +398,6 @@ class AuditWrapper:
         except Exception as e:
             self._log_failure(session_id, "sessions_raw", e)
 
-    # ── NEW: log_node_execution ───────────────────────────────────────────
     def log_node_execution(
         self,
         trace_id:       str,
@@ -395,6 +415,7 @@ class AuditWrapper:
         model_version:  Optional[str]   = None,
         tokens_used:    Optional[int]   = None,
         retry_count:    Optional[int]   = None,
+        node_metadata:  Optional[dict]  = None,
     ) -> Optional[str]:
         """
         Log one LangGraph node execution to node_executions_raw. Fire-and-forget.
@@ -407,6 +428,15 @@ class AuditWrapper:
         parent_node_id: node_execution_id of triggering node (branching pipelines)
         model_name    : only for LLM nodes — which model was called
         tokens_used   : only for LLM nodes — token count
+        node_metadata : dict of agent-level detail, stored as JSON in the
+                        node_metadata column. Use these keys consistently
+                        across every app so the column stays queryable:
+                          agent_id       - stable id of the agent that ran this step
+                          agent_role     - "researcher" / "recommender" / "broker"
+                          handoff_from   - agent_id that handed control to this step
+                          handoff_reason - why control moved
+                          reasoning      - the model's stated reason for its decision
+                        PII-redacted before write. Never put raw email or name here.
 
         Returns the generated node_execution_id, or None if logging failed.
         """
@@ -415,7 +445,18 @@ class AuditWrapper:
             started    = _now_iso()
             input_san  = _redact_pii(str(node_input  or ""))
             output_san = _redact_pii(str(node_output or ""))
-            ended      = _now_iso()
+
+            # node_metadata → JSON string, PII-redacted.
+            # default=str so non-serialisable values degrade instead of raising.
+            meta_json = None
+            if node_metadata:
+                try:
+                    meta_json = _redact_pii(json.dumps(node_metadata, default=str))
+                except Exception as _me:
+                    logger.warning("[AUDIT] node_metadata not serialisable: %s", _me)
+                    meta_json = None
+
+            ended = _now_iso()
             row = {
                 "node_execution_id": node_execution_id,
                 "trace_id":          trace_id,
@@ -439,6 +480,7 @@ class AuditWrapper:
                 "node_order":        str(node_order)  if node_order  is not None else None,
                 "tokens_used":       str(tokens_used) if tokens_used is not None else None,
                 "retry_count":       str(retry_count) if retry_count is not None else None,
+                "node_metadata":     meta_json,
             }
             _fire(self._tbl("raw_logs.node_executions_raw"), row)
             return node_execution_id
@@ -453,15 +495,16 @@ class AuditWrapper:
         model_output:           str,
         model_name:             str,
         status:                 str,
-        trace_id:               Optional[str]  = None,
-        session_id:             Optional[str]  = None,
-        model_version:          Optional[str]  = None,
-        user_country:           Optional[str]  = None,
-        user_state:             Optional[str]  = None,
-        system_prompt_version:  Optional[str]  = None,
-        consent_version:        Optional[str]  = None,
-        mlflow_trace_id:        Optional[str]  = None,
-        final_state:            Optional[dict] = None,
+        trace_id:               Optional[str]   = None,
+        session_id:             Optional[str]   = None,
+        model_version:          Optional[str]   = None,
+        user_country:           Optional[str]   = None,
+        user_state:             Optional[str]   = None,
+        system_prompt_version:  Optional[str]   = None,
+        consent_version:        Optional[str]   = None,
+        mlflow_trace_id:        Optional[str]   = None,
+        latency_ms:             Optional[float] = None,
+        final_state:            Optional[dict]  = None,
     ) -> dict:
         """
         Core method. Call once per AI interaction after the graph completes.
@@ -474,7 +517,6 @@ class AuditWrapper:
         Writes only to ai_interactions_raw — model output is logged separately
         via log_model_output().
         Returns dict with trace_id and subject_ref for chaining.
-
         """
         trace_id = trace_id or str(uuid.uuid4())
         result   = {"trace_id": trace_id, "status": "ok"}
@@ -529,15 +571,15 @@ class AuditWrapper:
                 "created_at":            now,
                 "schema_version":        self.schema_version,
                 # optional — only include if provided
-                "session_id":            session_id     or None,
-                "user_country":          user_country   or None,
-                "user_state":            user_state     or None,
-                "model_version":         model_version  or None,
+                "session_id":            session_id      or None,
+                "user_country":          user_country    or None,
+                "user_state":            user_state      or None,
+                "model_version":         model_version   or None,
                 "run_id":                mlflow_trace_id or None,
                 "consent_version":       consent_version or None,
                 # numeric columns — None means omit from INSERT (no CAST error)
                 "confidence_score":      None,
-                "latency_ms":            None,
+                "latency_ms":            str(int(round(latency_ms))) if latency_ms is not None else None,
             }
             _fire(self._tbl("raw_logs.ai_interactions_raw"), int_row)
 
@@ -653,7 +695,7 @@ class AuditWrapper:
             "subject_ref":     subject_ref   or None,
             "error_message":   error_message or None,
             # numeric — omit if None
-            "latency_ms":      str(round(latency_ms, 2)) if latency_ms else None,
+            "latency_ms":      str(int(round(latency_ms))) if latency_ms is not None else None,
         }
         _fire(self._tbl("raw_logs.tool_calls_raw"), row)
 
@@ -681,7 +723,7 @@ class AuditWrapper:
         try:
             subject_id, subject_ref = self._compute_refs(user_email)
 
-            # ── check if this customer already exists ──
+            # ── check if this customer already exists ──────────────────────
             from databricks.sdk import WorkspaceClient
             from databricks.sdk.service.sql import StatementState
 
@@ -728,16 +770,127 @@ class AuditWrapper:
         try:
             now = _now_iso()
             row = {
-                "failure_id":    str(uuid.uuid4()),
-                "app_id":        self.app_id,
-                "trace_id":      trace_id      or None,
-                "failed_table":  failed_table,
-                "error_message": str(error)[:2000],
-                "occurred_at":   now,
-                "recovered":     "false",
-                "created_at":    now,
-                "schema_version":self.schema_version,
+                "failure_id":     str(uuid.uuid4()),
+                "app_id":         self.app_id,
+                "trace_id":       trace_id     or None,
+                "failed_table":   failed_table,
+                "error_message":  str(error)[:2000],
+                "occurred_at":    now,
+                "recovered":      "false",
+                "created_at":     now,
+                "schema_version": self.schema_version,
             }
             _fire(self._tbl("raw_logs.logging_failures"), row)
         except Exception:
             pass
+
+
+# ── AuditTrailCallback ────────────────────────────────────────────────────
+# Separate top-level class — NOT inside AuditWrapper.
+#
+# Pass one instance to graph.compile().with_config() and every node,
+# LLM call, and tool call logs itself automatically to Delta tables.
+# Failures are handled inside AuditWrapper._log_failure() — not here.
+#
+# Usage in workflow.py __init__:
+#     from audit_wrapper import AuditWrapper, AuditTrailCallback
+#     self.audit_wrapper  = AuditWrapper(...)
+#     self.audit_callback = AuditTrailCallback(self.audit_wrapper)
+#
+# Usage in workflow.py _build_graph:
+#     app = workflow.compile(checkpointer=self.memory)
+#     if self.audit_callback:
+#         app = app.with_config({"callbacks": [self.audit_callback]})
+
+class AuditTrailCallback(BaseCallbackHandler):
+    """
+    LangGraph callback adapter for AuditWrapper.
+    Replaces all manual log_node_execution threading calls in workflow.py.
+    Every node, LLM call, and tool call is captured automatically.
+    Works with any LangGraph app — not just Shopping Assistant.
+    """
+
+    def __init__(self, audit_wrapper: "AuditWrapper"):
+        self.audit_wrapper = audit_wrapper
+        # key: run_id (UUID from LangGraph) → (start_time, node_name)
+        self._runs: dict = {}
+
+    def _extract_name(self, serialized, kwargs) -> str:
+        """
+        LangGraph 0.2.x passes the registered node name in
+        kwargs["metadata"]["langgraph_node"] — not in run_name or serialized.
+        """
+        metadata = kwargs.get("metadata") or {}
+        return (
+            metadata.get("langgraph_node")          # ← LangGraph 0.2.x node name
+            or kwargs.get("run_name")               # fallback: explicit run_name
+            or (serialized.get("name") if serialized else None)
+            or (serialized.get("id", ["unknown"])[-1] if serialized else None)
+            or "unknown"
+        )
+
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        """Called by LangGraph BEFORE every node runs. Records start time."""
+        run_id    = str(kwargs.get("run_id", id(inputs)))
+        node_name = self._extract_name(serialized, kwargs)
+        self._runs[run_id] = (time.time(), node_name)
+
+    def on_chain_end(self, outputs, **kwargs):
+        """Called by LangGraph AFTER every node completes successfully."""
+        # only log real graph nodes — skip graph runner and NodeTracer wrapper
+        node_name = (kwargs.get("metadata") or {}).get("langgraph_node")
+        if not node_name:
+            self._runs.pop(str(kwargs.get("run_id", "")), None)
+            return
+        run_id     = str(kwargs.get("run_id", ""))
+        t0, _      = self._runs.pop(run_id, (time.time(), node_name))
+        self.audit_wrapper.log_node_execution(
+            trace_id    = _current_trace_id.get(),
+            node_name   = node_name,
+            status      = "success",
+            node_output = str(outputs)[:500],
+            latency_ms  = (time.time() - t0) * 1000,
+            subject_ref = _current_subject_ref.get() or None,
+        )
+
+    def on_chain_end(self, outputs, **kwargs):
+        """Called by LangGraph AFTER every node completes."""
+        run_id        = str(kwargs.get("run_id", ""))
+        t0, node_name = self._runs.pop(run_id, (time.time(), None))
+        # skip graph runner, NodeTracer wrapper — they have no real node name
+        if not node_name or node_name == "unknown":
+            return
+        self.audit_wrapper.log_node_execution(
+            trace_id    = _current_trace_id.get(),
+            node_name   = node_name,
+            status      = "success",
+            node_output = str(outputs)[:500],
+            latency_ms  = (time.time() - t0) * 1000,
+            subject_ref = _current_subject_ref.get() or None,
+        )
+
+    def on_chain_error(self, error, **kwargs):
+        """Called by LangGraph when a node raises an exception."""
+        run_id        = str(kwargs.get("run_id", ""))
+        t0, node_name = self._runs.pop(run_id, (time.time(), None))
+        # skip graph runner, NodeTracer wrapper
+        if not node_name or node_name == "unknown":
+            return
+        self.audit_wrapper.log_node_execution(
+            trace_id    = _current_trace_id.get(),
+            node_name   = node_name,
+            status      = "error",
+            error_msg   = str(error)[:500],
+            latency_ms  = (time.time() - t0) * 1000,
+            subject_ref = _current_subject_ref.get() or None,
+        )
+
+    def on_tool_end(self, output, **kwargs):
+        """Called by LangGraph after every tool call completes."""
+        self.audit_wrapper.log_tool_call(
+            trace_id     = _current_trace_id.get(),
+            tool_name    = kwargs.get("run_name") or "unknown_tool",
+            tool_outputs = {"result": str(output)[:500]},
+            status       = "success",
+            subject_ref  = _current_subject_ref.get() or None,
+        )
