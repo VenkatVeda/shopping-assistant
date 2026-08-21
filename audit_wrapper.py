@@ -682,11 +682,28 @@ class AuditWrapper:
             subject_id, subject_ref = self._compute_refs(user_email)
 
             # ── check if this customer already exists ──
-            existing = spark.sql(f"""
-                SELECT COUNT(*) AS c
-                FROM {self._tbl('raw_logs.customer_pii')}
-                WHERE subject_id = '{subject_id}'
-            """).first()["c"]
+            from databricks.sdk import WorkspaceClient
+            from databricks.sdk.service.sql import StatementState
+
+            warehouse_id = os.getenv("DATABRICKS_SQL_WAREHOUSE_ID")
+            existing = 0
+            if warehouse_id:
+                w = WorkspaceClient()
+                result = w.statement_execution.execute_statement(
+                    warehouse_id = warehouse_id,
+                    statement    = f"""
+                        SELECT COUNT(*) AS c
+                        FROM {self._tbl('raw_logs.customer_pii')}
+                        WHERE subject_id = '{subject_id}'
+                    """,
+                    wait_timeout = "10s",
+                )
+                if (
+                    result.status.state == StatementState.SUCCEEDED
+                    and result.result
+                    and result.result.data_array
+                ):
+                    existing = int(result.result.data_array[0][0])
 
             if existing > 0:
                 return  # already registered — skip, no duplicate row

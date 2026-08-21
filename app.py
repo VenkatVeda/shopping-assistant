@@ -2,7 +2,6 @@
 Smart Shopping Assistant - Databricks App
 Flask backend serving static frontend and API endpoints with LangGraph Workflow
 """
-
 from flask import Flask, send_from_directory, jsonify, request, session, redirect, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
 import os
@@ -28,6 +27,7 @@ from core.auth import (
 from core.performance import get_monitor, get_tracker, track_time
 from core.observability import metrics_store, RequestTrace
 from core.evals import EvalRunner
+from core.geoip import get_country_from_request
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -396,7 +396,7 @@ def oauth_callback():
                 workflow.audit_wrapper.register_customer(
                     user_email      = email,
                     full_name       = name,
-                    user_country    = user_info.get("locale", "")[:2].upper() or os.getenv("DEFAULT_USER_COUNTRY", ""),
+                    user_country = get_country_from_request(request) or os.getenv("DEFAULT_USER_COUNTRY", ""),
                     consent_version = "tnc_v2.1",
                 )
         except Exception as _re:
