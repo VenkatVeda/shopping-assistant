@@ -70,6 +70,10 @@ class GraphState(TypedDict):
     action_product_id: Optional[str]         # Product ID targeted by wishlist/cart action
     action_status:     Optional[str]         # Result: success / already_exists / not_found / error
 
+    # Cart Fields
+    cart_items:        Optional[List[dict]]  # Loaded cart items for current turn
+    cart_quantity:     Optional[int]         # Quantity for add_to_cart action (default 1)
+
 class ShoppingAssistantWorkflow:
     def __init__(self):
         print("Initializing Shopping Assistant Workflow...")
@@ -229,6 +233,18 @@ class ShoppingAssistantWorkflow:
         except Exception as _we:
             print(f"[WISHLIST] WishlistStore init failed (non-blocking): {_we}")
             self.wishlist_store = None
+
+        # ── Cart Store ────────────────────────────────────────────────────────
+        try:
+            from .cart_store import CartStore, ensure_table as cart_ensure_table
+            self.cart_store = CartStore(
+                app_id=os.getenv("AUDIT_APP_ID", "myre_app")
+            )
+            cart_ensure_table()
+            print("✓ CartStore initialised")
+        except Exception as _ce:
+            print(f"[CART] CartStore init failed (non-blocking): {_ce}")
+            self.cart_store = None
         # ─────────────────────────────────────────────────────────────────────
 
         # Build Graph
@@ -252,6 +268,7 @@ class ShoppingAssistantWorkflow:
         workflow.add_node("response_generator",      t("response_generator",      self.response_generator_node))
         workflow.add_node("output_guardrail",        t("output_guardrail",        self.output_guardrail_node))
         workflow.add_node("wishlist_action",         t("wishlist_action",         self.wishlist_action_node))
+        workflow.add_node("cart_action",             t("cart_action",             self.cart_action_node))
         
         # Set Entry Point
         workflow.set_entry_point("input_guardrail")
@@ -274,14 +291,18 @@ class ShoppingAssistantWorkflow:
                 "shopping_conflict": "clarification",       # pause: ask START_FRESH/MERGE/REPLACE
                 "chat":              "response_generator",  # LLM chat reply → guardrail → END
                 "product_detail":    "response_generator",  # skip search pipeline entirely
-                "add_to_wishlist":   "wishlist_action",     # save product to wishlist
-                "remove_from_wishlist": "wishlist_action",  # remove product from wishlist
-                "view_wishlist":     "wishlist_action",     # fetch and display wishlist
+                "add_to_wishlist":    "wishlist_action",    # save product to wishlist
+                "remove_from_wishlist": "wishlist_action", # remove product from wishlist
+                "view_wishlist":      "wishlist_action",   # fetch and display wishlist
+                "add_to_cart":        "cart_action",       # add product to cart
+                "remove_from_cart":   "cart_action",       # remove product from cart
+                "view_cart":          "cart_action",       # fetch and display cart
             }
         )
 
-        # Wishlist action always routes to response_generator for confirmation message
+        # Wishlist / cart actions always route to response_generator for confirmation message
         workflow.add_edge("wishlist_action", "response_generator")
+        workflow.add_edge("cart_action",     "response_generator")
 
         # Clarification is a deliberate pause node — it always stops for user input.
         # The "continue" branch is a safety valve; in normal operation the node
@@ -821,6 +842,8 @@ class ShoppingAssistantWorkflow:
         if intent == "product_detail":
             return "product_detail"
         if intent in ("add_to_wishlist", "remove_from_wishlist", "view_wishlist"):
+            return intent
+        if intent in ("add_to_cart", "remove_from_cart", "view_cart"):
             return intent
         if intent in ("shopping", "preference_update"):
             prev = state.get("preferences")
@@ -1556,6 +1579,82 @@ class ShoppingAssistantWorkflow:
         return {
             "wishlist_items": wishlist_items,
             "action_status":  action_status,
+        }
+
+    def cart_action_node(self, state: GraphState):
+        """Node: Handle add_to_cart, remove_from_cart, view_cart intents."""
+        intent     = state.get("intent", "")
+        user_id    = state.get("user_id")
+        product_id = state.get("action_product_id") or state.get("selected_product_id")
+        quantity   = state.get("cart_quantity") or 1
+        trace_id   = _current_trace_id.get()
+
+        subject_ref = None
+        if self.audit_wrapper and user_id:
+            try:
+                _, subject_ref = self.audit_wrapper._compute_refs(user_id)
+            except Exception:
+                pass
+
+        cart_items    = []
+        action_status = "error"
+
+        try:
+            if intent == "view_cart":
+                if self.cart_store and subject_ref:
+                    cart_items = self.cart_store.fetch(subject_ref)
+                action_status = "success"
+                if self.audit_wrapper:
+                    self.audit_wrapper.log_cart_action(
+                        trace_id=trace_id, action="view",
+                        product_id="", status=action_status,
+                        quantity=0, subject_ref=subject_ref
+                    )
+
+            elif intent == "add_to_cart":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.cart_store and subject_ref:
+                    product_ctx  = state.get("product_context") or {}
+                    last_product = state.get("last_discussed_product") or {}
+                    self.cart_store.add(
+                        subject_ref  = subject_ref,
+                        product_id   = product_id,
+                        product_name = product_ctx.get("name") or last_product.get("name"),
+                        brand        = product_ctx.get("brand") or last_product.get("brand"),
+                        price        = product_ctx.get("price"),
+                        image_url    = product_ctx.get("primary_image_url") or product_ctx.get("image_url"),
+                        retailer_url = product_ctx.get("url_full") or product_ctx.get("url"),
+                        quantity     = quantity,
+                    )
+                    action_status = "success"
+                    if self.audit_wrapper:
+                        self.audit_wrapper.log_cart_action(
+                            trace_id=trace_id, action="add",
+                            product_id=product_id, status=action_status,
+                            quantity=quantity, subject_ref=subject_ref
+                        )
+
+            elif intent == "remove_from_cart":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.cart_store and subject_ref:
+                    self.cart_store.remove(subject_ref, product_id)
+                    action_status = "success"
+                    if self.audit_wrapper:
+                        self.audit_wrapper.log_cart_action(
+                            trace_id=trace_id, action="remove",
+                            product_id=product_id, status=action_status,
+                            quantity=0, subject_ref=subject_ref
+                        )
+
+        except Exception as e:
+            print(f"[CART NODE] Error: {e}")
+            action_status = "error"
+
+        return {
+            "cart_items":   cart_items,
+            "action_status": action_status,
         }
 
     def _detect_product_intent(self, state: GraphState):

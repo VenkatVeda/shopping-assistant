@@ -12,12 +12,15 @@ let selectedProductId = null;  // Track selected product
 let searchPerformed = false;  // Track if any search has been performed
 let wishlistItems = [];       // Cached wishlist from server
 let wishlistIds = new Set();  // product_id set for O(1) lookup
-let activeTab = 'products';   // 'products' | 'wishlist'
+let cartItems = [];           // Cached cart from server
+let cartIds = new Set();      // product_id set for O(1) lookup
+let activeTab = 'products';   // 'products' | 'wishlist' | 'cart'
 
 // Check authentication on page load
 document.addEventListener('DOMContentLoaded', () => {
     displayUserInfo();
     loadWishlist();
+    loadCart();
 
     const sendBtn = document.getElementById('sendBtn');
     const clearBtn = document.getElementById('clearBtn');
@@ -450,6 +453,11 @@ function createProductCard(product, index) {
     const heartClass = inWishlist ? 'wishlist-heart-btn in-wishlist' : 'wishlist-heart-btn';
     const heartTitle = inWishlist ? 'Remove from wishlist' : 'Add to wishlist';
 
+    const inCart = cartIds.has(String(productId));
+    const cartBtnClass = inCart ? 'cart-add-btn in-cart' : 'cart-add-btn';
+    const cartBtnTitle = inCart ? 'In cart' : 'Add to cart';
+    const cartBtnIcon = inCart ? '🛒✓' : '🛒';
+
     return `
         <div class="product-card" data-product-id="${productId}">
             <div class="product-image-container" style="position:relative">
@@ -465,9 +473,15 @@ function createProductCard(product, index) {
                 <p class="product-brand">${brand}</p>
                 <p class="product-price">$${price.toFixed(2)}</p>
                 ${badges ? `<div class="product-details">${badges}</div>` : ''}
-                <button class="product-discuss-btn" onclick="selectProductForDiscussion(${index}, event)">
-                    💬 Ask about this
-                </button>
+                <div class="product-actions">
+                    <button class="product-discuss-btn" onclick="selectProductForDiscussion(${index}, event)">
+                        💬 Ask about this
+                    </button>
+                    <button class="${cartBtnClass}" data-product-id="${productId}" title="${cartBtnTitle}"
+                        onclick="addToCartFromCard(currentProducts[${index}],this);event.stopPropagation()">
+                        ${cartBtnIcon}
+                    </button>
+                </div>
                 <a href="${url || '#'}" target="_blank" class="product-link" onclick="event.stopPropagation()" ${!url || url === '#' ? 'style="opacity: 0.5; pointer-events: none;"' : ''}>View Product →</a>
             </div>
         </div>
@@ -602,6 +616,9 @@ function renderWishlistPanel() {
         const imgEl = imgSrc
             ? `<img src="${imgSrc}" alt="${name}" class="wishlist-item-img" onerror="this.style.display='none'">`
             : `<div class="wishlist-item-img" style="display:flex;align-items:center;justify-content:center;font-size:28px">🛍️</div>`;
+        const alreadyInCart = cartIds.has(pid);
+        const cartBtnLabel = alreadyInCart ? '🛒✓' : '🛒';
+        const cartBtnCls   = alreadyInCart ? 'cart-add-btn in-cart wishlist-cart-btn' : 'cart-add-btn wishlist-cart-btn';
         return `
             <div class="wishlist-item">
                 ${imgEl}
@@ -610,7 +627,13 @@ function renderWishlistPanel() {
                     ${brand ? `<div class="wishlist-item-brand">${brand}</div>` : ''}
                     ${price ? `<div class="wishlist-item-price">${price}</div>` : ''}
                 </div>
-                <button class="wishlist-item-remove" title="Remove" onclick="removeWishlistItem('${pid}')">✕</button>
+                <div class="wishlist-item-actions">
+                    <button class="${cartBtnCls}" title="Add to cart"
+                        onclick="addToCartFromWishlist(${JSON.stringify(item)},this)">
+                        ${cartBtnLabel}
+                    </button>
+                    <button class="wishlist-item-remove" title="Remove" onclick="removeWishlistItem('${pid}')">✕</button>
+                </div>
             </div>`;
     }).join('');
     container.innerHTML = `<div class="wishlist-panel-header">${wishlistItems.length} saved item${wishlistItems.length !== 1 ? 's' : ''}</div>${items}`;
@@ -620,20 +643,255 @@ function switchTab(tab) {
     activeTab = tab;
     const products = document.getElementById('resultsContainer');
     const wishlist = document.getElementById('wishlistContainer');
-    const tabP = document.getElementById('tabProducts');
-    const tabW = document.getElementById('tabWishlist');
-    if (tab === 'products') {
-        products.style.display = '';
-        wishlist.style.display = 'none';
-        tabP.classList.add('active');
-        tabW.classList.remove('active');
+    const cart     = document.getElementById('cartContainer');
+    const tabP     = document.getElementById('tabProducts');
+    const tabW     = document.getElementById('tabWishlist');
+    const tabC     = document.getElementById('tabCart');
+
+    products.style.display = tab === 'products' ? '' : 'none';
+    wishlist.style.display = tab === 'wishlist' ? '' : 'none';
+    cart.style.display     = tab === 'cart'     ? '' : 'none';
+
+    tabP.classList.toggle('active', tab === 'products');
+    tabW.classList.toggle('active', tab === 'wishlist');
+    tabC.classList.toggle('active', tab === 'cart');
+
+    if (tab === 'wishlist') renderWishlistPanel();
+    if (tab === 'cart')     renderCartPanel();
+}
+
+// ── Cart helpers ──────────────────────────────────────────────────────────
+
+async function loadCart() {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/cart`, { credentials: 'include' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        cartItems = data.items || [];
+        cartIds   = new Set(cartItems.map(i => String(i.product_id)));
+        updateCartBadge();
+        if (activeTab === 'cart') renderCartPanel();
+        refreshCartButtons();
+    } catch (_) {}
+}
+
+function updateCartBadge() {
+    const badge = document.getElementById('cartBadge');
+    if (!badge) return;
+    const totalQty = cartItems.reduce((s, i) => s + (parseInt(i.quantity) || 1), 0);
+    if (totalQty > 0) {
+        badge.textContent = totalQty;
+        badge.style.display = 'inline-block';
     } else {
-        products.style.display = 'none';
-        wishlist.style.display = '';
-        tabP.classList.remove('active');
-        tabW.classList.add('active');
-        renderWishlistPanel();
+        badge.style.display = 'none';
     }
+}
+
+function refreshCartButtons() {
+    document.querySelectorAll('.cart-add-btn').forEach(btn => {
+        const pid = String(btn.dataset.productId);
+        if (!pid) return;
+        const inCart = cartIds.has(pid);
+        btn.textContent = inCart ? '🛒✓' : '🛒';
+        btn.classList.toggle('in-cart', inCart);
+        btn.title = inCart ? 'In cart' : 'Add to cart';
+    });
+}
+
+async function addToCartFromCard(product, btnEl) {
+    const pid = String(product.id);
+    if (cartIds.has(pid)) {
+        // Already in cart — switch to cart tab for visibility
+        switchTab('cart');
+        return;
+    }
+
+    // Optimistic update
+    cartIds.add(pid);
+    cartItems.push({
+        product_id:   pid,
+        product_name: product.name,
+        brand:        product.brand,
+        price:        product.price,
+        image_url:    product.image,
+        retailer_url: product.url,
+        quantity:     1,
+    });
+    updateCartBadge();
+    if (btnEl) {
+        btnEl.textContent = '🛒✓';
+        btnEl.classList.add('in-cart');
+        btnEl.title = 'In cart';
+    }
+    if (activeTab === 'cart') renderCartPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/add`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                product_id:   pid,
+                product_name: product.name,
+                brand:        product.brand,
+                price:        product.price,
+                image_url:    product.image,
+                retailer_url: product.url,
+                quantity:     1,
+            }),
+        });
+    } catch (err) {
+        console.warn('Cart add failed:', err);
+    }
+}
+
+async function addToCartFromWishlist(item, btnEl) {
+    const pid = String(item.product_id);
+    if (cartIds.has(pid)) {
+        switchTab('cart');
+        return;
+    }
+
+    cartIds.add(pid);
+    cartItems.push({
+        product_id:   pid,
+        product_name: item.product_name,
+        brand:        item.brand,
+        price:        item.price,
+        image_url:    item.image_url,
+        retailer_url: item.retailer_url,
+        quantity:     1,
+    });
+    updateCartBadge();
+    if (btnEl) {
+        btnEl.textContent = '🛒✓';
+        btnEl.classList.add('in-cart');
+    }
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/add`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                product_id:   pid,
+                product_name: item.product_name,
+                brand:        item.brand,
+                price:        item.price,
+                image_url:    item.image_url,
+                retailer_url: item.retailer_url,
+                quantity:     1,
+            }),
+        });
+    } catch (err) {
+        console.warn('Cart add (from wishlist) failed:', err);
+    }
+}
+
+async function removeFromCart(productId) {
+    const pid = String(productId);
+    cartIds.delete(pid);
+    cartItems = cartItems.filter(i => String(i.product_id) !== pid);
+    updateCartBadge();
+    refreshCartButtons();
+    renderCartPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/remove`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ product_id: pid }),
+        });
+    } catch (err) {
+        console.warn('Cart remove failed:', err);
+    }
+}
+
+async function updateCartQty(productId, delta) {
+    const pid  = String(productId);
+    const item = cartItems.find(i => String(i.product_id) === pid);
+    if (!item) return;
+
+    const newQty = (parseInt(item.quantity) || 1) + delta;
+    if (newQty <= 0) {
+        await removeFromCart(pid);
+        return;
+    }
+
+    item.quantity = newQty;
+    updateCartBadge();
+    renderCartPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/update`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ product_id: pid, quantity: newQty }),
+        });
+    } catch (err) {
+        console.warn('Cart update failed:', err);
+    }
+}
+
+function renderCartPanel() {
+    const container = document.getElementById('cartContainer');
+    if (!container) return;
+
+    if (cartItems.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">🛒</div>
+                <h3>Your cart is empty</h3>
+                <p>Add products from the search results or your wishlist</p>
+            </div>`;
+        return;
+    }
+
+    let subtotal = 0;
+    const itemsHtml = cartItems.map(item => {
+        const pid      = escapeHtml(String(item.product_id));
+        const name     = escapeHtml(item.product_name || 'Product');
+        const brand    = escapeHtml(item.brand || '');
+        const price    = parseFloat(item.price) || 0;
+        const qty      = parseInt(item.quantity) || 1;
+        const lineTotal = price * qty;
+        subtotal += lineTotal;
+
+        const imgSrc = item.image_url || '';
+        const imgEl  = imgSrc
+            ? `<img src="${imgSrc}" alt="${name}" class="wishlist-item-img" onerror="this.style.display='none'">`
+            : `<div class="wishlist-item-img" style="display:flex;align-items:center;justify-content:center;font-size:28px">🛍️</div>`;
+
+        return `
+            <div class="cart-item">
+                ${imgEl}
+                <div class="wishlist-item-info">
+                    <div class="wishlist-item-name" title="${name}">${name}</div>
+                    ${brand ? `<div class="wishlist-item-brand">${brand}</div>` : ''}
+                    <div class="wishlist-item-price">$${price.toFixed(2)}</div>
+                </div>
+                <div class="cart-item-controls">
+                    <div class="cart-qty-controls">
+                        <button class="cart-qty-btn" onclick="updateCartQty('${pid}',-1)">−</button>
+                        <span class="cart-qty-value">${qty}</span>
+                        <button class="cart-qty-btn" onclick="updateCartQty('${pid}',1)">+</button>
+                    </div>
+                    <div class="cart-line-total">$${lineTotal.toFixed(2)}</div>
+                    <button class="wishlist-item-remove" title="Remove" onclick="removeFromCart('${pid}')">✕</button>
+                </div>
+            </div>`;
+    }).join('');
+
+    const totalQty = cartItems.reduce((s, i) => s + (parseInt(i.quantity) || 1), 0);
+    container.innerHTML = `
+        <div class="wishlist-panel-header">${totalQty} item${totalQty !== 1 ? 's' : ''} in cart</div>
+        ${itemsHtml}
+        <div class="cart-subtotal">
+            <span>Subtotal</span>
+            <span>$${subtotal.toFixed(2)}</span>
+        </div>`;
 }
 
 // Handle clear chat

@@ -1677,6 +1677,129 @@ def wishlist_remove():
 
 
 # ============================================================================
+# CART API
+# ============================================================================
+
+@app.route('/api/cart', methods=['GET'])
+@token_required
+def cart_get():
+    """Return the authenticated user's active cart items with subtotal."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    items = workflow.cart_store.fetch(subject_ref)
+
+    subtotal = sum(
+        (float(item.get('price') or 0)) * int(item.get('quantity') or 1)
+        for item in items
+    )
+    return jsonify({'items': items, 'count': len(items), 'subtotal': round(subtotal, 2)})
+
+
+@app.route('/api/cart/add', methods=['POST'])
+@token_required
+def cart_add():
+    """Add a product to the cart, or increment its quantity if already present."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    data       = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    quantity = max(1, int(data.get('quantity', 1)))
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+
+    cart_item_id = workflow.cart_store.add(
+        subject_ref  = subject_ref,
+        product_id   = product_id,
+        product_name = data.get('product_name'),
+        brand        = data.get('brand'),
+        price        = data.get('price'),
+        image_url    = data.get('image_url'),
+        retailer_url = data.get('retailer_url'),
+        quantity     = quantity,
+    )
+    workflow.audit_wrapper.log_cart_action(
+        trace_id    = str(uuid.uuid4()),
+        action      = 'add_to_cart',
+        product_id  = product_id,
+        status      = 'success',
+        quantity    = quantity,
+        subject_ref = subject_ref,
+    )
+    return jsonify({'status': 'added', 'cart_item_id': cart_item_id, 'product_id': product_id}), 201
+
+
+@app.route('/api/cart/remove', methods=['DELETE'])
+@token_required
+def cart_remove():
+    """Remove a product from the cart (soft delete)."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    data       = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    workflow.cart_store.remove(subject_ref, product_id)
+    workflow.audit_wrapper.log_cart_action(
+        trace_id    = str(uuid.uuid4()),
+        action      = 'remove_from_cart',
+        product_id  = product_id,
+        status      = 'success',
+        quantity    = 0,
+        subject_ref = subject_ref,
+    )
+    return jsonify({'status': 'removed', 'product_id': product_id}), 200
+
+
+@app.route('/api/cart/update', methods=['PUT'])
+@token_required
+def cart_update():
+    """Update quantity for a cart item. quantity=0 removes the item."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    data       = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    quantity = int(data.get('quantity', 1))
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    workflow.cart_store.update_quantity(subject_ref, product_id, quantity)
+
+    action = 'remove_from_cart' if quantity <= 0 else 'update_cart'
+    workflow.audit_wrapper.log_cart_action(
+        trace_id    = str(uuid.uuid4()),
+        action      = action,
+        product_id  = product_id,
+        status      = 'success',
+        quantity    = max(0, quantity),
+        subject_ref = subject_ref,
+    )
+    status = 'removed' if quantity <= 0 else 'updated'
+    return jsonify({'status': status, 'product_id': product_id, 'quantity': max(0, quantity)}), 200
+
+
+# ============================================================================
 # APPLICATION ENTRY POINT
 # ============================================================================
 

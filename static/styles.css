@@ -871,3 +871,105 @@ button:hover {
     color: #444;
     font-size: 13px;
 }
+
+/* ── Wishlist item actions (Add-to-cart + remove) ─────────────────────── */
+.wishlist-item-actions {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+/* ── Cart button on product cards and wishlist items ─────────────────── */
+.cart-add-btn {
+    background: none;
+    border: 1.5px solid #ccc;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 15px;
+    padding: 4px 8px;
+    transition: background 0.15s, transform 0.15s;
+    white-space: nowrap;
+}
+.cart-add-btn:hover { background: #fff0e8; transform: scale(1.08); }
+.cart-add-btn.in-cart { border-color: #E97132; background: #fff0e8; }
+.wishlist-cart-btn { font-size: 14px; }
+
+/* ── Product action row (Ask / Cart) ─────────────────────────────────── */
+.product-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+/* ── Cart panel items ─────────────────────────────────────────────────── */
+.cart-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid #f0e8e0;
+}
+
+.cart-item-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    margin-left: auto;
+}
+
+.cart-qty-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 2px 4px;
+}
+
+.cart-qty-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: 700;
+    color: #E97132;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: background 0.15s;
+}
+.cart-qty-btn:hover { background: #fff0e8; }
+
+.cart-qty-value {
+    font-size: 14px;
+    font-weight: 600;
+    min-width: 18px;
+    text-align: center;
+}
+
+.cart-line-total {
+    font-size: 13px;
+    font-weight: 700;
+    color: #E97132;
+}
+
+.cart-subtotal {
+    display: flex;
+    justify-content: space-between;
+    padding: 14px 16px;
+    font-weight: 700;
+    font-size: 15px;
+    border-top: 2px solid #E97132;
+    color: #333;
+    position: sticky;
+    bottom: 0;
+    background: var(--bg-panel, #fff);
+}
