@@ -974,6 +974,78 @@ button:hover {
     background: var(--bg-panel, #fff);
 }
 
+/* ── Checkout button ─────────────────────────────────────────────────────── */
+.checkout-btn-wrap {
+    padding: 12px 16px 16px;
+}
+
+.checkout-btn {
+    width: 100%;
+    padding: 12px;
+    background: #E97132;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+}
+.checkout-btn:hover:not(:disabled) { background: #d4612a; }
+.checkout-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Order cards ─────────────────────────────────────────────────────────── */
+.orders-list { padding: 8px 0; }
+
+.order-card {
+    border: 1px solid #eee;
+    border-radius: 10px;
+    margin: 8px 12px;
+    padding: 12px 14px;
+    background: #fafafa;
+}
+
+.order-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+}
+
+.order-id   { font-weight: 700; font-size: 13px; color: #333; }
+.order-date { font-size: 12px; color: #888; flex: 1; }
+
+.order-status {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 12px;
+    text-transform: capitalize;
+}
+.order-status--confirmed { background: #e8f5e9; color: #2e7d32; }
+.order-status--pending   { background: #fff8e1; color: #f57f17; }
+
+.order-items { margin-bottom: 8px; }
+
+.order-item-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13px;
+    border-bottom: 1px solid #f0f0f0;
+}
+.order-item-row:last-child { border-bottom: none; }
+.order-item-name  { flex: 1; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.order-item-qty   { color: #888; font-size: 12px; }
+.order-item-price { font-weight: 600; color: #E97132; white-space: nowrap; }
+
+.order-total { font-size: 14px; color: #333; text-align: right; }
+
+/* Order confirmation modal icon */
+.order-confirm-icon { text-align: center; font-size: 48px; margin-bottom: 8px; }
+
 /* ── Header user area ────────────────────────────────────────────────────── */
 .app-header {
     display: flex;
