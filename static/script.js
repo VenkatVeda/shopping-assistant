@@ -1112,8 +1112,8 @@ async function placeOrder() {
         });
         const d = await resp.json();
         if (!resp.ok) {
-            alert(d.error || 'Could not place order.');
-            if (btn) { btn.disabled = false; btn.textContent = btn.textContent.replace('Placing order…', '✅ Checkout'); }
+            alert((d.error || 'Could not place order.') + (d.detail ? '\n\nDetail: ' + d.detail : ''));
+            if (btn) { btn.disabled = false; btn.textContent = '✅ Checkout'; }
             return;
         }
         // Clear local cart state

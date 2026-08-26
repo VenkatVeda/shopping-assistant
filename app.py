@@ -1955,8 +1955,8 @@ def place_order():
         }), 201
 
     except Exception as e:
-        logger.error('[ORDERS] place_order failed: %s', e)
-        return jsonify({'error': 'Could not place order. Please try again.'}), 500
+        logger.error('[ORDERS] place_order failed: %s', e, exc_info=True)
+        return jsonify({'error': 'Could not place order. Please try again.', 'detail': str(e)}), 500
 
 
 # ============================================================================
