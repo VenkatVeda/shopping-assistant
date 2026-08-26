@@ -1910,13 +1910,20 @@ def account_delete_request():
 # ORDERS API
 # ============================================================================
 
+def _get_subject_ref(user_id: str) -> str:
+    """Return pseudonymised subject_ref, falling back to user_id if AuditWrapper unavailable."""
+    if workflow and workflow.audit_wrapper:
+        return workflow.audit_wrapper._compute_refs(user_id)[1]
+    return user_id
+
+
 @app.route('/api/orders', methods=['GET'])
 @token_required
 def get_orders():
     try:
-        user_id = request.user_id
-        _, subject_ref = workflow.audit_wrapper._compute_refs(user_id)
-        orders = workflow.order_store.fetch_orders(subject_ref) if workflow.order_store else []
+        user_id    = request.user_id
+        subject_ref = _get_subject_ref(user_id)
+        orders = workflow.order_store.fetch_orders(subject_ref) if (workflow and workflow.order_store) else []
         return jsonify({'orders': orders})
     except Exception as e:
         logger.error('[ORDERS] fetch failed: %s', e)
@@ -1928,17 +1935,17 @@ def get_orders():
 def place_order():
     from core.shopping_audit import log_order_action
     try:
-        user_id = request.user_id
-        _, subject_ref = workflow.audit_wrapper._compute_refs(user_id)
+        user_id     = request.user_id
+        subject_ref = _get_subject_ref(user_id)
 
-        cart_items = workflow.cart_store.fetch(subject_ref) if workflow.cart_store else []
+        cart_items = workflow.cart_store.fetch(subject_ref) if (workflow and workflow.cart_store) else []
         if not cart_items:
             return jsonify({'error': 'Your cart is empty.'}), 400
 
-        order_id    = workflow.order_store.place_order(subject_ref, cart_items) if workflow.order_store else None
+        order_id    = workflow.order_store.place_order(subject_ref, cart_items) if (workflow and workflow.order_store) else None
         order_total = sum(float(i.get('price', 0)) * int(i.get('quantity', 1)) for i in cart_items)
 
-        if workflow.audit_wrapper:
+        if workflow and workflow.audit_wrapper:
             trace_id = str(uuid.uuid4())
             log_order_action(workflow.audit_wrapper,
                 trace_id=trace_id, action='checkout',
