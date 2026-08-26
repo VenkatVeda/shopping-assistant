@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     subject_ref   STRING    NOT NULL,
     app_id        STRING    NOT NULL,
     regulation    STRING,
-    status        STRING    DEFAULT 'pending',
+    status        STRING,
     requested_at  TIMESTAMP,
     processed_at  TIMESTAMP,
     notes         STRING

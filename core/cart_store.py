@@ -31,10 +31,10 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     price         DOUBLE,
     image_url     STRING,
     retailer_url  STRING,
-    quantity      INT       DEFAULT 1,
+    quantity      INT,
     added_at      TIMESTAMP,
     updated_at    TIMESTAMP,
-    is_active     BOOLEAN   DEFAULT true
+    is_active     BOOLEAN
 )
 USING DELTA
 """

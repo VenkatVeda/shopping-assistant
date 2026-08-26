@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS {ORDER_TBL} (
     unit_price    DOUBLE,
     line_total    DOUBLE,
     placed_at     TIMESTAMP,
-    status        STRING    DEFAULT 'confirmed'
+    status        STRING
 )
 USING DELTA
 """

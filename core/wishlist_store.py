@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     image_url     STRING,
     retailer_url  STRING,
     added_at      TIMESTAMP,
-    is_active     BOOLEAN   DEFAULT true
+    is_active     BOOLEAN
 )
 USING DELTA
 """
