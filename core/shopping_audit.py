@@ -90,3 +90,35 @@ def log_cart_action(
         audit_wrapper._fire(audit_wrapper._tbl("raw_logs.cart_events_raw"), row)
     except Exception as e:
         logger.warning("[SHOPPING AUDIT] log_cart_action failed: %s", e)
+
+
+def log_order_action(
+    audit_wrapper,
+    trace_id:   str,
+    action:     str,
+    order_id:   str,
+    status:     str,
+    item_count: int = 0,
+    order_total: float = 0.0,
+    subject_ref: Optional[str] = None,
+) -> None:
+    """Log a checkout / order event to raw_logs.order_events_raw."""
+    try:
+        now = _now_iso()
+        row = {
+            "event_id":        str(uuid.uuid4()),
+            "app_id":          audit_wrapper.app_id,
+            "trace_id":        trace_id,
+            "subject_ref":     subject_ref or None,
+            "action":          action,
+            "order_id":        order_id,
+            "item_count":      str(item_count),
+            "order_total":     str(round(order_total, 2)),
+            "status":          status,
+            "is_erasure_flag": "false",
+            "created_at":      now,
+            "schema_version":  audit_wrapper.schema_version,
+        }
+        audit_wrapper._fire(audit_wrapper._tbl("raw_logs.order_events_raw"), row)
+    except Exception as e:
+        logger.warning("[SHOPPING AUDIT] log_order_action failed: %s", e)

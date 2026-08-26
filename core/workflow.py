@@ -75,6 +75,11 @@ class GraphState(TypedDict):
     cart_items:        Optional[List[dict]]  # Loaded cart items for current turn
     cart_quantity:     Optional[int]         # Quantity for add_to_cart action (default 1)
 
+    # Order Fields
+    order_id:          Optional[str]         # Order ID returned after checkout
+    order_total:       Optional[float]       # Total value of placed order
+    orders:            Optional[List[dict]]  # Order history for view_orders
+
 class ShoppingAssistantWorkflow:
     def __init__(self):
         print("Initializing Shopping Assistant Workflow...")
@@ -246,6 +251,18 @@ class ShoppingAssistantWorkflow:
         except Exception as _ce:
             print(f"[CART] CartStore init failed (non-blocking): {_ce}")
             self.cart_store = None
+
+        # ── Order Store ───────────────────────────────────────────────────────
+        try:
+            from .order_store import OrderStore, ensure_table as order_ensure_table
+            self.order_store = OrderStore(
+                app_id=os.getenv("AUDIT_APP_ID", "myre_app")
+            )
+            order_ensure_table()
+            print("✓ OrderStore initialised")
+        except Exception as _oe:
+            print(f"[ORDER] OrderStore init failed (non-blocking): {_oe}")
+            self.order_store = None
         # ─────────────────────────────────────────────────────────────────────
 
         # Build Graph
@@ -270,6 +287,8 @@ class ShoppingAssistantWorkflow:
         workflow.add_node("output_guardrail",        t("output_guardrail",        self.output_guardrail_node))
         workflow.add_node("wishlist_action",         t("wishlist_action",         self.wishlist_action_node))
         workflow.add_node("cart_action",             t("cart_action",             self.cart_action_node))
+        workflow.add_node("checkout_action",         t("checkout_action",         self.checkout_node))
+        workflow.add_node("view_orders_action",      t("view_orders_action",      self.view_orders_node))
         
         # Set Entry Point
         workflow.set_entry_point("input_guardrail")
@@ -298,12 +317,16 @@ class ShoppingAssistantWorkflow:
                 "add_to_cart":        "cart_action",       # add product to cart
                 "remove_from_cart":   "cart_action",       # remove product from cart
                 "view_cart":          "cart_action",       # fetch and display cart
+                "checkout":           "checkout_action",   # place order from cart
+                "view_orders":        "view_orders_action", # fetch order history
             }
         )
 
-        # Wishlist / cart actions always route to response_generator for confirmation message
-        workflow.add_edge("wishlist_action", "response_generator")
-        workflow.add_edge("cart_action",     "response_generator")
+        # Wishlist / cart / order actions always route to response_generator
+        workflow.add_edge("wishlist_action",    "response_generator")
+        workflow.add_edge("cart_action",        "response_generator")
+        workflow.add_edge("checkout_action",    "response_generator")
+        workflow.add_edge("view_orders_action", "response_generator")
 
         # Clarification is a deliberate pause node — it always stops for user input.
         # The "continue" branch is a safety valve; in normal operation the node
@@ -845,6 +868,8 @@ class ShoppingAssistantWorkflow:
         if intent in ("add_to_wishlist", "remove_from_wishlist", "view_wishlist"):
             return intent
         if intent in ("add_to_cart", "remove_from_cart", "view_cart"):
+            return intent
+        if intent in ("checkout", "view_orders"):
             return intent
         if intent in ("shopping", "preference_update"):
             prev = state.get("preferences")
@@ -1655,6 +1680,84 @@ class ShoppingAssistantWorkflow:
 
         return {
             "cart_items":   cart_items,
+            "action_status": action_status,
+        }
+
+    def checkout_node(self, state: GraphState):
+        """Node: Place order from current cart, then clear cart."""
+        from .shopping_audit import log_order_action
+        user_id  = state.get("user_id")
+        trace_id = _current_trace_id.get()
+
+        subject_ref = None
+        if self.audit_wrapper and user_id:
+            try:
+                _, subject_ref = self.audit_wrapper._compute_refs(user_id)
+            except Exception:
+                pass
+
+        order_id      = None
+        action_status = "error"
+        order_total   = 0.0
+        cart_items    = []
+
+        try:
+            if self.cart_store and subject_ref:
+                cart_items = self.cart_store.fetch(subject_ref)
+
+            if not cart_items:
+                action_status = "empty_cart"
+            elif self.order_store and subject_ref:
+                order_id    = self.order_store.place_order(subject_ref, cart_items)
+                order_total = sum(
+                    float(i.get("price", 0)) * int(i.get("quantity", 1))
+                    for i in cart_items
+                )
+                action_status = "success"
+                if self.audit_wrapper:
+                    log_order_action(self.audit_wrapper,
+                        trace_id=trace_id, action="checkout",
+                        order_id=order_id, status=action_status,
+                        item_count=len(cart_items), order_total=order_total,
+                        subject_ref=subject_ref,
+                    )
+
+        except Exception as e:
+            print(f"[CHECKOUT NODE] Error: {e}")
+            action_status = "error"
+
+        return {
+            "order_id":     order_id,
+            "order_total":  order_total,
+            "cart_items":   [],         # cart is now empty
+            "action_status": action_status,
+        }
+
+    def view_orders_node(self, state: GraphState):
+        """Node: Fetch order history for the current user."""
+        user_id  = state.get("user_id")
+        trace_id = _current_trace_id.get()
+
+        subject_ref = None
+        if self.audit_wrapper and user_id:
+            try:
+                _, subject_ref = self.audit_wrapper._compute_refs(user_id)
+            except Exception:
+                pass
+
+        orders        = []
+        action_status = "error"
+
+        try:
+            if self.order_store and subject_ref:
+                orders = self.order_store.fetch_orders(subject_ref)
+            action_status = "success"
+        except Exception as e:
+            print(f"[VIEW ORDERS NODE] Error: {e}")
+            action_status = "error"
+
+        return {
+            "orders":        orders,
             "action_status": action_status,
         }
 

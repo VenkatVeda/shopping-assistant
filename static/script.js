@@ -786,20 +786,25 @@ function switchTab(tab) {
     const products = document.getElementById('resultsContainer');
     const wishlist = document.getElementById('wishlistContainer');
     const cart     = document.getElementById('cartContainer');
+    const orders   = document.getElementById('ordersContainer');
     const tabP     = document.getElementById('tabProducts');
     const tabW     = document.getElementById('tabWishlist');
     const tabC     = document.getElementById('tabCart');
+    const tabO     = document.getElementById('tabOrders');
 
     products.style.display = tab === 'products' ? '' : 'none';
     wishlist.style.display = tab === 'wishlist' ? '' : 'none';
     cart.style.display     = tab === 'cart'     ? '' : 'none';
+    orders.style.display   = tab === 'orders'   ? '' : 'none';
 
     tabP.classList.toggle('active', tab === 'products');
     tabW.classList.toggle('active', tab === 'wishlist');
     tabC.classList.toggle('active', tab === 'cart');
+    if (tabO) tabO.classList.toggle('active', tab === 'orders');
 
     if (tab === 'wishlist') renderWishlistPanel();
     if (tab === 'cart')     renderCartPanel();
+    if (tab === 'orders')   loadOrders();
 }
 
 // ── Cart helpers ──────────────────────────────────────────────────────────
@@ -1033,7 +1038,95 @@ function renderCartPanel() {
         <div class="cart-subtotal">
             <span>Subtotal</span>
             <span>$${subtotal.toFixed(2)}</span>
+        </div>
+        <div class="checkout-btn-wrap">
+            <button class="checkout-btn" onclick="placeOrder()">✅ Checkout — $${subtotal.toFixed(2)}</button>
         </div>`;
+}
+
+// ── Orders ────────────────────────────────────────────────────────────────
+
+async function loadOrders() {
+    const container = document.getElementById('ordersContainer');
+    if (!container) return;
+    container.innerHTML = '<div class="panel-loading">Loading orders…</div>';
+    try {
+        const resp = await fetch(`${API_BASE_URL}/orders`, { credentials: 'include' });
+        if (!resp.ok) throw new Error();
+        const data = await resp.json();
+        renderOrdersPanel(data.orders || []);
+    } catch (_) {
+        container.innerHTML = '<div class="panel-error">Could not load orders.</div>';
+    }
+}
+
+function renderOrdersPanel(orders) {
+    const container = document.getElementById('ordersContainer');
+    if (!container) return;
+    if (!orders.length) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">📦</div>
+                <h3>No orders yet</h3>
+                <p>Complete checkout to see your order history here</p>
+            </div>`;
+        return;
+    }
+    const ordersHtml = orders.map(order => {
+        const date  = order.placed_at ? new Date(order.placed_at).toLocaleDateString() : '';
+        const items = (order.items || []).map(i =>
+            `<div class="order-item-row">
+                <span class="order-item-name">${escapeHtml(i.product_name || 'Item')}</span>
+                <span class="order-item-qty">×${i.quantity}</span>
+                <span class="order-item-price">$${parseFloat(i.line_total || 0).toFixed(2)}</span>
+            </div>`
+        ).join('');
+        return `
+            <div class="order-card">
+                <div class="order-card-header">
+                    <span class="order-id">Order #${order.order_id.slice(-8).toUpperCase()}</span>
+                    <span class="order-date">${date}</span>
+                    <span class="order-status order-status--${order.status}">${order.status}</span>
+                </div>
+                <div class="order-items">${items}</div>
+                <div class="order-total">Total: <strong>$${parseFloat(order.total || 0).toFixed(2)}</strong></div>
+            </div>`;
+    }).join('');
+    container.innerHTML = `<div class="orders-list">${ordersHtml}</div>`;
+}
+
+async function placeOrder() {
+    const btn = document.querySelector('.checkout-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Placing order…'; }
+    try {
+        const resp = await fetch(`${API_BASE_URL}/orders/place`, {
+            method: 'POST',
+            credentials: 'include',
+        });
+        const d = await resp.json();
+        if (!resp.ok) {
+            alert(d.error || 'Could not place order.');
+            if (btn) { btn.disabled = false; btn.textContent = btn.textContent.replace('Placing order…', '✅ Checkout'); }
+            return;
+        }
+        // Clear local cart state
+        cartItems = [];
+        cartIds   = new Set();
+        updateCartBadge();
+        renderCartPanel();
+        // Show confirmation modal
+        document.getElementById('orderConfirmMsg').textContent =
+            `${d.item_count} item${d.item_count !== 1 ? 's' : ''} confirmed. Order total: $${parseFloat(d.order_total).toFixed(2)}. ` +
+            `Reference: #${(d.order_id || '').slice(-8).toUpperCase()}`;
+        document.getElementById('orderConfirmModal').style.display = 'flex';
+    } catch (_) {
+        alert('Network error. Please try again.');
+        if (btn) { btn.disabled = false; }
+    }
+}
+
+function closeOrderConfirmModal() {
+    document.getElementById('orderConfirmModal').style.display = 'none';
 }
 
 // Handle clear chat
