@@ -31,6 +31,14 @@ document.addEventListener('DOMContentLoaded', () => {
     userInput.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') handleSend();
     });
+
+    // Wire delete-confirm input
+    const deleteInp = document.getElementById('deleteConfirmInput');
+    if (deleteInp) {
+        deleteInp.addEventListener('input', () => {
+            document.getElementById('deleteConfirmBtn').disabled = (deleteInp.value.trim() !== 'DELETE');
+        });
+    }
 });
 
 // Get cookie value
@@ -41,51 +49,185 @@ function getCookie(name) {
     return null;
 }
 
-// Display user info in header
+// Display user info in header (populates avatar dropdown)
 function displayUserInfo() {
-    const userName = getCookie('user_name');
-    const userEmail = getCookie('user_email');
+    const userName    = getCookie('user_name');
+    const userEmail   = getCookie('user_email');
     const userPicture = getCookie('user_picture');
-    
-    if (userName) {
-        const headerContent = document.querySelector('.header-content');
-        
-        // Create user info section
-        const userInfo = document.createElement('div');
-        userInfo.className = 'user-info';
-        userInfo.style.marginLeft = 'auto';
-        userInfo.style.display = 'flex';
-        userInfo.style.alignItems = 'center';
-        userInfo.style.gap = '10px';
-        
-        if (userPicture && userPicture !== 'undefined') {
-            const img = document.createElement('img');
-            img.src = decodeURIComponent(userPicture);
-            img.alt = userName;
-            img.style.width = '32px';
-            img.style.height = '32px';
-            img.style.borderRadius = '50%';
-            userInfo.appendChild(img);
+
+    if (!userName) return;
+
+    const name    = decodeURIComponent(userName);
+    const email   = userEmail ? decodeURIComponent(userEmail) : '';
+    const picture = (userPicture && userPicture !== 'undefined') ? decodeURIComponent(userPicture) : '';
+
+    // Header avatar button
+    const headerUser = document.getElementById('headerUser');
+    const headerAvatar = document.getElementById('headerAvatar');
+    const headerUserName = document.getElementById('headerUserName');
+    if (picture) {
+        headerAvatar.src = picture;
+        headerAvatar.style.display = 'block';
+    } else {
+        headerAvatar.style.display = 'none';
+    }
+    headerUserName.textContent = name.split(' ')[0];
+    headerUser.style.display = 'flex';
+
+    // Dropdown header
+    const dropdownAvatar = document.getElementById('dropdownAvatar');
+    if (picture) { dropdownAvatar.src = picture; dropdownAvatar.style.display = 'block'; }
+    else { dropdownAvatar.style.display = 'none'; }
+    document.getElementById('dropdownName').textContent  = name;
+    document.getElementById('dropdownEmail').textContent = email;
+}
+
+// ── Dropdown ──────────────────────────────────────────────────────────────
+let _dropdownOpen = false;
+
+function toggleDropdown(e) {
+    e.stopPropagation();
+    _dropdownOpen ? closeDropdown() : openDropdown();
+}
+
+function openDropdown() {
+    const btn = document.getElementById('userAvatarBtn');
+    const dd  = document.getElementById('userDropdown');
+    const rect = btn.getBoundingClientRect();
+    dd.style.top   = (rect.bottom + 8) + 'px';
+    dd.style.right = (window.innerWidth - rect.right) + 'px';
+    dd.style.display = 'block';
+    _dropdownOpen = true;
+}
+
+function closeDropdown() {
+    document.getElementById('userDropdown').style.display = 'none';
+    _dropdownOpen = false;
+}
+
+document.addEventListener('click', () => { if (_dropdownOpen) closeDropdown(); });
+
+// ── Side Panel (Profile / Preferences) ──────────────────────────────────
+function openPanel(type) {
+    closeDropdown();
+    const panel = document.getElementById('sidePanel');
+    const overlay = document.getElementById('sidePanelOverlay');
+    const title = document.getElementById('sidePanelTitle');
+    const body  = document.getElementById('sidePanelBody');
+
+    if (type === 'profile') {
+        title.textContent = '👤 My Profile';
+        body.innerHTML = '<div class="panel-loading">Loading…</div>';
+        panel.style.display = 'flex';
+        overlay.style.display = 'block';
+        loadUserProfile(body);
+    } else if (type === 'preferences') {
+        title.textContent = '🎯 My Preferences';
+        body.innerHTML = '<div class="panel-loading">Loading…</div>';
+        panel.style.display = 'flex';
+        overlay.style.display = 'block';
+        loadPreferences(body);
+    }
+}
+
+function closePanel() {
+    document.getElementById('sidePanel').style.display = 'none';
+    document.getElementById('sidePanelOverlay').style.display = 'none';
+}
+
+async function loadUserProfile(body) {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/user/profile`, { credentials: 'include' });
+        if (!resp.ok) throw new Error('Not authenticated');
+        const d = await resp.json();
+        body.innerHTML = `
+            <div class="profile-avatar-wrap">
+                ${d.picture ? `<img src="${d.picture}" class="profile-avatar">` : '<div class="profile-avatar-placeholder">👤</div>'}
+            </div>
+            <table class="profile-table">
+                <tr><td class="profile-label">Name</td><td>${d.name || '—'}</td></tr>
+                <tr><td class="profile-label">Email</td><td>${d.email || '—'}</td></tr>
+                <tr><td class="profile-label">Country</td><td>${d.country || '—'}</td></tr>
+            </table>`;
+    } catch (err) {
+        body.innerHTML = '<div class="panel-error">Could not load profile.</div>';
+    }
+}
+
+async function loadPreferences(body) {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/user/preferences`, { credentials: 'include' });
+        if (!resp.ok) throw new Error();
+        const d = await resp.json();
+        const pref = d.preferences || {};
+        const keys = Object.keys(pref).filter(k => pref[k] !== null && pref[k] !== '' && !(Array.isArray(pref[k]) && pref[k].length === 0));
+        const rows = keys.length
+            ? keys.map(k => `<tr><td class="profile-label">${k}</td><td>${Array.isArray(pref[k]) ? pref[k].join(', ') : pref[k]}</td></tr>`).join('')
+            : '<tr><td colspan="2" class="pref-empty">No preferences learned yet.</td></tr>';
+        body.innerHTML = `
+            <p class="pref-hint">These preferences are learned from your conversations.</p>
+            <table class="profile-table">${rows}</table>
+            <button class="pref-clear-btn" onclick="clearPreferences()">🗑️ Clear All Preferences</button>
+            <div id="prefMsg" class="pref-msg" style="display:none"></div>`;
+    } catch {
+        body.innerHTML = '<div class="panel-error">Could not load preferences.</div>';
+    }
+}
+
+async function clearPreferences() {
+    const msg = document.getElementById('prefMsg');
+    try {
+        const resp = await fetch(`${API_BASE_URL}/user/preferences`, { method: 'DELETE', credentials: 'include' });
+        if (!resp.ok) throw new Error();
+        msg.textContent = 'Preferences cleared.';
+        msg.className   = 'pref-msg pref-msg--ok';
+        msg.style.display = 'block';
+        setTimeout(() => loadPreferences(document.getElementById('sidePanelBody')), 800);
+    } catch {
+        msg.textContent = 'Failed to clear preferences.';
+        msg.className   = 'pref-msg pref-msg--err';
+        msg.style.display = 'block';
+    }
+}
+
+// ── Delete Account Modal ──────────────────────────────────────────────────
+function openDeleteModal() {
+    closeDropdown();
+    document.getElementById('deleteConfirmInput').value = '';
+    document.getElementById('deleteConfirmBtn').disabled = true;
+    const msg = document.getElementById('deleteModalMsg');
+    msg.style.display = 'none';
+    document.getElementById('deleteModal').style.display = 'flex';
+}
+
+function closeDeleteModal() {
+    document.getElementById('deleteModal').style.display = 'none';
+}
+
+async function submitDeleteRequest() {
+    const msg = document.getElementById('deleteModalMsg');
+    msg.style.display = 'none';
+    try {
+        const resp = await fetch(`${API_BASE_URL}/account/delete-request`, {
+            method: 'POST',
+            credentials: 'include',
+        });
+        const d = await resp.json();
+        if (!resp.ok) {
+            msg.textContent = d.error || 'Request failed.';
+            msg.className   = 'modal-msg modal-msg--err';
+            msg.style.display = 'block';
+            return;
         }
-        
-        const nameSpan = document.createElement('span');
-        nameSpan.textContent = decodeURIComponent(userName);
-        nameSpan.style.color = 'white';
-        nameSpan.style.fontSize = '14px';
-        userInfo.appendChild(nameSpan);
-        
-        const logoutBtn = document.createElement('button');
-        logoutBtn.textContent = 'Logout';
-        logoutBtn.style.background = 'rgba(255,255,255,0.2)';
-        logoutBtn.style.color = 'white';
-        logoutBtn.style.border = 'none';
-        logoutBtn.style.padding = '5px 15px';
-        logoutBtn.style.borderRadius = '4px';
-        logoutBtn.style.cursor = 'pointer';
-        logoutBtn.onclick = handleLogout;
-        userInfo.appendChild(logoutBtn);
-        
-        headerContent.appendChild(userInfo);
+        msg.textContent = `✅ Request received (ID: ${d.request_id}). Your data will be deleted within 30 days. You will now be logged out.`;
+        msg.className   = 'modal-msg modal-msg--ok';
+        msg.style.display = 'block';
+        document.getElementById('deleteConfirmBtn').disabled = true;
+        setTimeout(handleLogout, 4000);
+    } catch {
+        msg.textContent = 'Network error — please try again.';
+        msg.className   = 'modal-msg modal-msg--err';
+        msg.style.display = 'block';
     }
 }
 

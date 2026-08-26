@@ -1802,6 +1802,111 @@ def cart_update():
 
 
 # ============================================================================
+# USER SETTINGS API
+# ============================================================================
+
+@app.route('/api/user/profile', methods=['GET'])
+@token_required
+def user_profile():
+    """Return the authenticated user's profile info from their cookie."""
+    user_id   = getattr(request, 'user_id', None)
+    user_name = request.cookies.get('user_name', '')
+    user_pic  = request.cookies.get('user_picture', '')
+    country   = get_country_from_request(request) or os.getenv('DEFAULT_USER_COUNTRY', '')
+    return jsonify({
+        'email':   user_id or '',
+        'name':    user_name,
+        'picture': user_pic,
+        'country': country,
+    })
+
+
+@app.route('/api/user/preferences', methods=['GET'])
+@token_required
+def user_preferences_get():
+    """Return the user's learned personalisation profile."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or not getattr(workflow, 'personalization_enabled', False):
+        return jsonify({'preferences': None, 'message': 'Personalisation not enabled'}), 200
+    try:
+        profile = workflow.profile_storage.load_profile(user_id)
+        prefs = {}
+        if profile and hasattr(profile, '__dict__'):
+            raw = profile.__dict__
+            prefs = {
+                'favourite_brands':     raw.get('favorite_brands', []),
+                'favourite_colors':     raw.get('preferred_colors', []),
+                'favourite_categories': raw.get('preferred_categories', []),
+                'price_range':          {'min': raw.get('min_price'), 'max': raw.get('max_price')},
+                'total_searches':       raw.get('interaction_count', 0),
+            }
+        return jsonify({'preferences': prefs})
+    except Exception as e:
+        logger.warning('[USER PREFS] Failed to load: %s', e)
+        return jsonify({'preferences': {}}), 200
+
+
+@app.route('/api/user/preferences', methods=['DELETE'])
+@token_required
+def user_preferences_clear():
+    """Clear the user's learned personalisation profile."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or not getattr(workflow, 'personalization_enabled', False):
+        return jsonify({'status': 'ok', 'message': 'Personalisation not enabled'}), 200
+    try:
+        from core.personalization.storage import UserProfile
+        empty = UserProfile(user_id=user_id)
+        workflow.profile_storage.save_profile(empty)
+        return jsonify({'status': 'cleared'})
+    except Exception as e:
+        logger.warning('[USER PREFS] Failed to clear: %s', e)
+        return jsonify({'error': 'Could not clear preferences'}), 500
+
+
+@app.route('/api/account/delete-request', methods=['POST'])
+@token_required
+def account_delete_request():
+    """Raise a Right-to-be-Forgotten / erasure request for the authenticated user."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.audit_wrapper is None:
+        return jsonify({'error': 'Service unavailable'}), 503
+
+    try:
+        from core.erasure_store import ErasureStore, ensure_table as erasure_ensure_table
+        erasure_ensure_table()
+        store = ErasureStore(app_id=os.getenv('AUDIT_APP_ID', 'myre_app'))
+
+        _, subject_ref = workflow.audit_wrapper._compute_refs(user_id)
+
+        if store.has_pending_request(subject_ref):
+            return jsonify({
+                'status': 'already_pending',
+                'message': 'A deletion request is already pending for your account.',
+            }), 200
+
+        from audit_wrapper import _determine_regulation
+        country    = get_country_from_request(request) or os.getenv('DEFAULT_USER_COUNTRY', '')
+        regulation = _determine_regulation(country)
+        request_id = store.raise_request(subject_ref=subject_ref, regulation=regulation)
+
+        return jsonify({
+            'status':     'raised',
+            'request_id': request_id,
+            'message':    'Your deletion request has been received. We will process it within 30 days.',
+        }), 201
+
+    except Exception as e:
+        logger.error('[ERASURE] Failed to raise request: %s', e)
+        return jsonify({'error': 'Could not process your request. Please try again.'}), 500
+
+
+# ============================================================================
 # APPLICATION ENTRY POINT
 # ============================================================================
 
