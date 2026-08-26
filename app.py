@@ -29,6 +29,7 @@ from core.performance import get_monitor, get_tracker, track_time
 from core.observability import metrics_store, RequestTrace
 from core.evals import EvalRunner
 from core.geoip import get_country_from_request
+from core.shopping_audit import log_wishlist_action, log_cart_action
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1640,7 +1641,7 @@ def wishlist_add():
         image_url=data.get('image_url'),
         retailer_url=data.get('retailer_url'),
     )
-    workflow.audit_wrapper.log_wishlist_action(
+    log_wishlist_action(workflow.audit_wrapper,
         trace_id=str(uuid.uuid4()),
         action='add_to_wishlist',
         product_id=product_id,
@@ -1667,7 +1668,7 @@ def wishlist_remove():
 
     subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
     workflow.wishlist_store.remove(subject_ref, product_id)
-    workflow.audit_wrapper.log_wishlist_action(
+    log_wishlist_action(workflow.audit_wrapper,
         trace_id=str(uuid.uuid4()),
         action='remove_from_wishlist',
         product_id=product_id,
@@ -1729,7 +1730,7 @@ def cart_add():
         retailer_url = data.get('retailer_url'),
         quantity     = quantity,
     )
-    workflow.audit_wrapper.log_cart_action(
+    log_cart_action(workflow.audit_wrapper,
         trace_id    = str(uuid.uuid4()),
         action      = 'add_to_cart',
         product_id  = product_id,
@@ -1757,7 +1758,7 @@ def cart_remove():
 
     subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
     workflow.cart_store.remove(subject_ref, product_id)
-    workflow.audit_wrapper.log_cart_action(
+    log_cart_action(workflow.audit_wrapper,
         trace_id    = str(uuid.uuid4()),
         action      = 'remove_from_cart',
         product_id  = product_id,
@@ -1788,7 +1789,7 @@ def cart_update():
     workflow.cart_store.update_quantity(subject_ref, product_id, quantity)
 
     action = 'remove_from_cart' if quantity <= 0 else 'update_cart'
-    workflow.audit_wrapper.log_cart_action(
+    log_cart_action(workflow.audit_wrapper,
         trace_id    = str(uuid.uuid4()),
         action      = action,
         product_id  = product_id,

@@ -20,6 +20,7 @@ from .observability import NodeTracer, RequestTrace, metrics_store
 from .audit_logger import log_guardrail
 from .evals import EvalRunner
 from .semantic_cache import build_cache
+from .shopping_audit import log_wishlist_action, log_cart_action
 from contextvars import ContextVar
 _current_trace_id: ContextVar[str] = ContextVar('_current_trace_id', default='')
 
@@ -1530,7 +1531,7 @@ class ShoppingAssistantWorkflow:
                     wishlist_items = self.wishlist_store.fetch(subject_ref)
                 action_status = "success"
                 if self.audit_wrapper:
-                    self.audit_wrapper.log_wishlist_action(
+                    log_wishlist_action(self.audit_wrapper,
                         trace_id=trace_id, action="view",
                         product_id="", status=action_status, subject_ref=subject_ref
                     )
@@ -1555,7 +1556,7 @@ class ShoppingAssistantWorkflow:
                         )
                         action_status = "success"
                     if self.audit_wrapper:
-                        self.audit_wrapper.log_wishlist_action(
+                        log_wishlist_action(self.audit_wrapper,
                             trace_id=trace_id, action="add",
                             product_id=product_id, status=action_status, subject_ref=subject_ref
                         )
@@ -1567,7 +1568,7 @@ class ShoppingAssistantWorkflow:
                     self.wishlist_store.remove(subject_ref, product_id)
                     action_status = "success"
                     if self.audit_wrapper:
-                        self.audit_wrapper.log_wishlist_action(
+                        log_wishlist_action(self.audit_wrapper,
                             trace_id=trace_id, action="remove",
                             product_id=product_id, status=action_status, subject_ref=subject_ref
                         )
@@ -1605,7 +1606,7 @@ class ShoppingAssistantWorkflow:
                     cart_items = self.cart_store.fetch(subject_ref)
                 action_status = "success"
                 if self.audit_wrapper:
-                    self.audit_wrapper.log_cart_action(
+                    log_cart_action(self.audit_wrapper,
                         trace_id=trace_id, action="view",
                         product_id="", status=action_status,
                         quantity=0, subject_ref=subject_ref
@@ -1629,7 +1630,7 @@ class ShoppingAssistantWorkflow:
                     )
                     action_status = "success"
                     if self.audit_wrapper:
-                        self.audit_wrapper.log_cart_action(
+                        log_cart_action(self.audit_wrapper,
                             trace_id=trace_id, action="add",
                             product_id=product_id, status=action_status,
                             quantity=quantity, subject_ref=subject_ref
@@ -1642,7 +1643,7 @@ class ShoppingAssistantWorkflow:
                     self.cart_store.remove(subject_ref, product_id)
                     action_status = "success"
                     if self.audit_wrapper:
-                        self.audit_wrapper.log_cart_action(
+                        log_cart_action(self.audit_wrapper,
                             trace_id=trace_id, action="remove",
                             product_id=product_id, status=action_status,
                             quantity=0, subject_ref=subject_ref
