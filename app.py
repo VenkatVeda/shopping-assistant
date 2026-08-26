@@ -1938,12 +1938,7 @@ def place_order():
         user_id     = request.user_id
         subject_ref = _get_subject_ref(user_id)
 
-        # Accept cart items from the request body (frontend has them in memory).
-        # Fall back to DB fetch only if not provided.
-        data = request.get_json(silent=True) or {}
-        cart_items = data.get('cart_items') or []
-        if not cart_items and workflow and workflow.cart_store:
-            cart_items = workflow.cart_store.fetch(subject_ref)
+        cart_items = workflow.cart_store.fetch(subject_ref) if (workflow and workflow.cart_store) else []
         if not cart_items:
             return jsonify({'error': 'Your cart is empty.'}), 400
 
