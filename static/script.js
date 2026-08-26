@@ -10,13 +10,18 @@ let sessionId = generateSessionId();
 let currentProducts = [];  // Store current products for reference
 let selectedProductId = null;  // Track selected product
 let searchPerformed = false;  // Track if any search has been performed
+let wishlistItems = [];       // Cached wishlist from server
+let wishlistIds = new Set();  // product_id set for O(1) lookup
+let cartItems = [];           // Cached cart from server
+let cartIds = new Set();      // product_id set for O(1) lookup
+let activeTab = 'products';   // 'products' | 'wishlist' | 'cart'
 
 // Check authentication on page load
 document.addEventListener('DOMContentLoaded', () => {
-    // Authentication is now handled by backend redirect
-    // Just display user info if cookies exist
     displayUserInfo();
-    
+    loadWishlist();
+    loadCart();
+
     const sendBtn = document.getElementById('sendBtn');
     const clearBtn = document.getElementById('clearBtn');
     const userInput = document.getElementById('userInput');
@@ -26,6 +31,14 @@ document.addEventListener('DOMContentLoaded', () => {
     userInput.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') handleSend();
     });
+
+    // Wire delete-confirm input
+    const deleteInp = document.getElementById('deleteConfirmInput');
+    if (deleteInp) {
+        deleteInp.addEventListener('input', () => {
+            document.getElementById('deleteConfirmBtn').disabled = (deleteInp.value.trim() !== 'DELETE');
+        });
+    }
 });
 
 // Get cookie value
@@ -36,51 +49,185 @@ function getCookie(name) {
     return null;
 }
 
-// Display user info in header
+// Display user info in header (populates avatar dropdown)
 function displayUserInfo() {
-    const userName = getCookie('user_name');
-    const userEmail = getCookie('user_email');
+    const userName    = getCookie('user_name');
+    const userEmail   = getCookie('user_email');
     const userPicture = getCookie('user_picture');
-    
-    if (userName) {
-        const headerContent = document.querySelector('.header-content');
-        
-        // Create user info section
-        const userInfo = document.createElement('div');
-        userInfo.className = 'user-info';
-        userInfo.style.marginLeft = 'auto';
-        userInfo.style.display = 'flex';
-        userInfo.style.alignItems = 'center';
-        userInfo.style.gap = '10px';
-        
-        if (userPicture && userPicture !== 'undefined') {
-            const img = document.createElement('img');
-            img.src = decodeURIComponent(userPicture);
-            img.alt = userName;
-            img.style.width = '32px';
-            img.style.height = '32px';
-            img.style.borderRadius = '50%';
-            userInfo.appendChild(img);
+
+    if (!userName) return;
+
+    const name    = decodeURIComponent(userName);
+    const email   = userEmail ? decodeURIComponent(userEmail) : '';
+    const picture = (userPicture && userPicture !== 'undefined') ? decodeURIComponent(userPicture) : '';
+
+    // Header avatar button
+    const headerUser = document.getElementById('headerUser');
+    const headerAvatar = document.getElementById('headerAvatar');
+    const headerUserName = document.getElementById('headerUserName');
+    if (picture) {
+        headerAvatar.src = picture;
+        headerAvatar.style.display = 'block';
+    } else {
+        headerAvatar.style.display = 'none';
+    }
+    headerUserName.textContent = name.split(' ')[0];
+    headerUser.style.display = 'flex';
+
+    // Dropdown header
+    const dropdownAvatar = document.getElementById('dropdownAvatar');
+    if (picture) { dropdownAvatar.src = picture; dropdownAvatar.style.display = 'block'; }
+    else { dropdownAvatar.style.display = 'none'; }
+    document.getElementById('dropdownName').textContent  = name;
+    document.getElementById('dropdownEmail').textContent = email;
+}
+
+// ── Dropdown ──────────────────────────────────────────────────────────────
+let _dropdownOpen = false;
+
+function toggleDropdown(e) {
+    e.stopPropagation();
+    _dropdownOpen ? closeDropdown() : openDropdown();
+}
+
+function openDropdown() {
+    const btn = document.getElementById('userAvatarBtn');
+    const dd  = document.getElementById('userDropdown');
+    const rect = btn.getBoundingClientRect();
+    dd.style.top   = (rect.bottom + 8) + 'px';
+    dd.style.right = (window.innerWidth - rect.right) + 'px';
+    dd.style.display = 'block';
+    _dropdownOpen = true;
+}
+
+function closeDropdown() {
+    document.getElementById('userDropdown').style.display = 'none';
+    _dropdownOpen = false;
+}
+
+document.addEventListener('click', () => { if (_dropdownOpen) closeDropdown(); });
+
+// ── Side Panel (Profile / Preferences) ──────────────────────────────────
+function openPanel(type) {
+    closeDropdown();
+    const panel = document.getElementById('sidePanel');
+    const overlay = document.getElementById('sidePanelOverlay');
+    const title = document.getElementById('sidePanelTitle');
+    const body  = document.getElementById('sidePanelBody');
+
+    if (type === 'profile') {
+        title.textContent = '👤 My Profile';
+        body.innerHTML = '<div class="panel-loading">Loading…</div>';
+        panel.style.display = 'flex';
+        overlay.style.display = 'block';
+        loadUserProfile(body);
+    } else if (type === 'preferences') {
+        title.textContent = '🎯 My Preferences';
+        body.innerHTML = '<div class="panel-loading">Loading…</div>';
+        panel.style.display = 'flex';
+        overlay.style.display = 'block';
+        loadPreferences(body);
+    }
+}
+
+function closePanel() {
+    document.getElementById('sidePanel').style.display = 'none';
+    document.getElementById('sidePanelOverlay').style.display = 'none';
+}
+
+async function loadUserProfile(body) {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/user/profile`, { credentials: 'include' });
+        if (!resp.ok) throw new Error('Not authenticated');
+        const d = await resp.json();
+        body.innerHTML = `
+            <div class="profile-avatar-wrap">
+                ${d.picture ? `<img src="${d.picture}" class="profile-avatar">` : '<div class="profile-avatar-placeholder">👤</div>'}
+            </div>
+            <table class="profile-table">
+                <tr><td class="profile-label">Name</td><td>${d.name || '—'}</td></tr>
+                <tr><td class="profile-label">Email</td><td>${d.email || '—'}</td></tr>
+                <tr><td class="profile-label">Country</td><td>${d.country || '—'}</td></tr>
+            </table>`;
+    } catch (err) {
+        body.innerHTML = '<div class="panel-error">Could not load profile.</div>';
+    }
+}
+
+async function loadPreferences(body) {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/user/preferences`, { credentials: 'include' });
+        if (!resp.ok) throw new Error();
+        const d = await resp.json();
+        const pref = d.preferences || {};
+        const keys = Object.keys(pref).filter(k => pref[k] !== null && pref[k] !== '' && !(Array.isArray(pref[k]) && pref[k].length === 0));
+        const rows = keys.length
+            ? keys.map(k => `<tr><td class="profile-label">${k}</td><td>${Array.isArray(pref[k]) ? pref[k].join(', ') : pref[k]}</td></tr>`).join('')
+            : '<tr><td colspan="2" class="pref-empty">No preferences learned yet.</td></tr>';
+        body.innerHTML = `
+            <p class="pref-hint">These preferences are learned from your conversations.</p>
+            <table class="profile-table">${rows}</table>
+            <button class="pref-clear-btn" onclick="clearPreferences()">🗑️ Clear All Preferences</button>
+            <div id="prefMsg" class="pref-msg" style="display:none"></div>`;
+    } catch {
+        body.innerHTML = '<div class="panel-error">Could not load preferences.</div>';
+    }
+}
+
+async function clearPreferences() {
+    const msg = document.getElementById('prefMsg');
+    try {
+        const resp = await fetch(`${API_BASE_URL}/user/preferences`, { method: 'DELETE', credentials: 'include' });
+        if (!resp.ok) throw new Error();
+        msg.textContent = 'Preferences cleared.';
+        msg.className   = 'pref-msg pref-msg--ok';
+        msg.style.display = 'block';
+        setTimeout(() => loadPreferences(document.getElementById('sidePanelBody')), 800);
+    } catch {
+        msg.textContent = 'Failed to clear preferences.';
+        msg.className   = 'pref-msg pref-msg--err';
+        msg.style.display = 'block';
+    }
+}
+
+// ── Delete Account Modal ──────────────────────────────────────────────────
+function openDeleteModal() {
+    closeDropdown();
+    document.getElementById('deleteConfirmInput').value = '';
+    document.getElementById('deleteConfirmBtn').disabled = true;
+    const msg = document.getElementById('deleteModalMsg');
+    msg.style.display = 'none';
+    document.getElementById('deleteModal').style.display = 'flex';
+}
+
+function closeDeleteModal() {
+    document.getElementById('deleteModal').style.display = 'none';
+}
+
+async function submitDeleteRequest() {
+    const msg = document.getElementById('deleteModalMsg');
+    msg.style.display = 'none';
+    try {
+        const resp = await fetch(`${API_BASE_URL}/account/delete-request`, {
+            method: 'POST',
+            credentials: 'include',
+        });
+        const d = await resp.json();
+        if (!resp.ok) {
+            msg.textContent = d.error || 'Request failed.';
+            msg.className   = 'modal-msg modal-msg--err';
+            msg.style.display = 'block';
+            return;
         }
-        
-        const nameSpan = document.createElement('span');
-        nameSpan.textContent = decodeURIComponent(userName);
-        nameSpan.style.color = 'white';
-        nameSpan.style.fontSize = '14px';
-        userInfo.appendChild(nameSpan);
-        
-        const logoutBtn = document.createElement('button');
-        logoutBtn.textContent = 'Logout';
-        logoutBtn.style.background = 'rgba(255,255,255,0.2)';
-        logoutBtn.style.color = 'white';
-        logoutBtn.style.border = 'none';
-        logoutBtn.style.padding = '5px 15px';
-        logoutBtn.style.borderRadius = '4px';
-        logoutBtn.style.cursor = 'pointer';
-        logoutBtn.onclick = handleLogout;
-        userInfo.appendChild(logoutBtn);
-        
-        headerContent.appendChild(userInfo);
+        msg.textContent = `✅ Request received (ID: ${d.request_id}). Your data will be deleted within 30 days. You will now be logged out.`;
+        msg.className   = 'modal-msg modal-msg--ok';
+        msg.style.display = 'block';
+        document.getElementById('deleteConfirmBtn').disabled = true;
+        setTimeout(handleLogout, 4000);
+    } catch {
+        msg.textContent = 'Network error — please try again.';
+        msg.className   = 'modal-msg modal-msg--err';
+        msg.style.display = 'block';
     }
 }
 
@@ -443,24 +590,450 @@ function createProductCard(product, index) {
         ? `<img src="${imageUrl}" alt="${name}" class="product-image" onerror="this.onerror=null; this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22200%22><rect width=%22200%22 height=%22200%22 fill=%22%23f0f0f0%22/><text x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 font-size=%2260%22>🛍️</text></svg>';">`
         : `<div class="product-image-placeholder">🛍️</div>`;
 
+    const inWishlist = wishlistIds.has(String(productId));
+    const heartIcon = inWishlist ? '♥' : '♡';
+    const heartClass = inWishlist ? 'wishlist-heart-btn in-wishlist' : 'wishlist-heart-btn';
+    const heartTitle = inWishlist ? 'Remove from wishlist' : 'Add to wishlist';
+
+    const inCart = cartIds.has(String(productId));
+    const cartBtnClass = inCart ? 'cart-add-btn in-cart' : 'cart-add-btn';
+    const cartBtnTitle = inCart ? 'In cart' : 'Add to cart';
+    const cartBtnIcon = inCart ? '🛒✓' : '🛒';
+
     return `
         <div class="product-card" data-product-id="${productId}">
-            <div class="product-image-container">
+            <div class="product-image-container" style="position:relative">
                 ${imageHtml}
                 <div class="product-number">${index + 1}</div>
+                <button class="${heartClass}" data-product-id="${productId}" title="${heartTitle}"
+                    onclick="toggleWishlistItem(currentProducts[${index}],this);event.stopPropagation()">
+                    ${heartIcon}
+                </button>
             </div>
             <div class="product-info">
                 <h3 class="product-name">${name}</h3>
                 <p class="product-brand">${brand}</p>
                 <p class="product-price">$${price.toFixed(2)}</p>
                 ${badges ? `<div class="product-details">${badges}</div>` : ''}
-                <button class="product-discuss-btn" onclick="selectProductForDiscussion(${index}, event)">
-                    💬 Ask about this
-                </button>
+                <div class="product-actions">
+                    <button class="product-discuss-btn" onclick="selectProductForDiscussion(${index}, event)">
+                        💬 Ask about this
+                    </button>
+                    <button class="${cartBtnClass}" data-product-id="${productId}" title="${cartBtnTitle}"
+                        onclick="addToCartFromCard(currentProducts[${index}],this);event.stopPropagation()">
+                        ${cartBtnIcon}
+                    </button>
+                </div>
                 <a href="${url || '#'}" target="_blank" class="product-link" onclick="event.stopPropagation()" ${!url || url === '#' ? 'style="opacity: 0.5; pointer-events: none;"' : ''}>View Product →</a>
             </div>
         </div>
     `;
+}
+
+// ── Wishlist helpers ──────────────────────────────────────────────────────
+
+async function loadWishlist() {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/wishlist`, { credentials: 'include' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        wishlistItems = data.items || [];
+        wishlistIds = new Set(wishlistItems.map(i => String(i.product_id)));
+        updateWishlistBadge();
+        if (activeTab === 'wishlist') renderWishlistPanel();
+        refreshHeartButtons();
+    } catch (_) {}
+}
+
+function updateWishlistBadge() {
+    const badge = document.getElementById('wishlistBadge');
+    if (!badge) return;
+    if (wishlistIds.size > 0) {
+        badge.textContent = wishlistIds.size;
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+    // Update tab label heart
+    const tab = document.getElementById('tabWishlist');
+    if (tab) tab.childNodes[0].textContent = wishlistIds.size > 0 ? '♥ Wishlist ' : '♡ Wishlist ';
+}
+
+function refreshHeartButtons() {
+    document.querySelectorAll('.wishlist-heart-btn').forEach(btn => {
+        const pid = String(btn.dataset.productId);
+        const inList = wishlistIds.has(pid);
+        btn.textContent = inList ? '♥' : '♡';
+        btn.classList.toggle('in-wishlist', inList);
+        btn.title = inList ? 'Remove from wishlist' : 'Add to wishlist';
+    });
+}
+
+async function toggleWishlistItem(product, btnEl) {
+    const pid = String(product.id);
+    const inList = wishlistIds.has(pid);
+
+    // Optimistic update
+    if (inList) {
+        wishlistIds.delete(pid);
+        wishlistItems = wishlistItems.filter(i => String(i.product_id) !== pid);
+    } else {
+        wishlistIds.add(pid);
+        wishlistItems.push({
+            product_id:   pid,
+            product_name: product.name,
+            brand:        product.brand,
+            price:        product.price,
+            image_url:    product.image,
+            retailer_url: product.url,
+        });
+    }
+    updateWishlistBadge();
+    if (btnEl) {
+        btnEl.textContent = wishlistIds.has(pid) ? '♥' : '♡';
+        btnEl.classList.toggle('in-wishlist', wishlistIds.has(pid));
+    }
+    if (activeTab === 'wishlist') renderWishlistPanel();
+
+    // Server sync
+    try {
+        const method = inList ? 'DELETE' : 'POST';
+        const endpoint = inList ? '/wishlist/remove' : '/wishlist/add';
+        await fetch(`${API_BASE_URL}${endpoint}`, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                product_id:   pid,
+                product_name: product.name,
+                brand:        product.brand,
+                price:        product.price,
+                image_url:    product.image,
+                retailer_url: product.url,
+            }),
+        });
+    } catch (err) {
+        console.warn('Wishlist sync failed:', err);
+    }
+}
+
+async function removeWishlistItem(productId) {
+    const pid = String(productId);
+    wishlistIds.delete(pid);
+    wishlistItems = wishlistItems.filter(i => String(i.product_id) !== pid);
+    updateWishlistBadge();
+    refreshHeartButtons();
+    renderWishlistPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/wishlist/remove`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ product_id: pid }),
+        });
+    } catch (err) {
+        console.warn('Wishlist remove failed:', err);
+    }
+}
+
+function renderWishlistPanel() {
+    const container = document.getElementById('wishlistContainer');
+    if (!container) return;
+    if (wishlistItems.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">♡</div>
+                <h3>Your wishlist is empty</h3>
+                <p>Tap the heart on any product to save it here</p>
+            </div>`;
+        return;
+    }
+    const items = wishlistItems.map(item => {
+        const pid = escapeHtml(String(item.product_id));
+        const name = escapeHtml(item.product_name || 'Product');
+        const brand = escapeHtml(item.brand || '');
+        const price = item.price ? `$${parseFloat(item.price).toFixed(2)}` : '';
+        const imgSrc = item.image_url || '';
+        const imgEl = imgSrc
+            ? `<img src="${imgSrc}" alt="${name}" class="wishlist-item-img" onerror="this.style.display='none'">`
+            : `<div class="wishlist-item-img" style="display:flex;align-items:center;justify-content:center;font-size:28px">🛍️</div>`;
+        const alreadyInCart = cartIds.has(pid);
+        const cartBtnLabel = alreadyInCart ? '🛒✓' : '🛒';
+        const cartBtnCls   = alreadyInCart ? 'cart-add-btn in-cart wishlist-cart-btn' : 'cart-add-btn wishlist-cart-btn';
+        return `
+            <div class="wishlist-item">
+                ${imgEl}
+                <div class="wishlist-item-info">
+                    <div class="wishlist-item-name" title="${name}">${name}</div>
+                    ${brand ? `<div class="wishlist-item-brand">${brand}</div>` : ''}
+                    ${price ? `<div class="wishlist-item-price">${price}</div>` : ''}
+                </div>
+                <div class="wishlist-item-actions">
+                    <button class="${cartBtnCls}" title="Add to cart"
+                        onclick="addToCartFromWishlist(${JSON.stringify(item)},this)">
+                        ${cartBtnLabel}
+                    </button>
+                    <button class="wishlist-item-remove" title="Remove" onclick="removeWishlistItem('${pid}')">✕</button>
+                </div>
+            </div>`;
+    }).join('');
+    container.innerHTML = `<div class="wishlist-panel-header">${wishlistItems.length} saved item${wishlistItems.length !== 1 ? 's' : ''}</div>${items}`;
+}
+
+function switchTab(tab) {
+    activeTab = tab;
+    const products = document.getElementById('resultsContainer');
+    const wishlist = document.getElementById('wishlistContainer');
+    const cart     = document.getElementById('cartContainer');
+    const tabP     = document.getElementById('tabProducts');
+    const tabW     = document.getElementById('tabWishlist');
+    const tabC     = document.getElementById('tabCart');
+
+    products.style.display = tab === 'products' ? '' : 'none';
+    wishlist.style.display = tab === 'wishlist' ? '' : 'none';
+    cart.style.display     = tab === 'cart'     ? '' : 'none';
+
+    tabP.classList.toggle('active', tab === 'products');
+    tabW.classList.toggle('active', tab === 'wishlist');
+    tabC.classList.toggle('active', tab === 'cart');
+
+    if (tab === 'wishlist') renderWishlistPanel();
+    if (tab === 'cart')     renderCartPanel();
+}
+
+// ── Cart helpers ──────────────────────────────────────────────────────────
+
+async function loadCart() {
+    try {
+        const resp = await fetch(`${API_BASE_URL}/cart`, { credentials: 'include' });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        cartItems = data.items || [];
+        cartIds   = new Set(cartItems.map(i => String(i.product_id)));
+        updateCartBadge();
+        if (activeTab === 'cart') renderCartPanel();
+        refreshCartButtons();
+    } catch (_) {}
+}
+
+function updateCartBadge() {
+    const badge = document.getElementById('cartBadge');
+    if (!badge) return;
+    const totalQty = cartItems.reduce((s, i) => s + (parseInt(i.quantity) || 1), 0);
+    if (totalQty > 0) {
+        badge.textContent = totalQty;
+        badge.style.display = 'inline-block';
+    } else {
+        badge.style.display = 'none';
+    }
+}
+
+function refreshCartButtons() {
+    document.querySelectorAll('.cart-add-btn').forEach(btn => {
+        const pid = String(btn.dataset.productId);
+        if (!pid) return;
+        const inCart = cartIds.has(pid);
+        btn.textContent = inCart ? '🛒✓' : '🛒';
+        btn.classList.toggle('in-cart', inCart);
+        btn.title = inCart ? 'In cart' : 'Add to cart';
+    });
+}
+
+async function addToCartFromCard(product, btnEl) {
+    const pid = String(product.id);
+    if (cartIds.has(pid)) {
+        // Already in cart — switch to cart tab for visibility
+        switchTab('cart');
+        return;
+    }
+
+    // Optimistic update
+    cartIds.add(pid);
+    cartItems.push({
+        product_id:   pid,
+        product_name: product.name,
+        brand:        product.brand,
+        price:        product.price,
+        image_url:    product.image,
+        retailer_url: product.url,
+        quantity:     1,
+    });
+    updateCartBadge();
+    if (btnEl) {
+        btnEl.textContent = '🛒✓';
+        btnEl.classList.add('in-cart');
+        btnEl.title = 'In cart';
+    }
+    if (activeTab === 'cart') renderCartPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/add`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                product_id:   pid,
+                product_name: product.name,
+                brand:        product.brand,
+                price:        product.price,
+                image_url:    product.image,
+                retailer_url: product.url,
+                quantity:     1,
+            }),
+        });
+    } catch (err) {
+        console.warn('Cart add failed:', err);
+    }
+}
+
+async function addToCartFromWishlist(item, btnEl) {
+    const pid = String(item.product_id);
+    if (cartIds.has(pid)) {
+        switchTab('cart');
+        return;
+    }
+
+    cartIds.add(pid);
+    cartItems.push({
+        product_id:   pid,
+        product_name: item.product_name,
+        brand:        item.brand,
+        price:        item.price,
+        image_url:    item.image_url,
+        retailer_url: item.retailer_url,
+        quantity:     1,
+    });
+    updateCartBadge();
+    if (btnEl) {
+        btnEl.textContent = '🛒✓';
+        btnEl.classList.add('in-cart');
+    }
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/add`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+                product_id:   pid,
+                product_name: item.product_name,
+                brand:        item.brand,
+                price:        item.price,
+                image_url:    item.image_url,
+                retailer_url: item.retailer_url,
+                quantity:     1,
+            }),
+        });
+    } catch (err) {
+        console.warn('Cart add (from wishlist) failed:', err);
+    }
+}
+
+async function removeFromCart(productId) {
+    const pid = String(productId);
+    cartIds.delete(pid);
+    cartItems = cartItems.filter(i => String(i.product_id) !== pid);
+    updateCartBadge();
+    refreshCartButtons();
+    renderCartPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/remove`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ product_id: pid }),
+        });
+    } catch (err) {
+        console.warn('Cart remove failed:', err);
+    }
+}
+
+async function updateCartQty(productId, delta) {
+    const pid  = String(productId);
+    const item = cartItems.find(i => String(i.product_id) === pid);
+    if (!item) return;
+
+    const newQty = (parseInt(item.quantity) || 1) + delta;
+    if (newQty <= 0) {
+        await removeFromCart(pid);
+        return;
+    }
+
+    item.quantity = newQty;
+    updateCartBadge();
+    renderCartPanel();
+
+    try {
+        await fetch(`${API_BASE_URL}/cart/update`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ product_id: pid, quantity: newQty }),
+        });
+    } catch (err) {
+        console.warn('Cart update failed:', err);
+    }
+}
+
+function renderCartPanel() {
+    const container = document.getElementById('cartContainer');
+    if (!container) return;
+
+    if (cartItems.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">🛒</div>
+                <h3>Your cart is empty</h3>
+                <p>Add products from the search results or your wishlist</p>
+            </div>`;
+        return;
+    }
+
+    let subtotal = 0;
+    const itemsHtml = cartItems.map(item => {
+        const pid      = escapeHtml(String(item.product_id));
+        const name     = escapeHtml(item.product_name || 'Product');
+        const brand    = escapeHtml(item.brand || '');
+        const price    = parseFloat(item.price) || 0;
+        const qty      = parseInt(item.quantity) || 1;
+        const lineTotal = price * qty;
+        subtotal += lineTotal;
+
+        const imgSrc = item.image_url || '';
+        const imgEl  = imgSrc
+            ? `<img src="${imgSrc}" alt="${name}" class="wishlist-item-img" onerror="this.style.display='none'">`
+            : `<div class="wishlist-item-img" style="display:flex;align-items:center;justify-content:center;font-size:28px">🛍️</div>`;
+
+        return `
+            <div class="cart-item">
+                ${imgEl}
+                <div class="wishlist-item-info">
+                    <div class="wishlist-item-name" title="${name}">${name}</div>
+                    ${brand ? `<div class="wishlist-item-brand">${brand}</div>` : ''}
+                    <div class="wishlist-item-price">$${price.toFixed(2)}</div>
+                </div>
+                <div class="cart-item-controls">
+                    <div class="cart-qty-controls">
+                        <button class="cart-qty-btn" onclick="updateCartQty('${pid}',-1)">−</button>
+                        <span class="cart-qty-value">${qty}</span>
+                        <button class="cart-qty-btn" onclick="updateCartQty('${pid}',1)">+</button>
+                    </div>
+                    <div class="cart-line-total">$${lineTotal.toFixed(2)}</div>
+                    <button class="wishlist-item-remove" title="Remove" onclick="removeFromCart('${pid}')">✕</button>
+                </div>
+            </div>`;
+    }).join('');
+
+    const totalQty = cartItems.reduce((s, i) => s + (parseInt(i.quantity) || 1), 0);
+    container.innerHTML = `
+        <div class="wishlist-panel-header">${totalQty} item${totalQty !== 1 ? 's' : ''} in cart</div>
+        ${itemsHtml}
+        <div class="cart-subtotal">
+            <span>Subtotal</span>
+            <span>$${subtotal.toFixed(2)}</span>
+        </div>`;
 }
 
 // Handle clear chat

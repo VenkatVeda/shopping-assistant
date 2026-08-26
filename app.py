@@ -28,6 +28,8 @@ from core.auth import (
 from core.performance import get_monitor, get_tracker, track_time
 from core.observability import metrics_store, RequestTrace
 from core.evals import EvalRunner
+from core.geoip import get_country_from_request
+from core.shopping_audit import log_wishlist_action, log_cart_action
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -396,7 +398,7 @@ def oauth_callback():
                 workflow.audit_wrapper.register_customer(
                     user_email      = email,
                     full_name       = name,
-                    user_country    = user_info.get("locale", "")[:2].upper() or os.getenv("DEFAULT_USER_COUNTRY", ""),
+                    user_country    = get_country_from_request(request) or os.getenv("DEFAULT_USER_COUNTRY", ""),
                     consent_version = "tnc_v2.1",
                 )
         except Exception as _re:
@@ -1589,6 +1591,319 @@ def metrics_dashboard():
 </body>
 </html>"""
     return html
+
+
+# ============================================================================
+# WISHLIST API ROUTES
+# ============================================================================
+
+@app.route('/api/wishlist', methods=['GET'])
+@token_required
+def wishlist_get():
+    """Fetch all active wishlist items for the authenticated user."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.wishlist_store is None:
+        return jsonify({'error': 'Wishlist unavailable'}), 503
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    items = workflow.wishlist_store.fetch(subject_ref)
+    return jsonify({'items': items, 'count': len(items)})
+
+
+@app.route('/api/wishlist/add', methods=['POST'])
+@token_required
+def wishlist_add():
+    """Add a product to the authenticated user's wishlist."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.wishlist_store is None:
+        return jsonify({'error': 'Wishlist unavailable'}), 503
+
+    data = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+
+    if workflow.wishlist_store.is_in_wishlist(subject_ref, product_id):
+        return jsonify({'status': 'already_exists', 'product_id': product_id}), 200
+
+    wishlist_id = workflow.wishlist_store.add(
+        subject_ref=subject_ref,
+        product_id=product_id,
+        product_name=data.get('product_name'),
+        brand=data.get('brand'),
+        price=data.get('price'),
+        image_url=data.get('image_url'),
+        retailer_url=data.get('retailer_url'),
+    )
+    log_wishlist_action(workflow.audit_wrapper,
+        trace_id=str(uuid.uuid4()),
+        action='add_to_wishlist',
+        product_id=product_id,
+        status='success',
+        subject_ref=subject_ref,
+    )
+    return jsonify({'status': 'added', 'wishlist_id': wishlist_id, 'product_id': product_id}), 201
+
+
+@app.route('/api/wishlist/remove', methods=['DELETE'])
+@token_required
+def wishlist_remove():
+    """Remove a product from the authenticated user's wishlist (soft delete)."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.wishlist_store is None:
+        return jsonify({'error': 'Wishlist unavailable'}), 503
+
+    data = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    workflow.wishlist_store.remove(subject_ref, product_id)
+    log_wishlist_action(workflow.audit_wrapper,
+        trace_id=str(uuid.uuid4()),
+        action='remove_from_wishlist',
+        product_id=product_id,
+        status='success',
+        subject_ref=subject_ref,
+    )
+    return jsonify({'status': 'removed', 'product_id': product_id}), 200
+
+
+# ============================================================================
+# CART API
+# ============================================================================
+
+@app.route('/api/cart', methods=['GET'])
+@token_required
+def cart_get():
+    """Return the authenticated user's active cart items with subtotal."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    items = workflow.cart_store.fetch(subject_ref)
+
+    subtotal = sum(
+        (float(item.get('price') or 0)) * int(item.get('quantity') or 1)
+        for item in items
+    )
+    return jsonify({'items': items, 'count': len(items), 'subtotal': round(subtotal, 2)})
+
+
+@app.route('/api/cart/add', methods=['POST'])
+@token_required
+def cart_add():
+    """Add a product to the cart, or increment its quantity if already present."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    data       = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    quantity = max(1, int(data.get('quantity', 1)))
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+
+    cart_item_id = workflow.cart_store.add(
+        subject_ref  = subject_ref,
+        product_id   = product_id,
+        product_name = data.get('product_name'),
+        brand        = data.get('brand'),
+        price        = data.get('price'),
+        image_url    = data.get('image_url'),
+        retailer_url = data.get('retailer_url'),
+        quantity     = quantity,
+    )
+    log_cart_action(workflow.audit_wrapper,
+        trace_id    = str(uuid.uuid4()),
+        action      = 'add_to_cart',
+        product_id  = product_id,
+        status      = 'success',
+        quantity    = quantity,
+        subject_ref = subject_ref,
+    )
+    return jsonify({'status': 'added', 'cart_item_id': cart_item_id, 'product_id': product_id}), 201
+
+
+@app.route('/api/cart/remove', methods=['DELETE'])
+@token_required
+def cart_remove():
+    """Remove a product from the cart (soft delete)."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    data       = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    workflow.cart_store.remove(subject_ref, product_id)
+    log_cart_action(workflow.audit_wrapper,
+        trace_id    = str(uuid.uuid4()),
+        action      = 'remove_from_cart',
+        product_id  = product_id,
+        status      = 'success',
+        quantity    = 0,
+        subject_ref = subject_ref,
+    )
+    return jsonify({'status': 'removed', 'product_id': product_id}), 200
+
+
+@app.route('/api/cart/update', methods=['PUT'])
+@token_required
+def cart_update():
+    """Update quantity for a cart item. quantity=0 removes the item."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.cart_store is None:
+        return jsonify({'error': 'Cart unavailable'}), 503
+
+    data       = request.json or {}
+    product_id = data.get('product_id', '').strip()
+    if not product_id:
+        return jsonify({'error': 'product_id is required'}), 400
+
+    quantity = int(data.get('quantity', 1))
+    subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1]
+    workflow.cart_store.update_quantity(subject_ref, product_id, quantity)
+
+    action = 'remove_from_cart' if quantity <= 0 else 'update_cart'
+    log_cart_action(workflow.audit_wrapper,
+        trace_id    = str(uuid.uuid4()),
+        action      = action,
+        product_id  = product_id,
+        status      = 'success',
+        quantity    = max(0, quantity),
+        subject_ref = subject_ref,
+    )
+    status = 'removed' if quantity <= 0 else 'updated'
+    return jsonify({'status': status, 'product_id': product_id, 'quantity': max(0, quantity)}), 200
+
+
+# ============================================================================
+# USER SETTINGS API
+# ============================================================================
+
+@app.route('/api/user/profile', methods=['GET'])
+@token_required
+def user_profile():
+    """Return the authenticated user's profile info from their cookie."""
+    user_id   = getattr(request, 'user_id', None)
+    user_name = request.cookies.get('user_name', '')
+    user_pic  = request.cookies.get('user_picture', '')
+    country   = get_country_from_request(request) or os.getenv('DEFAULT_USER_COUNTRY', '')
+    return jsonify({
+        'email':   user_id or '',
+        'name':    user_name,
+        'picture': user_pic,
+        'country': country,
+    })
+
+
+@app.route('/api/user/preferences', methods=['GET'])
+@token_required
+def user_preferences_get():
+    """Return the user's learned personalisation profile."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or not getattr(workflow, 'personalization_enabled', False):
+        return jsonify({'preferences': None, 'message': 'Personalisation not enabled'}), 200
+    try:
+        profile = workflow.profile_storage.load_profile(user_id)
+        prefs = {}
+        if profile and hasattr(profile, '__dict__'):
+            raw = profile.__dict__
+            prefs = {
+                'favourite_brands':     raw.get('favorite_brands', []),
+                'favourite_colors':     raw.get('preferred_colors', []),
+                'favourite_categories': raw.get('preferred_categories', []),
+                'price_range':          {'min': raw.get('min_price'), 'max': raw.get('max_price')},
+                'total_searches':       raw.get('interaction_count', 0),
+            }
+        return jsonify({'preferences': prefs})
+    except Exception as e:
+        logger.warning('[USER PREFS] Failed to load: %s', e)
+        return jsonify({'preferences': {}}), 200
+
+
+@app.route('/api/user/preferences', methods=['DELETE'])
+@token_required
+def user_preferences_clear():
+    """Clear the user's learned personalisation profile."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or not getattr(workflow, 'personalization_enabled', False):
+        return jsonify({'status': 'ok', 'message': 'Personalisation not enabled'}), 200
+    try:
+        from core.personalization.storage import UserProfile
+        empty = UserProfile(user_id=user_id)
+        workflow.profile_storage.save_profile(empty)
+        return jsonify({'status': 'cleared'})
+    except Exception as e:
+        logger.warning('[USER PREFS] Failed to clear: %s', e)
+        return jsonify({'error': 'Could not clear preferences'}), 500
+
+
+@app.route('/api/account/delete-request', methods=['POST'])
+@token_required
+def account_delete_request():
+    """Raise a Right-to-be-Forgotten / erasure request for the authenticated user."""
+    user_id = getattr(request, 'user_id', None)
+    if not user_id:
+        return jsonify({'error': 'Authentication required'}), 401
+    if workflow is None or workflow.audit_wrapper is None:
+        return jsonify({'error': 'Service unavailable'}), 503
+
+    try:
+        from core.erasure_store import ErasureStore, ensure_table as erasure_ensure_table
+        erasure_ensure_table()
+        store = ErasureStore(app_id=os.getenv('AUDIT_APP_ID', 'myre_app'))
+
+        _, subject_ref = workflow.audit_wrapper._compute_refs(user_id)
+
+        if store.has_pending_request(subject_ref):
+            return jsonify({
+                'status': 'already_pending',
+                'message': 'A deletion request is already pending for your account.',
+            }), 200
+
+        from audit_wrapper import _determine_regulation
+        country    = get_country_from_request(request) or os.getenv('DEFAULT_USER_COUNTRY', '')
+        regulation = _determine_regulation(country)
+        request_id = store.raise_request(subject_ref=subject_ref, regulation=regulation)
+
+        return jsonify({
+            'status':     'raised',
+            'request_id': request_id,
+            'message':    'Your deletion request has been received. We will process it within 30 days.',
+        }), 201
+
+    except Exception as e:
+        logger.error('[ERASURE] Failed to raise request: %s', e)
+        return jsonify({'error': 'Could not process your request. Please try again.'}), 500
 
 
 # ============================================================================

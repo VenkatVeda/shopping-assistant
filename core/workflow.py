@@ -20,6 +20,7 @@ from .observability import NodeTracer, RequestTrace, metrics_store
 from .audit_logger import log_guardrail
 from .evals import EvalRunner
 from .semantic_cache import build_cache
+from .shopping_audit import log_wishlist_action, log_cart_action
 from contextvars import ContextVar
 _current_trace_id: ContextVar[str] = ContextVar('_current_trace_id', default='')
 
@@ -64,6 +65,15 @@ class GraphState(TypedDict):
     product_context: Optional[dict]  # Details of the selected product
     last_discussed_product: Optional[dict]  # Last product discussed (id, name, brand)
     trace_id: Optional[str]  # Unique ID linking all audit logs for this request
+
+    # Wishlist Fields
+    wishlist_items:    Optional[List[dict]]  # Loaded wishlist items for current turn
+    action_product_id: Optional[str]         # Product ID targeted by wishlist/cart action
+    action_status:     Optional[str]         # Result: success / already_exists / not_found / error
+
+    # Cart Fields
+    cart_items:        Optional[List[dict]]  # Loaded cart items for current turn
+    cart_quantity:     Optional[int]         # Quantity for add_to_cart action (default 1)
 
 class ShoppingAssistantWorkflow:
     def __init__(self):
@@ -213,6 +223,31 @@ class ShoppingAssistantWorkflow:
             self.audit_wrapper = None
         # ─────────────────────────────────────────────────────────────────────
 
+        # ── Wishlist Store ────────────────────────────────────────────────────
+        try:
+            from .wishlist_store import WishlistStore, ensure_table
+            self.wishlist_store = WishlistStore(
+                app_id=os.getenv("AUDIT_APP_ID", "myre_app")
+            )
+            ensure_table()
+            print("✓ WishlistStore initialised")
+        except Exception as _we:
+            print(f"[WISHLIST] WishlistStore init failed (non-blocking): {_we}")
+            self.wishlist_store = None
+
+        # ── Cart Store ────────────────────────────────────────────────────────
+        try:
+            from .cart_store import CartStore, ensure_table as cart_ensure_table
+            self.cart_store = CartStore(
+                app_id=os.getenv("AUDIT_APP_ID", "myre_app")
+            )
+            cart_ensure_table()
+            print("✓ CartStore initialised")
+        except Exception as _ce:
+            print(f"[CART] CartStore init failed (non-blocking): {_ce}")
+            self.cart_store = None
+        # ─────────────────────────────────────────────────────────────────────
+
         # Build Graph
         self.app = self._build_graph()
         print("✓ Workflow Ready with Pinecone + RAG Enhancement!")
@@ -233,6 +268,8 @@ class ShoppingAssistantWorkflow:
         workflow.add_node("reranker",                t("reranker",                self.reranker_node))
         workflow.add_node("response_generator",      t("response_generator",      self.response_generator_node))
         workflow.add_node("output_guardrail",        t("output_guardrail",        self.output_guardrail_node))
+        workflow.add_node("wishlist_action",         t("wishlist_action",         self.wishlist_action_node))
+        workflow.add_node("cart_action",             t("cart_action",             self.cart_action_node))
         
         # Set Entry Point
         workflow.set_entry_point("input_guardrail")
@@ -255,8 +292,18 @@ class ShoppingAssistantWorkflow:
                 "shopping_conflict": "clarification",       # pause: ask START_FRESH/MERGE/REPLACE
                 "chat":              "response_generator",  # LLM chat reply → guardrail → END
                 "product_detail":    "response_generator",  # skip search pipeline entirely
+                "add_to_wishlist":    "wishlist_action",    # save product to wishlist
+                "remove_from_wishlist": "wishlist_action", # remove product from wishlist
+                "view_wishlist":      "wishlist_action",   # fetch and display wishlist
+                "add_to_cart":        "cart_action",       # add product to cart
+                "remove_from_cart":   "cart_action",       # remove product from cart
+                "view_cart":          "cart_action",       # fetch and display cart
             }
         )
+
+        # Wishlist / cart actions always route to response_generator for confirmation message
+        workflow.add_edge("wishlist_action", "response_generator")
+        workflow.add_edge("cart_action",     "response_generator")
 
         # Clarification is a deliberate pause node — it always stops for user input.
         # The "continue" branch is a safety valve; in normal operation the node
@@ -727,6 +774,14 @@ class ShoppingAssistantWorkflow:
                             print(f"[SEARCH] Price conversion warning for {product_id}: {e}", file=sys.stderr)
                             pass
                     
+                    # Post-filter by category (substring match against the
+                    # category_clean taxonomy path — see _category_matches)
+                    category_clean = metadata.get('category', '')
+                    if preferences.categories and not self._category_matches(category_clean, preferences.categories):
+                        continue
+                    if preferences.excluded_categories and self._category_matches(category_clean, preferences.excluded_categories):
+                        continue
+
                     # Add to results and mark as seen
                     results.append({
                         'id': product_id,
@@ -787,6 +842,10 @@ class ShoppingAssistantWorkflow:
         intent = state.get("intent")
         if intent == "product_detail":
             return "product_detail"
+        if intent in ("add_to_wishlist", "remove_from_wishlist", "view_wishlist"):
+            return intent
+        if intent in ("add_to_cart", "remove_from_cart", "view_cart"):
+            return intent
         if intent in ("shopping", "preference_update"):
             prev = state.get("preferences")
             new  = state.get("new_preferences")
@@ -1448,6 +1507,157 @@ class ShoppingAssistantWorkflow:
             "generated_response": validation_result["safe_response"]  # Update with safe version
         }
     
+    def wishlist_action_node(self, state: GraphState):
+        """Node: Handle add_to_wishlist, remove_from_wishlist, view_wishlist intents."""
+        intent      = state.get("intent", "")
+        user_id     = state.get("user_id")
+        product_id  = state.get("action_product_id") or state.get("selected_product_id")
+        trace_id    = _current_trace_id.get()
+
+        # Compute subject_ref for Delta writes (reuse AuditWrapper's HMAC chain)
+        subject_ref = None
+        if self.audit_wrapper and user_id:
+            try:
+                _, subject_ref = self.audit_wrapper._compute_refs(user_id)
+            except Exception:
+                pass
+
+        wishlist_items = []
+        action_status  = "error"
+
+        try:
+            if intent == "view_wishlist":
+                if self.wishlist_store and subject_ref:
+                    wishlist_items = self.wishlist_store.fetch(subject_ref)
+                action_status = "success"
+                if self.audit_wrapper:
+                    log_wishlist_action(self.audit_wrapper,
+                        trace_id=trace_id, action="view",
+                        product_id="", status=action_status, subject_ref=subject_ref
+                    )
+
+            elif intent == "add_to_wishlist":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.wishlist_store and subject_ref:
+                    if self.wishlist_store.is_in_wishlist(subject_ref, product_id):
+                        action_status = "already_exists"
+                    else:
+                        product_ctx = state.get("product_context") or {}
+                        last_product = state.get("last_discussed_product") or {}
+                        self.wishlist_store.add(
+                            subject_ref  = subject_ref,
+                            product_id   = product_id,
+                            product_name = product_ctx.get("name") or last_product.get("name"),
+                            brand        = product_ctx.get("brand") or last_product.get("brand"),
+                            price        = product_ctx.get("price"),
+                            image_url    = product_ctx.get("primary_image_url") or product_ctx.get("image_url"),
+                            retailer_url = product_ctx.get("url_full") or product_ctx.get("url"),
+                        )
+                        action_status = "success"
+                    if self.audit_wrapper:
+                        log_wishlist_action(self.audit_wrapper,
+                            trace_id=trace_id, action="add",
+                            product_id=product_id, status=action_status, subject_ref=subject_ref
+                        )
+
+            elif intent == "remove_from_wishlist":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.wishlist_store and subject_ref:
+                    self.wishlist_store.remove(subject_ref, product_id)
+                    action_status = "success"
+                    if self.audit_wrapper:
+                        log_wishlist_action(self.audit_wrapper,
+                            trace_id=trace_id, action="remove",
+                            product_id=product_id, status=action_status, subject_ref=subject_ref
+                        )
+
+        except Exception as e:
+            print(f"[WISHLIST NODE] Error: {e}")
+            action_status = "error"
+
+        return {
+            "wishlist_items": wishlist_items,
+            "action_status":  action_status,
+        }
+
+    def cart_action_node(self, state: GraphState):
+        """Node: Handle add_to_cart, remove_from_cart, view_cart intents."""
+        intent     = state.get("intent", "")
+        user_id    = state.get("user_id")
+        product_id = state.get("action_product_id") or state.get("selected_product_id")
+        quantity   = state.get("cart_quantity") or 1
+        trace_id   = _current_trace_id.get()
+
+        subject_ref = None
+        if self.audit_wrapper and user_id:
+            try:
+                _, subject_ref = self.audit_wrapper._compute_refs(user_id)
+            except Exception:
+                pass
+
+        cart_items    = []
+        action_status = "error"
+
+        try:
+            if intent == "view_cart":
+                if self.cart_store and subject_ref:
+                    cart_items = self.cart_store.fetch(subject_ref)
+                action_status = "success"
+                if self.audit_wrapper:
+                    log_cart_action(self.audit_wrapper,
+                        trace_id=trace_id, action="view",
+                        product_id="", status=action_status,
+                        quantity=0, subject_ref=subject_ref
+                    )
+
+            elif intent == "add_to_cart":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.cart_store and subject_ref:
+                    product_ctx  = state.get("product_context") or {}
+                    last_product = state.get("last_discussed_product") or {}
+                    self.cart_store.add(
+                        subject_ref  = subject_ref,
+                        product_id   = product_id,
+                        product_name = product_ctx.get("name") or last_product.get("name"),
+                        brand        = product_ctx.get("brand") or last_product.get("brand"),
+                        price        = product_ctx.get("price"),
+                        image_url    = product_ctx.get("primary_image_url") or product_ctx.get("image_url"),
+                        retailer_url = product_ctx.get("url_full") or product_ctx.get("url"),
+                        quantity     = quantity,
+                    )
+                    action_status = "success"
+                    if self.audit_wrapper:
+                        log_cart_action(self.audit_wrapper,
+                            trace_id=trace_id, action="add",
+                            product_id=product_id, status=action_status,
+                            quantity=quantity, subject_ref=subject_ref
+                        )
+
+            elif intent == "remove_from_cart":
+                if not product_id:
+                    action_status = "not_found"
+                elif self.cart_store and subject_ref:
+                    self.cart_store.remove(subject_ref, product_id)
+                    action_status = "success"
+                    if self.audit_wrapper:
+                        log_cart_action(self.audit_wrapper,
+                            trace_id=trace_id, action="remove",
+                            product_id=product_id, status=action_status,
+                            quantity=0, subject_ref=subject_ref
+                        )
+
+        except Exception as e:
+            print(f"[CART NODE] Error: {e}")
+            action_status = "error"
+
+        return {
+            "cart_items":   cart_items,
+            "action_status": action_status,
+        }
+
     def _detect_product_intent(self, state: GraphState):
         """Determine whether this turn is a product-detail interaction.
 
@@ -1760,60 +1970,11 @@ class ShoppingAssistantWorkflow:
         # Note: Price is stored as string in Pinecone, so we skip numeric comparisons
         # You may need to filter results after retrieval or convert in Pinecone upload
         
-        # Category filter (inclusion) - uses "category" field
-        if preferences.categories:
-            # Map friendly names and create variations for better matching
-            category_variations = []
-            for cat in preferences.categories:
-                cat_lower = cat.lower()
-                # Add original
-                category_variations.append(cat)
-                # Add lowercase
-                category_variations.append(cat_lower)
-                # Add capitalized
-                category_variations.append(cat.title())
-                # Add without 's' or with 's'
-                if cat_lower.endswith('s'):
-                    category_variations.append(cat_lower[:-1])  # "tote bags" -> "tote bag"
-                    category_variations.append(cat_lower[:-1].title())  # "Tote Bag"
-                else:
-                    category_variations.append(cat_lower + 's')  # "tote" -> "totes"
-                    category_variations.append((cat_lower + 's').title())  # "Totes"
-                
-                # Add common mappings
-                if 'tote' in cat_lower:
-                    category_variations.extend(['tote', 'Tote', 'tote bag', 'Tote Bag', 'tote bags', 'Tote Bags'])
-                elif 'shoulder' in cat_lower:
-                    category_variations.extend(['shoulder', 'Shoulder', 'shoulder bag', 'Shoulder Bag'])
-                elif 'crossbody' in cat_lower or 'cross-body' in cat_lower:
-                    category_variations.extend(['crossbody', 'Crossbody', 'cross-body', 'Cross-Body'])
-                elif 'backpack' in cat_lower:
-                    category_variations.extend(['backpack', 'Backpack', 'backpacks', 'Backpacks'])
-            
-            # Remove duplicates
-            category_variations = list(set(category_variations))
-            
-            print(f"[FILTER DEBUG] Original categories: {preferences.categories}")
-            print(f"[FILTER DEBUG] Category variations for matching: {category_variations[:10]}...")  # Show first 10
-            
-            # Always use $in for flexibility, even with one category
-            conditions.append({"category": {"$in": category_variations}})
-        
-        # Category filter (exclusion)
-        if preferences.excluded_categories:
-            category_map = {
-                "tote bags": "tote",
-                "shoulder bags": "shoulder",
-                "crossbody bags": "crossbody",
-                "backpacks": "backpack",
-                "clutches": "clutch"
-            }
-            mapped_excluded = [category_map.get(cat.lower(), cat) for cat in preferences.excluded_categories]
-            
-            if len(mapped_excluded) == 1:
-                conditions.append({"category": {"$ne": mapped_excluded[0]}})
-            else:
-                conditions.append({"category": {"$nin": mapped_excluded}})
+        # Category filter: NOT sent as an index-level filter. category_clean
+        # stores full taxonomy paths (e.g. "women/handbags/totes--1"), which
+        # can never match an exact/IN filter against a bare keyword like
+        # "tote". Category matching is instead applied as a substring
+        # post-filter in product_search_node() via _category_matches().
         
         # Color filter (inclusion) - uses "primary_color" field
         if preferences.colors:
@@ -1853,12 +2014,12 @@ class ShoppingAssistantWorkflow:
             else:
                 conditions.append({"material_type": {"$nin": preferences.excluded_materials}})
         
-        # Brand filter (exclusion) - uses "brand" field
+        # Brand filter (exclusion) - uses "brand_clean" field
         if preferences.excluded_brands:
             if len(preferences.excluded_brands) == 1:
-                conditions.append({"brand": {"$ne": preferences.excluded_brands[0]}})
+                conditions.append({"brand_clean": {"$ne": preferences.excluded_brands[0]}})
             else:
-                conditions.append({"brand": {"$nin": preferences.excluded_brands}})
+                conditions.append({"brand_clean": {"$nin": preferences.excluded_brands}})
         
         # Filter only available products (commented out for debugging)
         # conditions.append({"available": {"$eq": "true"}})
@@ -1870,6 +2031,34 @@ class ShoppingAssistantWorkflow:
             return conditions[0]
         else:
             return {"$and": conditions}
+
+    @staticmethod
+    def _generate_category_variations(categories: List[str]) -> List[str]:
+        """Build lowercase keyword variations used for substring matching against category_clean."""
+        variations = []
+        for cat in categories:
+            cat_lower = cat.lower()
+            variations.append(cat_lower)
+            if cat_lower.endswith('s'):
+                variations.append(cat_lower[:-1])
+            else:
+                variations.append(cat_lower + 's')
+            if 'tote' in cat_lower:
+                variations.append('tote')
+            elif 'shoulder' in cat_lower:
+                variations.append('shoulder')
+            elif 'crossbody' in cat_lower or 'cross-body' in cat_lower:
+                variations.extend(['crossbody', 'cross-body'])
+            elif 'backpack' in cat_lower:
+                variations.append('backpack')
+        return list(set(variations))
+
+    def _category_matches(self, category_clean: Optional[str], categories: List[str]) -> bool:
+        """Substring match against the category_clean taxonomy path."""
+        if not category_clean or not categories:
+            return False
+        haystack = category_clean.lower()
+        return any(kw in haystack for kw in self._generate_category_variations(categories))
 
     def process_query(self, query: str, session_id: str, user_id: str = None) -> dict:
         """Main entry point for the app"""

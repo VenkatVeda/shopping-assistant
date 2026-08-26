@@ -31,7 +31,11 @@ class DatabricksAdapter(VectorStoreInterface):
             index_name: Vector search index name (defaults to env var DATABRICKS_VECTOR_INDEX)
             endpoint_name: Vector search endpoint (defaults to env var DATABRICKS_VECTOR_ENDPOINT)
         """
-        self.host = host or os.getenv("DATABRICKS_HOST")
+        raw_host = host or os.getenv("DATABRICKS_HOST", "")
+        # Databricks Apps injects DATABRICKS_HOST without the https:// scheme
+        if raw_host and not raw_host.startswith("http"):
+            raw_host = f"https://{raw_host}"
+        self.host = raw_host or None
         self.token = token or os.getenv("DATABRICKS_TOKEN")
         self.index_name = index_name or os.getenv("DATABRICKS_VECTOR_INDEX", "bags_embeddings_index")
         self.endpoint_name = endpoint_name or os.getenv("DATABRICKS_VECTOR_ENDPOINT")
@@ -116,12 +120,11 @@ class DatabricksAdapter(VectorStoreInterface):
         _t0 = time.time()
         _error = ""
         try:
-            # Convert filters to Databricks SQL WHERE clause if provided
-            filter_clause = None
-            if filters:
-                filter_clause = self._build_filter_clause(filters)
-            
-            # Columns available in sandbox.venkat.bags_embeddings table
+            # Build filter dict for the Python client (dict format required,
+            # SQL strings are only for REST API calls — not the Python SDK)
+            filter_dict = self._build_filter_dict(filters) if filters else None
+
+            # Columns available in sandbox.venkat.bags_embeddings_v2 table
             columns_to_retrieve = [
                 "product_id",
                 "name_clean",
@@ -135,16 +138,16 @@ class DatabricksAdapter(VectorStoreInterface):
                 "is_available",
                 "on_sale",
                 "primary_image_url",
-                "url_full",  # Myer product page URL
+                "url_full",
                 "embedding_text"
             ]
-            
+
             # Execute vector search
             results = self.index.similarity_search(
                 query_vector=vector,
                 columns=columns_to_retrieve,
                 num_results=top_k,
-                filters=filter_clause
+                filters=filter_dict
             )
             
             # Debug: Print raw response
@@ -439,6 +442,57 @@ class DatabricksAdapter(VectorStoreInterface):
         """
         return self.get_index_stats()
     
+    def _build_filter_dict(self, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Convert Pinecone/MongoDB-style filters to Databricks Vector Search Python SDK format.
+
+        Databricks SDK filter format:
+          {"col": value}          equality
+          {"col": [v1, v2]}       IN list
+          {"col NOT": value}      not-equal
+          {"col NOT": [v1, v2]}   NOT IN list
+          {"col >": value}        greater-than  (also >=, <, <=)
+          Multiple keys = AND
+        """
+        if not filters:
+            return None
+
+        result = {}
+
+        def _convert_one(col: str, expr: Any):
+            if isinstance(expr, (str, int, float, bool)):
+                result[col] = expr
+            elif isinstance(expr, list):
+                result[col] = expr
+            elif isinstance(expr, dict):
+                for op, val in expr.items():
+                    if op == "$in":
+                        result[col] = val if isinstance(val, list) else [val]
+                    elif op == "$nin":
+                        result[f"{col} NOT"] = val if isinstance(val, list) else [val]
+                    elif op == "$ne":
+                        result[f"{col} NOT"] = val
+                    elif op == "$gt":
+                        result[f"{col} >"] = val
+                    elif op == "$gte":
+                        result[f"{col} >="] = val
+                    elif op == "$lt":
+                        result[f"{col} <"] = val
+                    elif op == "$lte":
+                        result[f"{col} <="] = val
+
+        for key, value in filters.items():
+            if key == "$and" and isinstance(value, list):
+                for sub in value:
+                    if isinstance(sub, dict):
+                        merged = self._build_filter_dict(sub)
+                        if merged:
+                            result.update(merged)
+            else:
+                _convert_one(key, value)
+
+        return result if result else None
+
     def _build_filter_clause(self, filters: Dict[str, Any]) -> Optional[str]:
         """
         Convert a MongoDB-style filters dict to a Databricks SQL WHERE clause string.

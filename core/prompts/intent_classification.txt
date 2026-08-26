@@ -308,9 +308,15 @@ SIZES:
 - Do NOT put colors, brands, categories, materials, closure types, strap types, or sizes in "features" if they are already captured in their dedicated fields.
 
 INTENT:
-- "intent" MUST be one of these TWO exact strings:
+- "intent" MUST be one of these exact strings:
   1. "chat": Small talk, greetings, jokes, or questions unrelated to shopping.
   2. "shopping": The user is looking for a product, browsing, asking about bag availability/features, OR modifying/refining a search.
+  3. "add_to_wishlist": The user wants to save or bookmark a product for later. Examples: "save this", "add to my wishlist", "I like this one, save it", "bookmark this", "save for later", "I want to remember this one".
+  4. "remove_from_wishlist": The user wants to remove a product from their wishlist. Examples: "remove from wishlist", "unsave this", "take it off my wishlist", "I don't want to save this anymore".
+  5. "view_wishlist": The user wants to see their saved products. Examples: "show my wishlist", "what have I saved?", "show saved items", "my wishlist", "what did I save?".
+  6. "add_to_cart": The user wants to add a product to their shopping cart. Examples: "add to cart", "put this in my cart", "I'll take this one", "add it", "buy this", "I want to buy this bag", "add to basket".
+  7. "remove_from_cart": The user wants to remove a product from their cart. Examples: "remove from cart", "take this out of my cart", "I don't want this anymore", "remove it from basket", "delete from cart".
+  8. "view_cart": The user wants to see their cart contents or total. Examples: "show my cart", "what's in my cart?", "view basket", "my cart", "what am I buying?", "cart total", "show my order".
 
 CRITICAL INTENT RULES:
 - ANY query about bags/products is "shopping", including:
@@ -318,6 +324,8 @@ CRITICAL INTENT RULES:
   - Queries with exclusions: "anything but not black", "tote bag not Fossil"
   - Modifications: "actually make it brown instead", "change to leather"
   - Updates: "under $100", "make it cheaper"
+- Wishlist intents take priority over "shopping" when the user is clearly saving/removing/viewing saved items, not searching.
+- Cart intents take priority over "shopping" when the user is clearly buying/removing/viewing cart items, not searching.
 - If the user message contains ANY shopping/product intent (even mixed with chat), use "shopping"
 - Only use "chat" for pure small talk with NO product/bag mentions
 - Examples:
@@ -325,6 +333,12 @@ CRITICAL INTENT RULES:
   - "tote bag not Fossil" → "shopping"
   - "actually make it brown instead" → "shopping"
   - "hello how are you" → "chat"
+  - "save this bag" → "add_to_wishlist"
+  - "show me my wishlist" → "view_wishlist"
+  - "remove it from my saved items" → "remove_from_wishlist"
+  - "add to cart" → "add_to_cart"
+  - "show my cart" → "view_cart"
+  - "remove from cart" → "remove_from_cart"
 
 FEATURE NORMALIZATION:
 - "fits tablet" / "for tablets" -> "fits tablet"

@@ -65,6 +65,7 @@ def _determine_regulation(country: str = "", state: str = "", sector: str = "") 
     if country in _EU_COUNTRIES:          return "GDPR"
     if country == "US" and state == "CA": return "CCPA"
     if country == "IN":                   return "DPDP"
+    if country == "AU":                   return "AUS"
     return "INTERNAL_POLICY"
 
 # ── PII redactor ───────────────────────────────────────────────────────────
@@ -88,9 +89,18 @@ def _redact_pii(text: str) -> str:
         result = re.sub(pattern, f'[{label}]', result)
     for pattern in _NAME_TRIGGERS:
         def _rep(m):
-            return m.group(0).replace(m.group(1), '[NAME]')
+            name = m.group(1)
+            if name is None:
+                return m.group(0)
+            return m.group(0).replace(name, '[NAME]')
         result = re.sub(pattern, _rep, result, flags=re.IGNORECASE)
     return result
+
+def _detect_pii_types(text: str) -> list:
+    """Return the list of PII pattern labels found in text (for pii_types_found)."""
+    if not text:
+        return []
+    return [label for label, pattern in _PII_PATTERNS if re.search(pattern, text)]
 
 # ── low-level writer ───────────────────────────────────────────────────────
 def _now_iso() -> str:
@@ -209,8 +219,27 @@ class AuditWrapper:
             try:
                 from databricks.sdk import WorkspaceClient
                 import base64
-                w      = WorkspaceClient()
-                secret = w.secrets.get_secret(scope=scope, key=key_name)
+                w = WorkspaceClient()
+                # Try primary scope first; fall back to audit_trail_secrets if different
+                scopes_to_try = [scope]
+                if scope != "audit_trail_secrets":
+                    scopes_to_try.append("audit_trail_secrets")
+                secret = None
+                last_error = None
+                for try_scope in scopes_to_try:
+                    try:
+                        secret = w.secrets.get_secret(scope=try_scope, key=key_name)
+                        if try_scope != scope:
+                            logger.warning(
+                                "[AUDIT] HMAC key '%s' not found in primary scope '%s' — "
+                                "falling back to 'audit_trail_secrets'. Check AUDIT_SECRET_SCOPE.",
+                                key_name, scope
+                            )
+                        break
+                    except Exception as e:
+                        last_error = e
+                if secret is None:
+                    raise last_error
                 try:
                     raw = base64.b64decode(secret.value).decode("utf-8")
                 except Exception:
