@@ -1109,6 +1109,8 @@ async function placeOrder() {
         const resp = await fetch(`${API_BASE_URL}/orders/place`, {
             method: 'POST',
             credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cart_items: cartItems }),
         });
         const d = await resp.json();
         if (!resp.ok) {
