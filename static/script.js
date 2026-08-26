@@ -749,7 +749,7 @@ function renderWishlistPanel() {
             </div>`;
         return;
     }
-    const items = wishlistItems.map(item => {
+    const items = wishlistItems.map((item, idx) => {
         const pid = escapeHtml(String(item.product_id));
         const name = escapeHtml(item.product_name || 'Product');
         const brand = escapeHtml(item.brand || '');
@@ -761,6 +761,7 @@ function renderWishlistPanel() {
         const alreadyInCart = cartIds.has(pid);
         const cartBtnLabel = alreadyInCart ? '🛒✓' : '🛒';
         const cartBtnCls   = alreadyInCart ? 'cart-add-btn in-cart wishlist-cart-btn' : 'cart-add-btn wishlist-cart-btn';
+        // Use data-idx to avoid JSON.stringify breaking onclick attribute quotes
         return `
             <div class="wishlist-item">
                 ${imgEl}
@@ -771,7 +772,7 @@ function renderWishlistPanel() {
                 </div>
                 <div class="wishlist-item-actions">
                     <button class="${cartBtnCls}" title="Add to cart"
-                        onclick="addToCartFromWishlist(${JSON.stringify(item)},this)">
+                        data-widx="${idx}" onclick="addToCartFromWishlistByIdx(this)">
                         ${cartBtnLabel}
                     </button>
                     <button class="wishlist-item-remove" title="Remove" onclick="removeWishlistItem('${pid}')">✕</button>
@@ -890,6 +891,12 @@ async function addToCartFromCard(product, btnEl) {
     } catch (err) {
         console.warn('Cart add failed:', err);
     }
+}
+
+function addToCartFromWishlistByIdx(btnEl) {
+    const idx  = parseInt(btnEl.getAttribute('data-widx'), 10);
+    const item = wishlistItems[idx];
+    if (item) addToCartFromWishlist(item, btnEl);
 }
 
 async function addToCartFromWishlist(item, btnEl) {
