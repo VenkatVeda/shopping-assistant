@@ -5,6 +5,7 @@ Flask backend serving static frontend and API endpoints with LangGraph Workflow
 
 from flask import Flask, send_from_directory, jsonify, request, session, redirect, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
+from core.geoip import get_country_from_request
 import os
 import sys
 import logging
@@ -364,7 +365,15 @@ def oauth_login():
     auth_url = get_google_auth_url(state)
     return redirect(auth_url)
 
-
+def _parse_country_from_locale(locale: str) -> str:
+    """Extract the region subtag from a BCP-47 locale (e.g. 'en-GB' -> 'GB').
+    Returns '' if the locale has no region (e.g. bare 'en') — don't guess."""
+    if not locale:
+        return ""
+    parts = locale.replace("_", "-").split("-")
+    if len(parts) >= 2 and len(parts[-1]) == 2:
+        return parts[-1].upper()
+    return ""
 @app.route('/oauth/callback')
 def oauth_callback():
     """Handle OAuth callback from Google"""
@@ -383,6 +392,7 @@ def oauth_callback():
 
         # Get user info from Google
         user_info = get_google_user_info(google_access_token)
+       # logger.info(f"[AUDIT DEBUG] Raw Google user_info locale field: {user_info.get('locale', 'FIELD NOT PRESENT')}")
 
         # Use email as stable user identifier (or hash it for privacy)
         email = user_info["email"]
@@ -396,7 +406,7 @@ def oauth_callback():
                 workflow.audit_wrapper.register_customer(
                     user_email      = email,
                     full_name       = name,
-                    user_country    = user_info.get("locale", "")[:2].upper() or os.getenv("DEFAULT_USER_COUNTRY", ""),
+                    user_country    = get_country_from_request(request) or os.getenv("DEFAULT_USER_COUNTRY", ""),
                     consent_version = "tnc_v2.1",
                 )
         except Exception as _re:
@@ -857,7 +867,6 @@ def health():
         "service": "shopping-assistant",
         "workflow": workflow_status
     })
-
 
 @app.route('/api/test-extended-tools', methods=['GET'])
 @token_required

@@ -61,7 +61,6 @@ env:
     value: "dummy"
 
 # Audit Trail Configuration
-# Audit Trail Configuration
   - name: AUDIT_APP_ID
     valueFrom: audit-app-id
   - name: AUDIT_CATALOG
@@ -70,3 +69,4 @@ env:
     valueFrom: audit-secret-scope
   - name: DATABRICKS_SQL_WAREHOUSE_ID
     valueFrom: sql-warehouse-id
+  

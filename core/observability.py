@@ -247,22 +247,22 @@ def _extract_inputs(node_name: str, state: Dict) -> Dict:
         }
 
     if node_name == "result_validator":
-        return {"result_count": len(state.get("results", []))}
+        return {"result_count": len(state.get("results") or [])}
 
     if node_name == "constraint_relaxer":
         return {
             "relaxation_level": state.get("relaxation_level", 0),
-            "result_count":     len(state.get("results", [])),
+            "result_count":     len(state.get("results") or []),
             "preferences":      _prefs_summary(prefs),
         }
 
     if node_name == "reranker":
-        return {"result_count": len(state.get("results", []))}
+        return {"result_count": len(state.get("results") or [])}
 
     if node_name == "response_generator":
         return {
             "intent":        state.get("intent", ""),
-            "result_count":  len(state.get("reranked_results") or state.get("results", [])),
+            "result_count":  len(state.get("reranked_results") or state.get("results") or []),
             "discussion_mode": state.get("product_discussion_mode", False),
         }
 

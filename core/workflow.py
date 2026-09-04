@@ -18,7 +18,6 @@ from .guardrails import OutputGuardrail
 from .prompt_loader import load_prompt
 from .performance import track_time, get_tracker
 from .observability import NodeTracer, RequestTrace, metrics_store
-from .audit_logger import log_guardrail
 from .evals import EvalRunner
 from .semantic_cache import build_cache
 
@@ -292,26 +291,26 @@ class ShoppingAssistantWorkflow:
             history = state.get("history", [])
             summary = state.get("summary", "")
 
-            _audit_ctx = {
-                "request_id": state.get("session_id", ""),
-                "user_id":    state.get("user_id", "anon") or "anon",
-                "session_id": str(state.get("session_id", "")),
-            }
+            # _audit_ctx = {
+            #     "request_id": state.get("session_id", ""),
+            #     "user_id":    state.get("user_id", "anon") or "anon",
+            #     "session_id": str(state.get("session_id", "")),
+            # }
 
             if not query:
                 return {"error": "Please ask me something! I'm here to help you find bags, wallets, and accessories.", 
                         "history": history, "summary": summary}
             
             if len(query) > 500:
-                log_guardrail(
-                    guardrail_type="input",
-                    status="fail",
-                    issues=["Query too long — exceeds 500 characters"],
-                    corrections_made=False,
-                    latency_ms=(time.time() - _t0) * 1000,
-                    query_preview=query[:120],
-                    **_audit_ctx,
-                )
+                # log_guardrail(
+                #     guardrail_type="input",
+                #     status="fail",
+                #     issues=["Query too long — exceeds 500 characters"],
+                #     corrections_made=False,
+                #     latency_ms=(time.time() - _t0) * 1000,
+                #     query_preview=query[:120],
+                #     **_audit_ctx,
+                # )
                 # ── KEPT: guardrail_results_raw — callback doesn't cover this table ──
                 self._log_input_guardrail(status="fail", score=0.0, triggered_block=True)
                 return {"error": "That query is too long. Could you please rephrase it more concisely?",
@@ -328,15 +327,15 @@ class ShoppingAssistantWorkflow:
                 
                 if safety_result["status"] == "UNSAFE":
                     print(f"[INPUT GUARDRAIL] Blocked {safety_result['category']}: {safety_result['reason']}")
-                    log_guardrail(
-                        guardrail_type="input",
-                        status="fail",
-                        issues=[f"{safety_result['category']}: {safety_result['reason']}"],
-                        corrections_made=False,
-                        latency_ms=(time.time() - _t0) * 1000,
-                        query_preview=query[:120],
-                        **_audit_ctx,
-                    )
+                    # log_guardrail(
+                    #     guardrail_type="input",
+                    #     status="fail",
+                    #     issues=[f"{safety_result['category']}: {safety_result['reason']}"],
+                    #     corrections_made=False,
+                    #     latency_ms=(time.time() - _t0) * 1000,
+                    #     query_preview=query[:120],
+                    #     **_audit_ctx,
+                    # )
                     # ── KEPT: guardrail_results_raw — callback doesn't cover this table ──
                     self._log_input_guardrail(status="fail", score=0.0, triggered_block=True)
                     return {
@@ -355,15 +354,15 @@ class ShoppingAssistantWorkflow:
             if memory_result["was_summarized"]:
                 print(f"[MEMORY] Summarization triggered - kept last {len(memory_result['history'])} turns")
 
-            log_guardrail(
-                guardrail_type="input",
-                status="pass",
-                issues=[],
-                corrections_made=False,
-                latency_ms=(time.time() - _t0) * 1000,
-                query_preview=query[:120],
-                **_audit_ctx,
-            )
+            # log_guardrail(
+            #     guardrail_type="input",
+            #     status="pass",
+            #     issues=[],
+            #     corrections_made=False,
+            #     latency_ms=(time.time() - _t0) * 1000,
+            #     query_preview=query[:120],
+            #     **_audit_ctx,
+            # )
             # ── KEPT: guardrail_results_raw — callback doesn't cover this table ──
             self._log_input_guardrail(status="pass", score=1.0, triggered_block=False)
 
@@ -1347,22 +1346,22 @@ class ShoppingAssistantWorkflow:
         with track_time("node_response_generator"):
             result = self.response_generator.process(state)
 
-        # ── COMMENTED: AuditTrailCallback.on_llm_end captures model output automatically ──
-        # if self.audit_wrapper:
-        #     products = state.get("reranked_results") or state.get("results") or []
-        #     recommended_ids = [
-        #         p.get("id") for p in products[:3] if isinstance(p, dict) and p.get("id")
-        #     ]
-        #     threading.Thread(
-        #         target=self.audit_wrapper.log_model_output,
-        #         kwargs={
-        #             "trace_id":          _current_trace_id.get(),
-        #             "output_text":       result.get("generated_response", ""),
-        #             "recommended_items": recommended_ids,
-        #             "subject_ref":       _current_subject_ref.get() or None,
-        #         },
-        #         daemon=True,
-        #     ).start()
+# ── COMMENTED: AuditTrailCallback.on_llm_end captures model output automatically ──
+        if self.audit_wrapper:
+            products = state.get("reranked_results") or state.get("results") or []
+            recommended_ids = [
+                p.get("id") for p in products[:3] if isinstance(p, dict) and p.get("id")
+            ]
+            threading.Thread(
+                target=self.audit_wrapper.log_model_output,
+                kwargs={
+                    "trace_id":          _current_trace_id.get(),
+                    "output_text":       result.get("generated_response", ""),
+                    "recommended_items": recommended_ids,
+                    "subject_ref":       _current_subject_ref.get() or None,
+                },
+                daemon=True,
+            ).start()
 
         return result
     
@@ -1738,6 +1737,8 @@ class ShoppingAssistantWorkflow:
                     "previous_preferences": previous_state.get("preferences"),
                     "reranked_results": None,
                     "results": None,
+                    "guardrail_status": None,      
+                    "guardrail_issues": None,      
                     "last_discussed_product": previous_state.get("last_discussed_product"),
                     "product_discussion_mode": previous_state.get("product_discussion_mode"),
                     "product_context": previous_state.get("product_context"),

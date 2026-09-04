@@ -1,4 +1,3 @@
-
 """
 AuditWrapper — writes AI interaction audit events to Delta tables
 in the shopping_assistant catalog on Databricks.
@@ -128,12 +127,15 @@ def _detect_pii_types(text: str) -> list:
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
-def _write_row(table: str, row: dict) -> None:
+def _write_row(table: str, row: dict, on_failure=None) -> None:
     """
     Write one row to a Delta table via Databricks SQL Warehouse.
     Columns with None or empty string are omitted from the INSERT
     so Delta uses the column default (NULL) — this avoids CAST errors
     when trying to insert '' into DOUBLE or BIGINT columns.
+
+    on_failure: optional callback(table, error_message) invoked when the
+    write fails, so callers can route the failure into logging_failures.
     """
     try:
         from databricks.sdk import WorkspaceClient
@@ -177,16 +179,20 @@ def _write_row(table: str, row: dict) -> None:
 
         if result.status.error:
             logger.warning("[AUDIT] Write failed for %s: %s", table, result.status.error.message)
+            if on_failure:
+                on_failure(table, result.status.error.message)
         else:
             logger.debug("[AUDIT] Row written to %s", table)
 
     except Exception as exc:
         logger.warning("[AUDIT] Failed to write to %s: %s", table, exc)
+        if on_failure:
+            on_failure(table, str(exc))
 
 
-def _fire(table: str, row: dict) -> None:
+def _fire(table: str, row: dict, on_failure=None) -> None:
     """Fire-and-forget background write — never blocks the caller."""
-    threading.Thread(target=_write_row, args=(table, row), daemon=True).start()
+    threading.Thread(target=_write_row, args=(table, row, on_failure), daemon=True).start()
 
 
 # ── AuditWrapper ───────────────────────────────────────────────────────────
@@ -676,28 +682,35 @@ class AuditWrapper:
         subject_ref:   Optional[str]   = None,
     ) -> None:
         """Log one tool/API call. Fire-and-forget."""
-        now         = _now_iso()
-        inputs_san  = _redact_pii(json.dumps(tool_inputs  or {}))
-        outputs_san = _redact_pii(json.dumps(tool_outputs or {}))
-        row = {
-            "tool_call_id":    str(uuid.uuid4()),
-            "trace_id":        trace_id,
-            "app_id":          self.app_id,
-            "tool_name":       tool_name,
-            "tool_inputs":     inputs_san,
-            "tool_outputs":    outputs_san,
-            "status":          status,
-            "called_at":       now,
-            "is_erasure_flag": "false",
-            "created_at":      now,
-            "schema_version":  self.schema_version,
-            # optional
-            "subject_ref":     subject_ref   or None,
-            "error_message":   error_message or None,
-            # numeric — omit if None
-            "latency_ms":      str(int(round(latency_ms))) if latency_ms is not None else None,
-        }
-        _fire(self._tbl("raw_logs.tool_calls_raw"), row)
+        try:
+            now         = _now_iso()
+            inputs_san  = _redact_pii(json.dumps(tool_inputs  or {}))
+            outputs_san = _redact_pii(json.dumps(tool_outputs or {}))
+            row = {
+                "tool_call_id":    str(uuid.uuid4()),
+                "trace_id":        trace_id,
+                "app_id":          self.app_id,
+                "tool_name":       tool_name,
+                "tool_inputs":     inputs_san,
+                "tool_outputs":    outputs_san,
+                "status":          status,
+                "called_at":       now,
+                "is_erasure_flag": "false",
+                "created_at":      now,
+                "schema_version":  self.schema_version,
+                # optional
+                "subject_ref":     subject_ref   or None,
+                "error_message":   error_message or None,
+                # numeric — omit if None
+                "latency_ms":      str(int(round(latency_ms))) if latency_ms is not None else None,
+            }
+            _fire(
+                self._tbl("raw_logs.tool_calls_raw"),
+                row,
+                on_failure=lambda tbl, err: self._log_failure(trace_id, tbl, Exception(err)),
+            )
+        except Exception as e:
+            self._log_failure(trace_id, "tool_calls_raw", e)
 
     def register_customer(
         self,
@@ -834,24 +847,6 @@ class AuditTrailCallback(BaseCallbackHandler):
         run_id    = str(kwargs.get("run_id", id(inputs)))
         node_name = self._extract_name(serialized, kwargs)
         self._runs[run_id] = (time.time(), node_name)
-
-    def on_chain_end(self, outputs, **kwargs):
-        """Called by LangGraph AFTER every node completes successfully."""
-        # only log real graph nodes — skip graph runner and NodeTracer wrapper
-        node_name = (kwargs.get("metadata") or {}).get("langgraph_node")
-        if not node_name:
-            self._runs.pop(str(kwargs.get("run_id", "")), None)
-            return
-        run_id     = str(kwargs.get("run_id", ""))
-        t0, _      = self._runs.pop(run_id, (time.time(), node_name))
-        self.audit_wrapper.log_node_execution(
-            trace_id    = _current_trace_id.get(),
-            node_name   = node_name,
-            status      = "success",
-            node_output = str(outputs)[:500],
-            latency_ms  = (time.time() - t0) * 1000,
-            subject_ref = _current_subject_ref.get() or None,
-        )
 
     def on_chain_end(self, outputs, **kwargs):
         """Called by LangGraph AFTER every node completes."""
