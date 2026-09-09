@@ -14,6 +14,8 @@ import uuid
 import logging
 from typing import Optional
 
+from audit_wrapper import _fire
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,7 +53,7 @@ def log_wishlist_action(
             "created_at":      now,
             "schema_version":  audit_wrapper.schema_version,
         }
-        audit_wrapper._fire(audit_wrapper._tbl("raw_logs.wishlist_events_raw"), row)
+        _fire(audit_wrapper._tbl("raw_logs.wishlist_events_raw"), row)
     except Exception as e:
         logger.warning("[SHOPPING AUDIT] log_wishlist_action failed: %s", e)
 
@@ -87,7 +89,7 @@ def log_cart_action(
             "created_at":      now,
             "schema_version":  audit_wrapper.schema_version,
         }
-        audit_wrapper._fire(audit_wrapper._tbl("raw_logs.cart_events_raw"), row)
+        _fire(audit_wrapper._tbl("raw_logs.cart_events_raw"), row)
     except Exception as e:
         logger.warning("[SHOPPING AUDIT] log_cart_action failed: %s", e)
 
@@ -119,6 +121,6 @@ def log_order_action(
             "created_at":      now,
             "schema_version":  audit_wrapper.schema_version,
         }
-        audit_wrapper._fire(audit_wrapper._tbl("raw_logs.order_events_raw"), row)
+        _fire(audit_wrapper._tbl("raw_logs.order_events_raw"), row)
     except Exception as e:
         logger.warning("[SHOPPING AUDIT] log_order_action failed: %s", e)
