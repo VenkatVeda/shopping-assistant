@@ -22,7 +22,8 @@ from .evals import EvalRunner
 from .semantic_cache import build_cache
 from .shopping_audit import log_wishlist_action, log_cart_action
 from contextvars import ContextVar
-_current_trace_id: ContextVar[str] = ContextVar('_current_trace_id', default='')
+_current_trace_id:    ContextVar[str] = ContextVar('_current_trace_id',    default='')
+_current_subject_ref: ContextVar[str] = ContextVar('_current_subject_ref', default='')
 
 class GraphState(TypedDict):
     """State definition for the graph"""
@@ -219,13 +220,22 @@ class ShoppingAssistantWorkflow:
 
         # ── Audit Trail ───────────────────────────────────────────────────────
         try:
-            from audit_wrapper import AuditWrapper
+            from audit_wrapper import AuditWrapper, AuditTrailCallback
             self.audit_wrapper = AuditWrapper(
                 catalog = os.getenv("AUDIT_CATALOG", "shopping_assistant"),
             )
+            # Auto-logs every node + tool call to node_executions_raw /
+            # tool_calls_raw — a supplement to the manual log_node_execution()
+            # calls already inside a handful of nodes, not a replacement.
+            self.audit_callback = AuditTrailCallback(
+                self.audit_wrapper,
+                trace_id_getter    = _current_trace_id.get,
+                subject_ref_getter = _current_subject_ref.get,
+            )
         except Exception as _e:
             print(f"[AUDIT] AuditWrapper init failed (non-blocking): {_e}")
-            self.audit_wrapper = None
+            self.audit_wrapper  = None
+            self.audit_callback = None
         # ─────────────────────────────────────────────────────────────────────
 
         # ── Wishlist Store ────────────────────────────────────────────────────
@@ -2217,6 +2227,17 @@ class ShoppingAssistantWorkflow:
         pre_trace_id = str(_uuid.uuid4())
         initial_state["trace_id"] = pre_trace_id
         _current_trace_id.set(pre_trace_id)
+
+        # ── AUDIT: subject_ref for AuditTrailCallback's auto node logging ──
+        if self.audit_wrapper and user_id:
+            try:
+                _current_subject_ref.set(self.audit_wrapper._compute_refs(user_id)[1])
+            except Exception:
+                pass
+
+        # ── AUDIT: attach the callback so every node auto-logs itself ──
+        if getattr(self, "audit_callback", None):
+            config["callbacks"] = [self.audit_callback]
 
         # ── AUDIT: log session start once per new conversation ──
         _is_new_session = not (

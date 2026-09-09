@@ -40,6 +40,7 @@ Required .env variables:
 import os
 import re
 import json
+import time
 import hmac as hmac_lib
 import hashlib
 import logging
@@ -47,6 +48,11 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+try:
+    from langchain_core.callbacks import BaseCallbackHandler
+except ImportError:
+    BaseCallbackHandler = object  # graceful fallback if langchain_core not installed
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +112,15 @@ def _detect_pii_types(text: str) -> list:
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-def _write_row(table: str, row: dict) -> None:
+def _write_row(table: str, row: dict, on_failure=None) -> None:
     """
     Write one row to a Delta table via Databricks SQL Warehouse.
     Columns with None or empty string are omitted from the INSERT
     so Delta uses the column default (NULL) — this avoids CAST errors
     when trying to insert '' into DOUBLE or BIGINT columns.
+
+    on_failure: optional callback(table, error_message) invoked when the
+    write fails, so callers can route the failure into logging_failures.
     """
     try:
         from databricks.sdk import WorkspaceClient
@@ -155,16 +164,20 @@ def _write_row(table: str, row: dict) -> None:
 
         if result.status.error:
             logger.warning("[AUDIT] Write failed for %s: %s", table, result.status.error.message)
+            if on_failure:
+                on_failure(table, result.status.error.message)
         else:
             logger.debug("[AUDIT] Row written to %s", table)
 
     except Exception as exc:
         logger.warning("[AUDIT] Failed to write to %s: %s", table, exc)
+        if on_failure:
+            on_failure(table, str(exc))
 
 
-def _fire(table: str, row: dict) -> None:
+def _fire(table: str, row: dict, on_failure=None) -> None:
     """Fire-and-forget background write — never blocks the caller."""
-    threading.Thread(target=_write_row, args=(table, row), daemon=True).start()
+    threading.Thread(target=_write_row, args=(table, row, on_failure), daemon=True).start()
 
 
 # ── AuditWrapper ───────────────────────────────────────────────────────────
@@ -256,7 +269,7 @@ class AuditWrapper:
     def _hmac(self, value: str) -> str:
         return hmac_lib.new(
             self._get_key(),
-            value.encode(),
+            (value or "").encode(),
             hashlib.sha256
         ).hexdigest()
 
@@ -604,28 +617,35 @@ class AuditWrapper:
         subject_ref:   Optional[str]   = None,
     ) -> None:
         """Log one tool/API call. Fire-and-forget."""
-        now         = _now_iso()
-        inputs_san  = _redact_pii(json.dumps(tool_inputs  or {}))
-        outputs_san = _redact_pii(json.dumps(tool_outputs or {}))
-        row = {
-            "tool_call_id":    str(uuid.uuid4()),
-            "trace_id":        trace_id,
-            "app_id":          self.app_id,
-            "tool_name":       tool_name,
-            "tool_inputs":     inputs_san,
-            "tool_outputs":    outputs_san,
-            "status":          status,
-            "called_at":       now,
-            "is_erasure_flag": "false",
-            "created_at":      now,
-            "schema_version":  self.schema_version,
-            # optional
-            "subject_ref":     subject_ref   or None,
-            "error_message":   error_message or None,
-            # numeric — omit if None
-            "latency_ms":      str(round(latency_ms, 2)) if latency_ms is not None else None,
-        }
-        _fire(self._tbl("raw_logs.tool_calls_raw"), row)
+        try:
+            now         = _now_iso()
+            inputs_san  = _redact_pii(json.dumps(tool_inputs  or {}))
+            outputs_san = _redact_pii(json.dumps(tool_outputs or {}))
+            row = {
+                "tool_call_id":    str(uuid.uuid4()),
+                "trace_id":        trace_id,
+                "app_id":          self.app_id,
+                "tool_name":       tool_name,
+                "tool_inputs":     inputs_san,
+                "tool_outputs":    outputs_san,
+                "status":          status,
+                "called_at":       now,
+                "is_erasure_flag": "false",
+                "created_at":      now,
+                "schema_version":  self.schema_version,
+                # optional
+                "subject_ref":     subject_ref   or None,
+                "error_message":   error_message or None,
+                # numeric — omit if None
+                "latency_ms":      str(round(latency_ms, 2)) if latency_ms is not None else None,
+            }
+            _fire(
+                self._tbl("raw_logs.tool_calls_raw"),
+                row,
+                on_failure=lambda tbl, err: self._log_failure(trace_id, tbl, Exception(err)),
+            )
+        except Exception as e:
+            self._log_failure(trace_id, "tool_calls_raw", e)
 
     def register_customer(
         self,
@@ -636,24 +656,48 @@ class AuditWrapper:
         consent_version: Optional[str] = "tnc_v2.1",
     ) -> None:
         """
-        Register a customer in customer_pii on first login.
+        Register a customer in customer_pii on first login ONLY.
         Call from oauth_callback in app.py after Google login succeeds.
         Fire-and-forget — never blocks the login flow.
 
-        Safe to call on EVERY login — not just first time. The table is
-        append-only so repeat logins just add a new row with updated
-        consent timestamp. Erasure deletes ALL rows for that subject_ref.
+        Safe to call on EVERY login. If a row already exists for this
+        subject_id, the call is a no-op — repeat logins do NOT create
+        duplicate rows. Erasure deletes the row for that subject_ref.
 
         PII is handled entirely inside this method — the caller never
         sees subject_id or subject_ref. Raw email is stored here by
         design (this IS the PII table — it's the only place email lives).
         """
         try:
-            _, subject_ref = self._compute_refs(user_email)
+            subject_id, subject_ref = self._compute_refs(user_email)
+
+            # ── skip if this customer is already registered ────────────────
+            from databricks.sdk import WorkspaceClient
+            from databricks.sdk.service.sql import StatementState
+
+            warehouse_id = os.getenv("DATABRICKS_SQL_WAREHOUSE_ID")
+            existing = 0
+            if warehouse_id:
+                w = WorkspaceClient()
+                result = w.statement_execution.execute_statement(
+                    warehouse_id = warehouse_id,
+                    statement    = f"""
+                        SELECT COUNT(*) AS c
+                        FROM {self._tbl('raw_logs.customer_pii')}
+                        WHERE subject_id = '{subject_id}'
+                    """,
+                    wait_timeout = "10s",
+                )
+                if result.status.state == StatementState.SUCCEEDED and result.result and result.result.data_array:
+                    existing = int(result.result.data_array[0][0])
+
+            if existing > 0:
+                return  # already registered — skip, no duplicate row
+
             regulation = _determine_regulation(user_country or "", user_state or "")
             now = _now_iso()
             row = {
-               
+                "subject_id":      subject_id,
                 "subject_ref":     subject_ref,
                 "app_id":          self.app_id,
                 "email":           user_email,
@@ -687,3 +731,115 @@ class AuditWrapper:
             _fire(self._tbl("raw_logs.logging_failures"), row)
         except Exception:
             pass
+
+
+# ── AuditTrailCallback ────────────────────────────────────────────────────
+# Separate top-level class — NOT inside AuditWrapper. Works with any
+# LangGraph app; not specific to the Shopping Assistant.
+#
+# Pass one instance in the `config={"callbacks": [...]}` of graph.invoke()
+# (or via graph.with_config()) and every node + tool call logs itself
+# automatically to node_executions_raw / tool_calls_raw — no need to
+# call log_node_execution() by hand inside each node function.
+#
+# trace_id_getter / subject_ref_getter are zero-arg callables the host app
+# supplies (e.g. a ContextVar's .get method) — this class does not assume
+# any particular request-context mechanism.
+#
+# Usage:
+#     self.audit_callback = AuditTrailCallback(
+#         self.audit_wrapper,
+#         trace_id_getter    = _current_trace_id.get,
+#         subject_ref_getter = _current_subject_ref.get,
+#     )
+#     ...
+#     config = {"configurable": {...}, "callbacks": [self.audit_callback]}
+#     app.invoke(state, config=config)
+
+class AuditTrailCallback(BaseCallbackHandler):
+    """
+    LangGraph callback adapter for AuditWrapper. Automatically logs every
+    node execution and tool call the graph runs — a supplement to (not a
+    replacement for) any manual log_node_execution() calls already inside
+    specific nodes for domain-specific detail.
+    """
+
+    def __init__(self, audit_wrapper: "AuditWrapper", trace_id_getter=None, subject_ref_getter=None):
+        self.audit_wrapper = audit_wrapper
+        self._trace_id_getter    = trace_id_getter    or (lambda: "")
+        self._subject_ref_getter = subject_ref_getter or (lambda: None)
+        # key: run_id (UUID from LangGraph) → (start_time, node_name)
+        self._runs: dict = {}
+
+    def _extract_name(self, serialized, kwargs) -> str:
+        """
+        LangGraph 0.2.x passes the registered node name in
+        kwargs["metadata"]["langgraph_node"] — not in run_name or serialized.
+        """
+        metadata = kwargs.get("metadata") or {}
+        return (
+            metadata.get("langgraph_node")          # ← LangGraph 0.2.x node name
+            or kwargs.get("run_name")               # fallback: explicit run_name
+            or (serialized.get("name") if serialized else None)
+            or (serialized.get("id", ["unknown"])[-1] if serialized else None)
+            or "unknown"
+        )
+
+    def on_chain_start(self, serialized, inputs, **kwargs):
+        """Called by LangGraph BEFORE every node runs. Records start time."""
+        try:
+            run_id    = str(kwargs.get("run_id", id(inputs)))
+            node_name = self._extract_name(serialized, kwargs)
+            self._runs[run_id] = (time.time(), node_name)
+        except Exception:
+            pass
+
+    def on_chain_end(self, outputs, **kwargs):
+        """Called by LangGraph AFTER every node completes."""
+        try:
+            run_id        = str(kwargs.get("run_id", ""))
+            t0, node_name = self._runs.pop(run_id, (time.time(), None))
+            # skip graph runner / wrapper frames — they have no real node name
+            if not node_name or node_name == "unknown":
+                return
+            self.audit_wrapper.log_node_execution(
+                trace_id    = self._trace_id_getter() or "",
+                node_name   = node_name,
+                status      = "success",
+                node_output = str(outputs)[:500],
+                latency_ms  = (time.time() - t0) * 1000,
+                subject_ref = self._subject_ref_getter() or None,
+            )
+        except Exception as e:
+            logger.warning("[AUDIT] AuditTrailCallback.on_chain_end failed: %s", e)
+
+    def on_chain_error(self, error, **kwargs):
+        """Called by LangGraph when a node raises an exception."""
+        try:
+            run_id        = str(kwargs.get("run_id", ""))
+            t0, node_name = self._runs.pop(run_id, (time.time(), None))
+            if not node_name or node_name == "unknown":
+                return
+            self.audit_wrapper.log_node_execution(
+                trace_id    = self._trace_id_getter() or "",
+                node_name   = node_name,
+                status      = "error",
+                error_msg   = str(error)[:500],
+                latency_ms  = (time.time() - t0) * 1000,
+                subject_ref = self._subject_ref_getter() or None,
+            )
+        except Exception as e:
+            logger.warning("[AUDIT] AuditTrailCallback.on_chain_error failed: %s", e)
+
+    def on_tool_end(self, output, **kwargs):
+        """Called by LangGraph after every tool call completes."""
+        try:
+            self.audit_wrapper.log_tool_call(
+                trace_id     = self._trace_id_getter() or "",
+                tool_name    = kwargs.get("run_name") or "unknown_tool",
+                tool_outputs = {"result": str(output)[:500]},
+                status       = "success",
+                subject_ref  = self._subject_ref_getter() or None,
+            )
+        except Exception as e:
+            logger.warning("[AUDIT] AuditTrailCallback.on_tool_end failed: %s", e)
