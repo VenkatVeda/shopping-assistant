@@ -135,6 +135,58 @@ CREATE TABLE IF NOT EXISTS {CATALOG}.user_data.erasure_requests (
 ) USING DELTA
 """, label="CREATE TABLE erasure_requests")
 
+# ── 2b. raw_logs event tables (core/shopping_audit.py) ────────────────────────
+# These live in raw_logs, not user_data — the raw_logs schema is assumed to
+# already exist (created by the platform's audit trail onboarding).
+
+sql(f"""
+CREATE TABLE IF NOT EXISTS {CATALOG}.raw_logs.wishlist_events_raw (
+    event_id         STRING NOT NULL,
+    trace_id         STRING,
+    app_id           STRING NOT NULL,
+    subject_ref      STRING,
+    action           STRING,
+    product_id       STRING,
+    status           STRING,
+    is_erasure_flag  STRING,
+    created_at       TIMESTAMP,
+    schema_version   STRING
+) USING DELTA
+""", label="CREATE TABLE wishlist_events_raw")
+
+sql(f"""
+CREATE TABLE IF NOT EXISTS {CATALOG}.raw_logs.cart_events_raw (
+    event_id         STRING NOT NULL,
+    trace_id         STRING,
+    app_id           STRING NOT NULL,
+    subject_ref      STRING,
+    action           STRING,
+    product_id       STRING,
+    quantity         INT,
+    status           STRING,
+    is_erasure_flag  STRING,
+    created_at       TIMESTAMP,
+    schema_version   STRING
+) USING DELTA
+""", label="CREATE TABLE cart_events_raw")
+
+sql(f"""
+CREATE TABLE IF NOT EXISTS {CATALOG}.raw_logs.order_events_raw (
+    event_id         STRING NOT NULL,
+    app_id           STRING NOT NULL,
+    trace_id         STRING,
+    subject_ref      STRING,
+    action           STRING,
+    order_id         STRING,
+    item_count       INT,
+    order_total      DOUBLE,
+    status           STRING,
+    is_erasure_flag  STRING,
+    created_at       TIMESTAMP,
+    schema_version   STRING
+) USING DELTA
+""", label="CREATE TABLE order_events_raw")
+
 # ── 3. app_registry ───────────────────────────────────────────────────────────
 
 print("\n=== 3. app_registry ===")
@@ -215,5 +267,17 @@ for tbl in ["wishlist_items", "cart_items", "orders", "erasure_requests"]:
     else:
         err = r.status.error.message[:80] if r and r.status and r.status.error else "no warehouse"
         print(f"  FAIL  {CATALOG}.user_data.{tbl}: {err}")
+
+for tbl in ["wishlist_events_raw", "cart_events_raw", "order_events_raw"]:
+    r = w.statement_execution.execute_statement(
+        warehouse_id=WAREHOUSE_ID,
+        statement=f"SELECT COUNT(*) FROM {CATALOG}.raw_logs.{tbl}",
+        wait_timeout="50s",
+    ) if WAREHOUSE_ID else None
+    if r and r.result and r.result.data_array:
+        print(f"  OK    {CATALOG}.raw_logs.{tbl}  ({r.result.data_array[0][0]} rows)")
+    else:
+        err = r.status.error.message[:80] if r and r.status and r.status.error else "no warehouse"
+        print(f"  FAIL  {CATALOG}.raw_logs.{tbl}: {err}")
 
 print("\nBootstrap complete.")
