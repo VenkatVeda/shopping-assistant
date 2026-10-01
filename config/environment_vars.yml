@@ -7,8 +7,8 @@ dev:
   FLASK_DEBUG: "1"
   PINECONE_INDEX_NAME: bags-image-url-embeddings
   DATABRICKS_EMBEDDING_ENDPOINT: databricks-bge-large-en
-  DATABRICKS_CHAT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
-  DATABRICKS_INTENT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  DATABRICKS_CHAT_ENDPOINT: system.ai.meta-llama-3-1-8b-instruct
+  DATABRICKS_INTENT_ENDPOINT: system.ai.meta-llama-3-1-8b-instruct
   LOG_LEVEL: DEBUG
   # Personalization Feature Flag (set to "true" to enable profile learning)
   ENABLE_PERSONALIZATION: "true"  # Start disabled in dev, enable after testing
@@ -22,8 +22,8 @@ test:
   FLASK_DEBUG: "0"
   PINECONE_INDEX_NAME: bags-image-url-embeddings
   DATABRICKS_EMBEDDING_ENDPOINT: databricks-bge-large-en
-  DATABRICKS_CHAT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
-  DATABRICKS_INTENT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  DATABRICKS_CHAT_ENDPOINT: system.ai.meta-llama-3-1-8b-instruct
+  DATABRICKS_INTENT_ENDPOINT: system.ai.meta-llama-3-1-8b-instruct
   LOG_LEVEL: INFO
   # Personalization Feature Flag
   ENABLE_PERSONALIZATION: "true"  # Enable in test for validation
@@ -37,8 +37,8 @@ prod:
   FLASK_DEBUG: "0"
   PINECONE_INDEX_NAME: bags-image-url-embeddings
   DATABRICKS_EMBEDDING_ENDPOINT: databricks-bge-large-en
-  DATABRICKS_CHAT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
-  DATABRICKS_INTENT_ENDPOINT: databricks-meta-llama-3-1-8b-instruct
+  DATABRICKS_CHAT_ENDPOINT: system.ai.meta-llama-3-1-8b-instruct
+  DATABRICKS_INTENT_ENDPOINT: system.ai.meta-llama-3-1-8b-instruct
   LOG_LEVEL: WARNING
   # Personalization Feature Flag
   ENABLE_PERSONALIZATION: "true"  # Enable in production after test validation

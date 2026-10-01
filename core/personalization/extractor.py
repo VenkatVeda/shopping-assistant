@@ -7,30 +7,27 @@ import logging
 import re
 from typing import Any, Dict, Optional
 
+from ..gateway_client import GatewayChatModel, GatewayPolicyBlock
+
 logger = logging.getLogger(__name__)
 
 
 class PreferenceExtractor:
     """
-    Extracts preferences using the Databricks Foundation Model API.
-    The WorkspaceClient is created once and reused across all calls.
+    Extracts preferences using the Databricks AI Gateway (on-behalf-of the
+    signed-in user), via the same GatewayChatModel every other LLM call in
+    the app goes through — so gateway policies (rate limits, guardrails)
+    apply consistently and a policy block surfaces the same way everywhere.
     """
 
-    def __init__(self, llm_client=None, model_name: str = "databricks-meta-llama-3-1-8b-instruct"):
+    def __init__(self, llm_client=None, model_name: str = "system.ai.meta-llama-3-1-8b-instruct"):
         """
         Args:
-            llm_client: Unused — kept for backwards-compatibility. Client is
-                        created internally via WorkspaceClient().
-            model_name: Databricks serving endpoint name.
+            llm_client: Unused — kept for backwards-compatibility.
+            model_name: Databricks AI Gateway model service name (system.ai.*).
         """
         self.model_name = model_name
-        # Instantiate once — avoids per-call auth + connection-pool overhead
-        try:
-            from databricks.sdk import WorkspaceClient
-            self._workspace_client = WorkspaceClient()
-        except Exception as e:
-            logger.warning(f"[EXTRACTOR] Could not initialise WorkspaceClient: {e}")
-            self._workspace_client = None
+        self.llm = GatewayChatModel(endpoint=model_name, temperature=0.1, max_tokens=500)
 
     def extract(self, user_input: str, context: Optional[str] = None) -> Dict[str, Any]:
         """Extract preferences from a user message via the Databricks LLM."""
@@ -40,24 +37,16 @@ class PreferenceExtractor:
             extracted = self._parse_llm_response(response_text)
             logger.debug("[EXTRACTOR] Extraction succeeded")
             return extracted
+        except GatewayPolicyBlock:
+            raise
         except Exception as e:
             logger.error(f"[EXTRACTOR] Error calling LLM: {e}")
             return self._empty_extraction()
 
     def _call_databricks_llm(self, prompt: str) -> str:
-        """Call the Databricks Foundation Model API using the shared WorkspaceClient."""
-        if self._workspace_client is None:
-            raise RuntimeError("WorkspaceClient not initialised")
-
-        from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
-
-        response = self._workspace_client.serving_endpoints.query(
-            name=self.model_name,
-            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-            max_tokens=500,
-            temperature=0.1,
-        )
-        return response.choices[0].message.content
+        """Call the Databricks AI Gateway via the shared GatewayChatModel."""
+        response = self.llm.invoke([{"role": "user", "content": prompt}])
+        return response.content
 
     def _build_extraction_prompt(self, user_input: str, context: Optional[str]) -> str:
         return f"""You are a precise information extraction system for a shopping assistant. Extract structured data from the user's message.

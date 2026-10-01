@@ -516,7 +516,12 @@ class AuditWrapper:
         Core method. Call once per AI interaction after the graph completes.
         Fire-and-forget — never blocks the request.
         user_email must be a valid non-empty string.
-        user_country must be passed by the caller from the user profile.
+        user_country is the CURRENT/REQUEST country for this interaction
+        (e.g. from get_country_from_request()). regulation_at_time is the
+        regulation APPLICABLE TO THIS INTERACTION, recomputed from that
+        country every call — it intentionally does NOT read the user's
+        registered country/regulation in customer_pii (that stays a
+        separate, frozen, account-level record — see register_customer()).
         trace_id should be the caller's pre-generated request trace_id — only a
         fallback UUID is minted when trace_id is None, so every audit row for
         one request shares the same trace_id.
@@ -536,10 +541,7 @@ class AuditWrapper:
                 )
 
             _, sref    = self._compute_refs(user_email)
-            regulation = _determine_regulation(
-                user_country or "",
-                user_state   or "",
-            )
+            regulation = _determine_regulation(user_country or "", user_state or "")
 
             input_san  = _redact_pii(user_input  or "")
             input_hash = self._hmac(user_input or "")
@@ -569,10 +571,12 @@ class AuditWrapper:
                 "status":                status,
                 "is_erasure_flag":       "false",
                 "app_metadata":          json.dumps({
-                    "intent":           intent,
-                    "result_count":     result_count,
-                    "guardrail_status": g_status,
-                    "mlflow_trace_id":  mlflow_trace_id,
+                    "intent":            intent,
+                    "result_count":      result_count,
+                    "guardrail_status":  g_status,
+                    "blocked_by_policy": (final_state or {}).get("blocked_by_policy"),
+                    "blocked_phase":     (final_state or {}).get("blocked_phase"),
+                    "mlflow_trace_id":   mlflow_trace_id,
                 }),
                 "created_at":            now,
                 "schema_version":        self.schema_version,
@@ -758,6 +762,12 @@ class AuditWrapper:
 
             if existing > 0:
                 return  # already registered — skip, no duplicate row
+
+            if not user_country:
+                logger.warning(
+                    "[AUDIT] Registering customer with unknown country (email redacted) — "
+                    "regulation will default to INTERNAL_POLICY. subject_id=%s", subject_id
+                )
 
             regulation = _determine_regulation(user_country or "", user_state or "")
             now = _now_iso()

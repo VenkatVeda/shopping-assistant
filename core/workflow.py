@@ -10,7 +10,10 @@ import threading
 from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from databricks_langchain import DatabricksEmbeddings, ChatDatabricks
+# from databricks_langchain import DatabricksEmbeddings, ChatDatabricks
+from databricks_langchain import DatabricksEmbeddings
+from .gateway_client import GatewayChatModel
+
 from .models import SearchPreferences
 from .memory_manager import MemoryManager
 from .nodes import ResultValidator, Reranker, ResponseGenerator
@@ -26,6 +29,7 @@ from .semantic_cache import build_cache
 # REMOVED: _current_trace_id: ContextVar[str] = ContextVar('_current_trace_id', default='')
 # REMOVED: _current_subject_ref: ContextVar[str] = ContextVar('_current_subject_ref', default='')
 from audit_wrapper import AuditWrapper, AuditTrailCallback, _current_trace_id, _current_subject_ref
+
 
 class GraphState(TypedDict):
     """State definition for the graph"""
@@ -83,8 +87,8 @@ class ShoppingAssistantWorkflow:
         )
         
         # Initialize Databricks Chat Model for RAG components
-        chat_endpoint = os.getenv("DATABRICKS_CHAT_ENDPOINT", "databricks-meta-llama-3-1-8b-instruct")
-        self.chat_model = ChatDatabricks(
+        chat_endpoint = os.getenv("DATABRICKS_CHAT_ENDPOINT", "system.ai.meta-llama-3-1-8b-instruct")
+        self.chat_model = GatewayChatModel(
             endpoint=chat_endpoint,
             temperature=0.7,
             max_tokens=800
@@ -1073,6 +1077,9 @@ class ShoppingAssistantWorkflow:
                 return result
 
         except Exception as e:
+            from .gateway_client import GatewayPolicyBlock
+            if isinstance(e, GatewayPolicyBlock):
+                raise
             print(f"[PERSONALIZATION] Error: {e}")
             import traceback
             print(f"[PERSONALIZATION] Traceback: {traceback.format_exc()}")
@@ -1604,37 +1611,53 @@ class ShoppingAssistantWorkflow:
         return merged
     
     def _check_input_safety(self, query: str) -> dict:
-        """Check input query for safety and relevance"""
-        try:
-            from .prompt_loader import load_prompt
-            import re
-            
-            prompt = load_prompt("input_safety_check", {"query": query})
-            response = self.chat_model.invoke(prompt)
-            content = response.content if hasattr(response, 'content') else str(response)
-            
-            status_match = re.search(r'STATUS:\s*(SAFE|UNSAFE)', content, re.IGNORECASE)
-            category_match = re.search(r'CATEGORY:\s*(.+?)(?:\n|$)', content, re.IGNORECASE)
-            reason_match = re.search(r'REASON:\s*(.+?)(?:\n|POLITE)', content, re.IGNORECASE | re.DOTALL)
-            message_match = re.search(r'POLITE_DECLINE_MESSAGE:\s*(.+?)(?:\n\n|$)', content, re.IGNORECASE | re.DOTALL)
-            
-            status = status_match.group(1).upper() if status_match else "SAFE"
-            category = category_match.group(1).strip() if category_match else "APPROPRIATE"
-            reason = reason_match.group(1).strip() if reason_match else "No issues detected"
-            decline_message = message_match.group(1).strip() if message_match else "N/A"
-            
-            if decline_message in ["N/A", "n/a", ""]:
-                decline_message = "I'm here to help you find bags, wallets, and accessories. How can I assist you with shopping today?"
-            
-            return {"status": status, "category": category, "reason": reason, "decline_message": decline_message}
-            
-        except Exception as e:
-            print(f"[INPUT GUARDRAIL] Safety check error: {e}")
-            return {
-                "status": "SAFE",
-                "category": "ERROR",
-                "reason": f"Safety check error: {str(e)}",
-                "decline_message": "N/A"
+        """
+        Input safety check — INACTIVE. This app-side LLM safety check has been
+        superseded by the Databricks AI Gateway's own Safety/PII service policy
+        configured on the system.ai.meta-llama-3-1-8b-instruct route, which
+        already blocks unsafe input via GatewayPolicyBlock before we get here.
+        Left commented out (rather than deleted) so it can be re-enabled if the
+        gateway policy is ever removed.
+        """
+        # try:
+        #     from .prompt_loader import load_prompt
+        #     import re
+        #
+        #     prompt = load_prompt("input_safety_check", {"query": query})
+        #     response = self.chat_model.invoke(prompt)
+        #     content = response.content if hasattr(response, 'content') else str(response)
+        #
+        #     status_match = re.search(r'STATUS:\s*(SAFE|UNSAFE)', content, re.IGNORECASE)
+        #     category_match = re.search(r'CATEGORY:\s*(.+?)(?:\n|$)', content, re.IGNORECASE)
+        #     reason_match = re.search(r'REASON:\s*(.+?)(?:\n|POLITE)', content, re.IGNORECASE | re.DOTALL)
+        #     message_match = re.search(r'POLITE_DECLINE_MESSAGE:\s*(.+?)(?:\n\n|$)', content, re.IGNORECASE | re.DOTALL)
+        #
+        #     status = status_match.group(1).upper() if status_match else "SAFE"
+        #     category = category_match.group(1).strip() if category_match else "APPROPRIATE"
+        #     reason = reason_match.group(1).strip() if reason_match else "No issues detected"
+        #     decline_message = message_match.group(1).strip() if message_match else "N/A"
+        #
+        #     if decline_message in ["N/A", "n/a", ""]:
+        #         decline_message = "I'm here to help you find bags, wallets, and accessories. How can I assist you with shopping today?"
+        #
+        #     return {"status": status, "category": category, "reason": reason, "decline_message": decline_message}
+        #
+        # except Exception as e:
+        #     from .gateway_client import GatewayPolicyBlock
+        #     if isinstance(e, GatewayPolicyBlock):
+        #         raise
+        #     print(f"[INPUT GUARDRAIL] Safety check error: {e}")
+        #     return {
+        #         "status": "SAFE",
+        #         "category": "ERROR",
+        #         "reason": f"Safety check error: {str(e)}",
+        #         "decline_message": "N/A"
+        #     }
+        return {
+            "status": "SAFE",
+            "category": "APPROPRIATE",
+            "reason": "Input safety check delegated to AI Gateway service policy",
+            "decline_message": "N/A"
             }
     
     def _build_search_query(self, preferences: SearchPreferences) -> str:
@@ -1719,7 +1742,7 @@ class ShoppingAssistantWorkflow:
         haystack = category_clean.lower()
         return any(kw in haystack for kw in self._generate_category_variations(categories))
 
-    def process_query(self, query: str, session_id: str, user_id: str = None) -> dict:
+    def process_query(self, query: str, session_id: str, user_id: str = None, request_country: str = None) -> dict:
         """Main entry point for the app"""
         config = {"configurable": {"thread_id": session_id}}
         
@@ -1799,8 +1822,22 @@ class ShoppingAssistantWorkflow:
             ).start()
 
         _graph_t0 = time.time()
+        from .gateway_client import GatewayPolicyBlock
         with RequestTrace(query=query, user_id=user_id, session_id=session_id) as rt:
-            final_state = self.app.invoke(initial_state, config=config)
+            try:
+                final_state = self.app.invoke(initial_state, config=config)
+            except GatewayPolicyBlock as b:
+                print(f"[WORKFLOW] Gateway policy block: {b.policy} ({b.phase})")
+                final_state = {
+                    **initial_state,
+                    "generated_response": "I can only help with shopping for bags and accessories.",
+                    "safe_response": "I can only help with shopping for bags and accessories.",
+                    "guardrail_status": "blocked",
+                    "guardrail_issues": [f"Blocked by gateway policy: {b.policy}"],
+                    "blocked_by_policy": b.policy,
+                    "blocked_phase": b.phase,
+                    "error": None,
+                }
             rt.set_result(final_state)
         _graph_ms = (time.time() - _graph_t0) * 1000
 
@@ -1820,19 +1857,14 @@ class ShoppingAssistantWorkflow:
                 _status = "success"
                 if final_state.get("error"):
                     _status = "error"
-                elif final_state.get("guardrail_status") == "fail":
+                elif final_state.get("guardrail_status") in ("fail", "blocked"):
                     _status = "guardrail_blocked"
 
-                _user_country = ""
-                try:
-                    if hasattr(self, 'profile_storage') and user_id:
-                        _profile = self.profile_storage.load_profile(user_id)
-                        if _profile and hasattr(_profile, 'country'):
-                            _user_country = _profile.country or ""
-                except Exception:
-                    pass
-                if not _user_country:
-                    _user_country = os.getenv("DEFAULT_USER_COUNTRY", "")
+                # Request/current country — where THIS request came from, per app.py::search().
+                # Deliberately no fallback to DEFAULT_USER_COUNTRY here: an undetectable
+                # request country must stay empty (-> NULL in ai_interactions_raw.user_country),
+                # not silently become an environment default. It never influences regulation.
+                _user_country = request_country
 
                 # KEPT: log_interaction — one row per request, needs full final_state
                 threading.Thread(
@@ -1843,7 +1875,7 @@ class ShoppingAssistantWorkflow:
                         "model_output":          str(_output),
                         "model_name":            os.getenv(
                             "DATABRICKS_CHAT_ENDPOINT",
-                            "databricks-meta-llama-3-1-8b-instruct"
+                            "system.ai.meta-llama-3-1-8b-instruct"
                         ),
                         "status":                _status,
                         "trace_id":              pre_trace_id,
@@ -1859,14 +1891,24 @@ class ShoppingAssistantWorkflow:
 
                 # KEPT: output guardrail log — needs guardrail_status from final_state
                 if final_state.get("guardrail_status"):
+                    _blocked_policy = final_state.get("blocked_by_policy")
+                    _blocked_phase  = final_state.get("blocked_phase")
+                    if _blocked_policy:
+                        # Real gateway policy that fired — name + phase it actually happened in,
+                        # instead of the hardcoded "output_content_safety" label.
+                        _policy_name = _blocked_policy
+                        _result      = f"blocked_{_blocked_phase or 'unknown_phase'}"
+                    else:
+                        _policy_name = "output_content_safety"
+                        _result      = final_state.get("guardrail_status", "pass")
                     threading.Thread(
                         target=self.audit_wrapper.log_guardrail,
                         kwargs={
                             "trace_id":        pre_trace_id,
-                            "policy_name":     "output_content_safety",
+                            "policy_name":     _policy_name,
                             "score":           1.0 if final_state.get("guardrail_status") == "pass" else 0.0,
-                            "result":          final_state.get("guardrail_status", "pass"),
-                            "triggered_block": final_state.get("guardrail_status") == "fail",
+                            "result":          _result,
+                            "triggered_block": final_state.get("guardrail_status") in ("fail", "blocked"),
                             "subject_ref":     _current_subject_ref.get() or None,
                         },
                         daemon=True,
