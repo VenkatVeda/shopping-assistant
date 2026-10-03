@@ -37,3 +37,5 @@ python-dotenv>=1.0.0
 openai==2.47.0
 
 pytest==9.1.1
+
+mlflow[databricks]>=3.1
