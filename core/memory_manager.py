@@ -5,7 +5,8 @@ Implements smart memory management with automatic summarization
 
 import sys
 from typing import List, Dict, Optional
-from databricks_langchain import ChatDatabricks
+#from databricks_langchain import ChatDatabricks
+from .gateway_client import GatewayChatModel
 from .prompt_loader import load_prompt
 from dotenv import load_dotenv
 import os
@@ -29,9 +30,9 @@ class MemoryManager:
     def __init__(self, chat_endpoint: str = None):
         """Initialize memory manager with Databricks ChatDatabricks"""
         # Use provided endpoint or get from environment
-        endpoint = chat_endpoint or os.getenv("DATABRICKS_CHAT_ENDPOINT", "databricks-meta-llama-3-1-8b-instruct")
+        endpoint = chat_endpoint or os.getenv("DATABRICKS_CHAT_ENDPOINT", "system.ai.meta-llama-3-1-8b-instruct")
         
-        self.llm = ChatDatabricks(
+        self.llm = GatewayChatModel(
             endpoint=endpoint,
             temperature=0.3,
             max_tokens=500

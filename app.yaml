@@ -25,9 +25,9 @@ env:
   - name: DATABRICKS_EMBEDDING_ENDPOINT
     value: "databricks-bge-large-en"  # Or your custom embedding endpoint
   - name: DATABRICKS_CHAT_ENDPOINT
-    value: "databricks-meta-llama-3-1-8b-instruct"  # For memory summarization
+    value: "system.ai.meta-llama-3-1-8b-instruct"  # For memory summarization
   - name: DATABRICKS_INTENT_ENDPOINT
-    value: "databricks-meta-llama-3-1-8b-instruct"  # For intent classification
+    value: "system.ai.meta-llama-3-1-8b-instruct"  # For intent classification
   
   # MCP Vector Store Configuration
   - name: USE_MCP_VECTOR_SEARCH

@@ -76,9 +76,9 @@ resources:
           - name: DATABRICKS_EMBEDDING_ENDPOINT
             value: "databricks-bge-large-en"
           - name: DATABRICKS_CHAT_ENDPOINT
-            value: "databricks-meta-llama-3-1-8b-instruct"
+            value: "system.ai.meta-llama-3-1-8b-instruct"
           - name: DATABRICKS_INTENT_ENDPOINT
-            value: "databricks-meta-llama-3-1-8b-instruct"
+            value: "system.ai.meta-llama-3-1-8b-instruct"
           
           # Vector Store Configuration
           # Set to "false" for Databricks Apps (MCP doesn't work in Apps runtime)
@@ -163,6 +163,8 @@ targets:
       apps:
         shopping_assistant:
           name: "ecom-shop-assistant-prod"
+          user_api_scopes:
+            - ai-gateway
           resources:
             - name: vector-search-index
               uc_securable:

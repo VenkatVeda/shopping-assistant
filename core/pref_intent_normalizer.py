@@ -2,14 +2,15 @@ import os
 import json
 import time
 from dotenv import load_dotenv
-from databricks_langchain import ChatDatabricks
+#from databricks_langchain import ChatDatabricks
+from .gateway_client import GatewayChatModel
 from .prompt_loader import load_prompt
 
 # Load environment variables
 load_dotenv()
 
 # Configuration for Databricks Intent Endpoint
-INTENT_ENDPOINT = os.getenv("DATABRICKS_INTENT_ENDPOINT", "databricks-meta-llama-3-1-8b-instruct")
+INTENT_ENDPOINT = os.getenv("DATABRICKS_INTENT_ENDPOINT", "system.ai.meta-llama-3-1-8b-instruct")
 
 # Load system prompt from file
 SYSTEM_PROMPT = load_prompt("intent_classification")
@@ -43,7 +44,7 @@ _CATALOGUE_BRANDS_LOWER: dict = {b.lower(): b for b in CATALOGUE_BRANDS}
 class IntentClassifier:
     def __init__(self):
         """Initialize the Intent Classifier with Databricks ChatDatabricks."""
-        self.llm = ChatDatabricks(
+        self.llm = GatewayChatModel(
             endpoint=INTENT_ENDPOINT,
             temperature=0.0,
             max_tokens=1000
