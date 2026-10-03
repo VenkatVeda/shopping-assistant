@@ -149,6 +149,9 @@ class IntentClassifier:
             )
             
         except Exception as e:
+            from .gateway_client import GatewayPolicyBlock
+            if isinstance(e, GatewayPolicyBlock):
+                raise  # let workflow.process_query log blocked_by_policy / blocked_phase
             return self._get_empty_response(query, f"Error: {str(e)}")
 
     def _calculate_completeness(self, data: dict) -> float:

@@ -436,6 +436,9 @@ class ResponseGenerator:
                 }
 
             except Exception as e:
+                from .gateway_client import GatewayPolicyBlock
+                if isinstance(e, GatewayPolicyBlock):
+                    raise  # let workflow.process_query log blocked_by_policy / blocked_phase
                 print(f"[RESPONSE GENERATOR] Error generating response: {e}")
                 fallback = self._generate_grounded_response(products, query)
                 history_entry = f"Assistant: {fallback}"
@@ -498,6 +501,9 @@ class ResponseGenerator:
             }
 
         except Exception as exc:
+            from .gateway_client import GatewayPolicyBlock
+            if isinstance(exc, GatewayPolicyBlock):
+                raise  # let workflow.process_query log blocked_by_policy / blocked_phase
             print(f"[RESPONSE GENERATOR] Chat error: {exc}")
             return {
                 "generated_response": (
@@ -623,6 +629,9 @@ class ResponseGenerator:
             }
 
         except Exception as exc:
+            from .gateway_client import GatewayPolicyBlock
+            if isinstance(exc, GatewayPolicyBlock):
+                raise  # let workflow.process_query log blocked_by_policy / blocked_phase
             print(f"[RESPONSE GENERATOR] Product detail error: {exc}")
             return {
                 "generated_response": (
