@@ -203,6 +203,10 @@ class ShoppingAssistantWorkflow:
             )
             # ── NEW: callback adapter wires audit logging automatically ───────
             self.audit_callback = AuditTrailCallback(self.audit_wrapper)
+            # Gateway calls bypass LangChain, so the callback can't see them;
+            # GatewayChatModel records each call itself via this sink.
+            from .gateway_client import set_audit_sink
+            set_audit_sink(self.audit_wrapper)
         except Exception as _e:
             print(f"[AUDIT] AuditWrapper init failed (non-blocking): {_e}")
             self.audit_wrapper  = None

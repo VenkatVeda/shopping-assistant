@@ -1,10 +1,28 @@
 """
 Unity AI Gateway client adapter — On-Behalf-Of (OBO) authentication.
+
+Every call is also recorded in the audit trail (node_executions_raw, node_type="llm")
+from inside invoke(). LangChain never sees these calls — this is a plain
+requests.post, not a LangChain chat model — so the AuditTrailCallback cannot
+record them; only this code sees the HTTP request and response.
 """
+
+import threading
+import time
 
 import requests
 from flask import request as flask_request
 from databricks.sdk import WorkspaceClient
+
+
+# AuditWrapper instance, registered once by ShoppingAssistantWorkflow.__init__.
+_audit_sink = None
+
+
+def set_audit_sink(audit_wrapper) -> None:
+    """Register the AuditWrapper that receives one row per gateway call."""
+    global _audit_sink
+    _audit_sink = audit_wrapper
 
 
 class GatewayPolicyBlock(Exception):
@@ -20,6 +38,56 @@ class _GatewayResponse:
         self.content = content
 
 
+def _calling_node():
+    """Name of the LangGraph node this call is running inside, if known."""
+    try:
+        from langchain_core.runnables.config import var_child_runnable_config
+        cfg = var_child_runnable_config.get() or {}
+        return (cfg.get("metadata") or {}).get("langgraph_node")
+    except Exception:
+        return None
+
+
+def _record_gateway_call(endpoint: str, status: str, t0: float, info: dict,
+                         error_msg: str = None) -> None:
+    """Write one audit row for this gateway call. Never raises."""
+    if _audit_sink is None:
+        return
+    try:
+        from audit_wrapper import _current_trace_id, _current_subject_ref
+
+        usage = info.get("usage") or {}
+        meta = {
+            "calling_node":      info.get("calling_node"),
+            "endpoint":          endpoint,
+            "http_status":       info.get("http_status"),
+            "uses_ai_gateway":   True,
+            "policy_action":     "DENY" if status == "blocked" else "ALLOW",
+            "blocked_by_policy": info.get("policy"),
+            "blocked_phase":     info.get("phase"),
+            "prompt_tokens":     usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "response_chars":    info.get("response_chars"),
+        }
+        kwargs = dict(
+            trace_id      = _current_trace_id.get(),
+            node_name     = f"gateway_llm_call:{info.get('calling_node') or 'unknown'}",
+            status        = status,
+            latency_ms    = (time.time() - t0) * 1000,
+            error_msg     = error_msg,
+            subject_ref   = _current_subject_ref.get() or None,
+            node_type     = "llm",
+            model_name    = endpoint,
+            tokens_used   = usage.get("total_tokens"),
+            node_metadata = meta,
+        )
+        threading.Thread(
+            target=_audit_sink.log_node_execution, kwargs=kwargs, daemon=True
+        ).start()
+    except Exception:
+        pass
+
+
 class GatewayChatModel:
     def __init__(self, endpoint: str, temperature: float = 0.1, max_tokens: int = 500):
         self.endpoint = endpoint
@@ -30,6 +98,22 @@ class GatewayChatModel:
         self._url = f"{self._host}/ai-gateway/mlflow/v1/chat/completions"
 
     def invoke(self, messages, max_tokens: int = None, temperature: float = None) -> _GatewayResponse:
+        t0 = time.time()
+        info = {"calling_node": _calling_node()}
+        try:
+            response = self._invoke(messages, max_tokens, temperature, info)
+        except GatewayPolicyBlock as b:
+            info.update(policy=b.policy, phase=b.phase)
+            _record_gateway_call(self.endpoint, "blocked", t0, info, error_msg=str(b))
+            raise
+        except Exception as e:
+            _record_gateway_call(self.endpoint, "error", t0, info, error_msg=str(e)[:500])
+            raise
+        info["response_chars"] = len(response.content or "")
+        _record_gateway_call(self.endpoint, "success", t0, info)
+        return response
+
+    def _invoke(self, messages, max_tokens, temperature, info: dict) -> _GatewayResponse:
         user_token = None
         try:
             user_token = flask_request.headers.get("X-Forwarded-Access-Token")
@@ -52,6 +136,7 @@ class GatewayChatModel:
             "temperature": temperature if temperature is not None else self.temperature,
         }
         response = requests.post(self._url, headers=headers, json=payload, timeout=60)
+        info["http_status"] = response.status_code
 
         if response.status_code != 200:
             raise RuntimeError(
@@ -60,6 +145,7 @@ class GatewayChatModel:
             )
 
         data = response.json()
+        info["usage"] = data.get("usage") or {}
         content = data["choices"][0]["message"]["content"]
 
         # Extract gateway policy decision from response metadata
