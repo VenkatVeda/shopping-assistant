@@ -48,6 +48,30 @@ def _calling_node():
         return None
 
 
+# Header names a gateway or proxy commonly uses for its request id. The first call after
+# deployment also records every response header NAME (response_header_keys), so the real
+# name can be confirmed from the audit table without guessing.
+_REQUEST_ID_HEADERS = (
+    "x-request-id", "x-databricks-request-id", "x-ms-request-id",
+    "apim-request-id", "request-id", "x-correlation-id",
+)
+
+
+def _find_request_id(headers):
+    """Return (header_name, value) for the gateway's request id, or (None, None)."""
+    try:
+        for name in _REQUEST_ID_HEADERS:
+            value = headers.get(name)
+            if value:
+                return name, value
+        for name, value in headers.items():
+            if "request-id" in name.lower() or "request_id" in name.lower():
+                return name, value
+    except Exception:
+        pass
+    return None, None
+
+
 def _record_gateway_call(endpoint: str, status: str, t0: float, info: dict,
                          error_msg: str = None) -> None:
     """Write one audit row for this gateway call. Never raises."""
@@ -68,6 +92,11 @@ def _record_gateway_call(endpoint: str, status: str, t0: float, info: dict,
             "prompt_tokens":     usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
             "response_chars":    info.get("response_chars"),
+            # Join key to the gateway trace table (databricks.request_id), when the gateway returns it.
+            "gateway_request_id":  info.get("gateway_request_id"),
+            "request_id_header":   info.get("request_id_header"),
+            "response_header_keys": info.get("response_header_keys"),
+            "response_body_keys":   info.get("response_body_keys"),
         }
         kwargs = dict(
             trace_id      = _current_trace_id.get(),
@@ -137,6 +166,8 @@ class GatewayChatModel:
         }
         response = requests.post(self._url, headers=headers, json=payload, timeout=60)
         info["http_status"] = response.status_code
+        info["response_header_keys"] = sorted(response.headers.keys())
+        info["request_id_header"], info["gateway_request_id"] = _find_request_id(response.headers)
 
         if response.status_code != 200:
             raise RuntimeError(
@@ -146,6 +177,14 @@ class GatewayChatModel:
 
         data = response.json()
         info["usage"] = data.get("usage") or {}
+        info["response_body_keys"] = sorted(data.keys()) if isinstance(data, dict) else None
+        # If the id is not in a header, accept it from the body only when it is a UUID-shaped
+        # value under an explicit request-id key (never the chat completion "id").
+        if not info.get("gateway_request_id") and isinstance(data, dict):
+            for key in ("request_id", "databricks.request_id"):
+                if data.get(key):
+                    info["request_id_header"], info["gateway_request_id"] = f"body:{key}", data[key]
+                    break
         content = data["choices"][0]["message"]["content"]
 
         # Extract gateway policy decision from response metadata

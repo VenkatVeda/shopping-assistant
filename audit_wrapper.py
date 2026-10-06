@@ -117,6 +117,28 @@ def _redact_pii(text: str) -> str:
         result = re.sub(pattern, _rep, result, flags=re.IGNORECASE)
     return result
 
+_UUID_RE = re.compile(
+    r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+)
+
+def _redact_pii_keep_ids(text: str) -> str:
+    """
+    _redact_pii, but UUIDs (trace ids, gateway request ids) are left intact.
+    The phone / Aadhaar patterns match any 10-12 digit run, so a UUID whose last
+    segment happens to be all digits would otherwise be replaced by [PHONE] or
+    [AADHAAR] and silently lose its value as a join key.
+    """
+    if not text:
+        return text
+    shielded: list = []
+    def _stash(m):
+        shielded.append(m.group(0))
+        return f"\x00UUID{len(shielded) - 1}\x00"
+    result = _redact_pii(_UUID_RE.sub(_stash, text))
+    for i, value in enumerate(shielded):
+        result = result.replace(f"\x00UUID{i}\x00", value)
+    return result
+
 def _detect_pii_types(text: str) -> list:
     """Return the list of PII pattern labels found in text (for pii_types_found)."""
     if not text:
@@ -126,6 +148,10 @@ def _detect_pii_types(text: str) -> list:
 # ── low-level writer ───────────────────────────────────────────────────────
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+def _ts_to_iso(ts: float) -> str:
+    """Epoch seconds -> the same UTC string format as _now_iso()."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 def _write_row(table: str, row: dict, on_failure=None) -> None:
     """
@@ -422,6 +448,7 @@ class AuditWrapper:
         tokens_used:    Optional[int]   = None,
         retry_count:    Optional[int]   = None,
         node_metadata:  Optional[dict]  = None,
+        started_at:     Optional[str]   = None,
     ) -> Optional[str]:
         """
         Log one LangGraph node execution to node_executions_raw. Fire-and-forget.
@@ -444,11 +471,15 @@ class AuditWrapper:
                           reasoning      - the model's stated reason for its decision
                         PII-redacted before write. Never put raw email or name here.
 
+        started_at    : real start time of the step (same format as _now_iso()).
+                        When omitted, the write time is used, which is only
+                        correct for rows written the moment the step starts.
+
         Returns the generated node_execution_id, or None if logging failed.
         """
         try:
             node_execution_id = str(uuid.uuid4())
-            started    = _now_iso()
+            started    = started_at or _now_iso()
             input_san  = _redact_pii(str(node_input  or ""))
             output_san = _redact_pii(str(node_output or ""))
 
@@ -457,7 +488,7 @@ class AuditWrapper:
             meta_json = None
             if node_metadata:
                 try:
-                    meta_json = _redact_pii(json.dumps(node_metadata, default=str))
+                    meta_json = _redact_pii_keep_ids(json.dumps(node_metadata, default=str))
                 except Exception as _me:
                     logger.warning("[AUDIT] node_metadata not serialisable: %s", _me)
                     meta_json = None
@@ -835,7 +866,8 @@ class AuditTrailCallback(BaseCallbackHandler):
 
     def __init__(self, audit_wrapper: "AuditWrapper"):
         self.audit_wrapper = audit_wrapper
-        # key: run_id (UUID from LangGraph) → (start_time, node_name)
+        # key: run_id (UUID from LangGraph) → (start_time, node_name, is_node_run)
+        # is_node_run is False for runs nested inside another run of the SAME node.
         self._runs: dict = {}
 
     def _extract_name(self, serialized, kwargs) -> str:
@@ -853,17 +885,28 @@ class AuditTrailCallback(BaseCallbackHandler):
         )
 
     def on_chain_start(self, serialized, inputs, **kwargs):
-        """Called by LangGraph BEFORE every node runs. Records start time."""
+        """
+        Called by LangGraph BEFORE every run inside a node. Records start time.
+
+        LangGraph tags every run INSIDE a node (the node wrapper, the routing
+        function of a conditional edge) with the same `langgraph_node` name, so
+        one node execution produces 2-3 callback events. Only the outermost run
+        of a node is the node execution: a run whose parent is another run of
+        the same node is nested and must not be logged again.
+        """
         run_id    = str(kwargs.get("run_id", id(inputs)))
         node_name = self._extract_name(serialized, kwargs)
-        self._runs[run_id] = (time.time(), node_name)
+        parent_id = kwargs.get("parent_run_id")
+        parent    = self._runs.get(str(parent_id)) if parent_id else None
+        is_node_run = not (parent and parent[1] == node_name)
+        self._runs[run_id] = (time.time(), node_name, is_node_run)
 
     def on_chain_end(self, outputs, **kwargs):
-        """Called by LangGraph AFTER every node completes."""
-        run_id        = str(kwargs.get("run_id", ""))
-        t0, node_name = self._runs.pop(run_id, (time.time(), None))
-        # skip graph runner, NodeTracer wrapper — they have no real node name
-        if not node_name or node_name == "unknown":
+        """Called by LangGraph AFTER every run inside a node completes."""
+        run_id = str(kwargs.get("run_id", ""))
+        t0, node_name, is_node_run = self._runs.pop(run_id, (time.time(), None, False))
+        # skip graph runner / unnamed runs, and runs nested inside the same node
+        if not node_name or node_name == "unknown" or not is_node_run:
             return
         self.audit_wrapper.log_node_execution(
             trace_id    = _current_trace_id.get(),
@@ -872,14 +915,15 @@ class AuditTrailCallback(BaseCallbackHandler):
             node_output = str(outputs)[:500],
             latency_ms  = (time.time() - t0) * 1000,
             subject_ref = _current_subject_ref.get() or None,
+            started_at  = _ts_to_iso(t0),
         )
 
     def on_chain_error(self, error, **kwargs):
         """Called by LangGraph when a node raises an exception."""
-        run_id        = str(kwargs.get("run_id", ""))
-        t0, node_name = self._runs.pop(run_id, (time.time(), None))
-        # skip graph runner, NodeTracer wrapper
-        if not node_name or node_name == "unknown":
+        run_id = str(kwargs.get("run_id", ""))
+        t0, node_name, is_node_run = self._runs.pop(run_id, (time.time(), None, False))
+        # skip graph runner / unnamed runs, and runs nested inside the same node
+        if not node_name or node_name == "unknown" or not is_node_run:
             return
         self.audit_wrapper.log_node_execution(
             trace_id    = _current_trace_id.get(),
@@ -888,6 +932,7 @@ class AuditTrailCallback(BaseCallbackHandler):
             error_msg   = str(error)[:500],
             latency_ms  = (time.time() - t0) * 1000,
             subject_ref = _current_subject_ref.get() or None,
+            started_at  = _ts_to_iso(t0),
         )
 
     def on_tool_end(self, output, **kwargs):

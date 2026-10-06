@@ -378,6 +378,12 @@ class NodeTracer:
             inputs = _extract_inputs(node_name, state)
             input_hash = _state_hash(state)
 
+            # The node must run exactly once. The fallbacks below exist only for the case
+            # where MLflow itself fails; they must never re-run a node that already ran
+            # (and raised, e.g. GatewayPolicyBlock, or finished and returned a result).
+            node_started = False
+            node_done    = False
+
             try:
                 if self._mlflow:
                     try:
@@ -387,7 +393,9 @@ class NodeTracer:
                         with mlflow.start_span(name=node_name) as span:
                             # structured inputs + input state fingerprint
                             span.set_inputs({**inputs, "input_state_hash": input_hash})
+                            node_started = True
                             result = fn(state)
+                            node_done = True
                             elapsed = time.time() * 1000 - start_ms
                             # merge output state into result for hashing
                             merged = {**state, **result}
@@ -402,10 +410,17 @@ class NodeTracer:
                             span.set_attribute("latency_ms",        round(elapsed, 2))
                             span.set_status(SpanStatusCode.OK)
                     except ImportError:
-                        result = fn(state)
+                        if node_started and not node_done:
+                            raise                       # the node itself failed: do not run it again
+                        if not node_done:
+                            result = fn(state)          # MLflow missing: run the node once, untraced
                     except Exception as mlflow_err:
+                        if node_started and not node_done:
+                            raise                       # the node itself failed: do not run it again
                         logger.debug(f"[OBSERVABILITY] span error in {node_name}: {mlflow_err}")
-                        result = fn(state)
+                        if not node_done:
+                            result = fn(state)          # MLflow failed before the node ran: run it once
+                        # else: the node finished and only MLflow bookkeeping failed; keep the result
                 else:
                     result = fn(state)
 
