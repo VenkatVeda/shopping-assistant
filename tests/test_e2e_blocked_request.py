@@ -1,4 +1,4 @@
-﻿"""End-to-end: real LangGraph + real NodeTracer + real AuditTrailCallback + real GatewayChatModel (mocked HTTP).
+"""End-to-end: real LangGraph + real NodeTracer + real AuditTrailCallback + real GatewayChatModel (mocked HTTP).
 usage: python test_e2e.py <dir with audit_wrapper.py and core/{observability,gateway_client}.py>"""
 import os as _os, sys as _sys
 _ROOT = _sys.argv[1] if len(_sys.argv) > 1 else _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..')
@@ -66,4 +66,8 @@ for label, blocked in (("ALLOWED request", False), ("BLOCKED request", True)):
     n, c, rows = run(blocked)
     print(f"{label}: gateway HTTP calls = {n}; audit step rows = {sum(c.values())}")
     for (node, st), k in sorted(c.items()): print(f"     {node:40} {st:8} x{k}")
+    gw = [r for r in rows if r["node_name"].startswith("gateway_llm_call")]
+    step = [r for r in rows if r["node_name"] == "intent_classifier"]
+    linked = len(gw) == 1 and len(step) == 1 and gw[0].get("parent_node_id") == step[0]["node_execution_id"]
+    print(f"     parent link: {'ok' if linked else 'MISSING'}")
 

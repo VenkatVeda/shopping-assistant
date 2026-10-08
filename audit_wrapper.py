@@ -71,6 +71,17 @@ logger = logging.getLogger(__name__)
 _current_trace_id:    ContextVar[str] = ContextVar('_current_trace_id',    default='')
 _current_subject_ref: ContextVar[str] = ContextVar('_current_subject_ref', default='')
 
+# (trace_id, node_name) -> node_execution_id of the node run in progress.
+# AuditTrailCallback fills it when a node starts and clears it when the node ends;
+# core/gateway_client.py reads it so a gateway_llm_call row can point at the step
+# that made the call (parent_node_id). A plain dict, because ContextVars set inside
+# a callback do not reliably reach the node's own thread.
+_active_nodes: dict = {}
+
+def get_active_node_id(trace_id: str, node_name: str) -> Optional[str]:
+    """node_execution_id of the step named node_name that is running in this request, or None."""
+    return _active_nodes.get((trace_id, node_name))
+
 # ── jurisdiction mapper ────────────────────────────────────────────────────
 _EU_COUNTRIES = {
     "AT","BE","BG","CY","CZ","DE","DK","EE","ES","FI",
@@ -152,6 +163,17 @@ def _now_iso() -> str:
 def _ts_to_iso(ts: float) -> str:
     """Epoch seconds -> the same UTC string format as _now_iso()."""
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+def _guardrail_meta_json(meta) -> Optional[str]:
+    """guardrail_metadata as masked JSON text (None when empty or not serialisable)."""
+    if not meta:
+        return None
+    try:
+        text = meta if isinstance(meta, str) else json.dumps(meta, default=str)
+        return _redact_pii_keep_ids(text)[:4000]
+    except Exception as e:
+        logger.warning("[AUDIT] guardrail_metadata not serialisable: %s", e)
+        return None
 
 def _write_row(table: str, row: dict, on_failure=None) -> None:
     """
@@ -449,6 +471,7 @@ class AuditWrapper:
         retry_count:    Optional[int]   = None,
         node_metadata:  Optional[dict]  = None,
         started_at:     Optional[str]   = None,
+        node_execution_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Log one LangGraph node execution to node_executions_raw. Fire-and-forget.
@@ -474,11 +497,15 @@ class AuditWrapper:
         started_at    : real start time of the step (same format as _now_iso()).
                         When omitted, the write time is used, which is only
                         correct for rows written the moment the step starts.
+        node_execution_id: id to use for this row. When omitted a new one is generated.
+                        AuditTrailCallback passes the id it handed out when the step
+                        started, so rows written while the step ran (gateway calls) can
+                        already point at it through parent_node_id.
 
-        Returns the generated node_execution_id, or None if logging failed.
+        Returns the node_execution_id used, or None if logging failed.
         """
         try:
-            node_execution_id = str(uuid.uuid4())
+            node_execution_id = node_execution_id or str(uuid.uuid4())
             started    = started_at or _now_iso()
             input_san  = _redact_pii(str(node_input  or ""))
             output_san = _redact_pii(str(node_output or ""))
@@ -556,8 +583,10 @@ class AuditWrapper:
         trace_id should be the caller's pre-generated request trace_id — only a
         fallback UUID is minted when trace_id is None, so every audit row for
         one request shares the same trace_id.
-        Writes only to ai_interactions_raw — model output is logged separately
-        via log_model_output().
+        Writes to ai_interactions_raw. Model output is logged separately via
+        log_model_output(), except for a request blocked by a gateway policy
+        (final_state["blocked_by_policy"] set): the refusal text is then written
+        to model_outputs_raw here, with output_type="blocked_refusal".
         Returns dict with trace_id and subject_ref for chaining.
         """
         trace_id = trace_id or str(uuid.uuid4())
@@ -607,6 +636,17 @@ class AuditWrapper:
                     "guardrail_status":  g_status,
                     "blocked_by_policy": (final_state or {}).get("blocked_by_policy"),
                     "blocked_phase":     (final_state or {}).get("blocked_phase"),
+                    "guardrail_issues":  [
+                        _redact_pii(str(i))[:200]
+                        for i in ((final_state or {}).get("guardrail_issues") or [])[:10]
+                    ],
+                    # names and results only (detail stays in guardrail_results_raw) of the
+                    # output checks that did not pass, when the app puts them in final_state
+                    "failed_checks":     [
+                        {"policy_name": c.get("policy_name") or c.get("name"), "result": c.get("result")}
+                        for c in ((final_state or {}).get("guardrail_checks") or [])
+                        if isinstance(c, dict) and c.get("result") not in (None, "pass", "skipped")
+                    ][:10],
                     "mlflow_trace_id":   mlflow_trace_id,
                 }),
                 "created_at":            now,
@@ -624,6 +664,18 @@ class AuditWrapper:
             }
             _fire(self._tbl("raw_logs.ai_interactions_raw"), int_row)
 
+            # A request stopped by a gateway policy never reaches the response generator, so no
+            # model output is logged for it. Keep what the shopper was actually shown, built from
+            # the model_output and final_state the app already passes in.
+            if (final_state or {}).get("blocked_by_policy"):
+                self.log_model_output(
+                    trace_id      = trace_id,
+                    output_text   = model_output,
+                    subject_ref   = sref,
+                    output_type   = "blocked_refusal",
+                    finish_reason = "content_filter",
+                )
+
         except Exception as e:
             result["status"] = "logging_failed"
             result["error"]  = str(e)
@@ -639,6 +691,7 @@ class AuditWrapper:
         subject_ref:        Optional[str]  = None,
         output_type:        str            = "recommendation",
         finish_reason:      str            = "stop",
+        tokens_used:        Optional[int]  = None,
     ) -> None:
         """
         Log one generated model output to model_outputs_raw. Fire-and-forget.
@@ -647,6 +700,8 @@ class AuditWrapper:
         output_text is PII-redacted before storage; the raw text is HMAC-hashed
         (output_hash) for tamper evidence but never stored unredacted.
         recommended_items must contain product IDs only — never product names.
+        tokens_used: optional total tokens of the call that produced this output;
+        stored as NULL when not given.
         """
         try:
             now         = _now_iso()
@@ -670,7 +725,7 @@ class AuditWrapper:
                 "schema_version":        self.schema_version,
                 # numeric columns — omitted (None) to avoid CAST errors
                 "confidence_score":      None,
-                "tokens_used":           None,
+                "tokens_used":           str(int(tokens_used)) if tokens_used is not None else None,
             }
             _fire(self._tbl("raw_logs.model_outputs_raw"), row)
         except Exception as e:
@@ -678,14 +733,27 @@ class AuditWrapper:
 
     def log_guardrail(
         self,
-        trace_id:        str,
-        policy_name:     str,
-        score:           float,
-        result:          str,
-        triggered_block: bool,
-        subject_ref:     Optional[str] = None,
+        trace_id:           str,
+        policy_name:        str,
+        score:              Optional[float],
+        result:             str,
+        triggered_block:    bool,
+        subject_ref:        Optional[str]  = None,
+        guardrail_metadata: Optional[dict] = None,
+        checked_at:         Optional[str]  = None,
     ) -> None:
-        """Log one guardrail check. Fire-and-forget."""
+        """
+        Log one guardrail check. Fire-and-forget.
+
+        policy_name        : the real name of the check that ran (e.g. "query_length_limit"),
+                             never a generic label.
+        score              : pass None when the check has no real score. Do not invent 1.0 / 0.0.
+        guardrail_metadata : optional dict with the detail of the decision (issues found, limits,
+                             counts ...). Stored as JSON in guardrail_metadata, PII-masked first.
+                             Never put raw user text in it.
+        checked_at         : optional real check time (same format as _now_iso()); the write time
+                             is used when omitted.
+        """
         now = _now_iso()
         row = {
             "guardrail_id":    str(uuid.uuid4()),
@@ -694,16 +762,65 @@ class AuditWrapper:
             "policy_name":     policy_name,
             "result":          result,
             "triggered_block": str(triggered_block).lower(),
-            "checked_at":      now,
+            "checked_at":      checked_at or now,
             "is_erasure_flag": "false",
             "created_at":      now,
             "schema_version":  self.schema_version,
             # optional
             "subject_ref":     subject_ref or None,
+            "guardrail_metadata": _guardrail_meta_json(guardrail_metadata),
             # numeric — omit if None to avoid CAST errors
             "score":           str(round(score, 4)) if score is not None else None,
         }
         _fire(self._tbl("raw_logs.guardrail_results_raw"), row)
+
+    def log_guardrail_checks(
+        self,
+        trace_id:    str,
+        checks:      list,
+        subject_ref: Optional[str] = None,
+        node_name:   Optional[str] = None,
+    ) -> None:
+        """
+        Log several guardrail checks in one call (one guardrail_results_raw row each).
+        The wrapper only writes what the app hands it, so the app builds this list.
+
+        checks: list of dicts, one per check that ran:
+            policy_name     (or name) : real name of the check            -- required
+            result                    : "pass" | "fail" | "warning" | "skipped"
+                                        (default: "fail" if triggered_block else "pass")
+            triggered_block           : True when the check stopped or replaced the answer (default False)
+            score                     : optional real score, otherwise leave out (stored as NULL)
+            metadata (or details)     : optional dict with the detail, e.g. {"issues": [...], "limit": 500}
+            checked_at                : optional real check time
+            node                      : optional name of the graph node that ran the check
+        node_name: optional default for "node" when an entry has none, e.g. "output_guardrail".
+            It is stored as "node" inside guardrail_metadata so a check can be tied to its step
+            row in node_executions_raw (same trace_id, same node name).
+        A malformed entry is skipped and never stops the others or the request.
+        """
+        for c in checks or []:
+            try:
+                name = c.get("policy_name") or c.get("name")
+                if not name:
+                    continue
+                blocked = bool(c.get("triggered_block", False))
+                meta = dict(c.get("metadata") or c.get("details") or {})
+                node = c.get("node") or node_name
+                if node:
+                    meta.setdefault("node", node)
+                self.log_guardrail(
+                    trace_id           = trace_id,
+                    policy_name        = name,
+                    score              = c.get("score"),
+                    result             = c.get("result") or ("fail" if blocked else "pass"),
+                    triggered_block    = blocked,
+                    subject_ref        = subject_ref,
+                    guardrail_metadata = meta or None,
+                    checked_at         = c.get("checked_at"),
+                )
+            except Exception as e:
+                logger.warning("[AUDIT] Skipped one guardrail check entry: %s", e)
 
     def log_tool_call(
         self,
@@ -869,6 +986,15 @@ class AuditTrailCallback(BaseCallbackHandler):
         # key: run_id (UUID from LangGraph) → (start_time, node_name, is_node_run)
         # is_node_run is False for runs nested inside another run of the SAME node.
         self._runs: dict = {}
+        # key: run_id of an outermost node run → (node_execution_id, (trace_id, node_name))
+        self._node_ids: dict = {}
+
+    def _finish_node(self, run_id: str):
+        """Return the node_execution_id handed out at start and clear it from the registry."""
+        nid, key = self._node_ids.pop(run_id, (None, None))
+        if key is not None and _active_nodes.get(key) == nid:
+            _active_nodes.pop(key, None)
+        return nid
 
     def _extract_name(self, serialized, kwargs) -> str:
         """
@@ -900,6 +1026,13 @@ class AuditTrailCallback(BaseCallbackHandler):
         parent    = self._runs.get(str(parent_id)) if parent_id else None
         is_node_run = not (parent and parent[1] == node_name)
         self._runs[run_id] = (time.time(), node_name, is_node_run)
+        if is_node_run and node_name and node_name != "unknown":
+            # Hand out this step's row id now, so a gateway call made while the step runs
+            # can already name its parent (see get_active_node_id).
+            nid = str(uuid.uuid4())
+            key = (_current_trace_id.get(), node_name)
+            self._node_ids[run_id] = (nid, key)
+            _active_nodes[key] = nid
 
     def on_chain_end(self, outputs, **kwargs):
         """Called by LangGraph AFTER every run inside a node completes."""
@@ -908,6 +1041,14 @@ class AuditTrailCallback(BaseCallbackHandler):
         # skip graph runner / unnamed runs, and runs nested inside the same node
         if not node_name or node_name == "unknown" or not is_node_run:
             return
+        # High-level view of the checks a guardrail node ran, when the node returns them in its
+        # output (names and results only; the detail is in guardrail_results_raw, same trace_id).
+        checks = outputs.get("guardrail_checks") if isinstance(outputs, dict) else None
+        checks_meta = None
+        if isinstance(checks, list) and checks:
+            checks_meta = {"checks": [
+                {"policy_name": c.get("policy_name") or c.get("name"), "result": c.get("result")}
+                for c in checks if isinstance(c, dict)][:20]}
         self.audit_wrapper.log_node_execution(
             trace_id    = _current_trace_id.get(),
             node_name   = node_name,
@@ -915,7 +1056,9 @@ class AuditTrailCallback(BaseCallbackHandler):
             node_output = str(outputs)[:500],
             latency_ms  = (time.time() - t0) * 1000,
             subject_ref = _current_subject_ref.get() or None,
+            node_metadata = checks_meta,
             started_at  = _ts_to_iso(t0),
+            node_execution_id = self._finish_node(run_id),
         )
 
     def on_chain_error(self, error, **kwargs):
@@ -925,15 +1068,27 @@ class AuditTrailCallback(BaseCallbackHandler):
         # skip graph runner / unnamed runs, and runs nested inside the same node
         if not node_name or node_name == "unknown" or not is_node_run:
             return
+        # A gateway policy block is a decision, not a failure of the step: log it as "blocked"
+        # (the same status the gateway_llm_call row already gets) with the policy name and phase.
+        blocked = self._is_policy_block(error)
         self.audit_wrapper.log_node_execution(
-            trace_id    = _current_trace_id.get(),
-            node_name   = node_name,
-            status      = "error",
-            error_msg   = str(error)[:500],
-            latency_ms  = (time.time() - t0) * 1000,
-            subject_ref = _current_subject_ref.get() or None,
-            started_at  = _ts_to_iso(t0),
+            trace_id      = _current_trace_id.get(),
+            node_name     = node_name,
+            status        = "blocked" if blocked else "error",
+            error_msg     = str(error)[:500],
+            latency_ms    = (time.time() - t0) * 1000,
+            subject_ref   = _current_subject_ref.get() or None,
+            node_metadata = ({"blocked_by_policy": getattr(error, "policy", None),
+                              "blocked_phase":     getattr(error, "phase", None)} if blocked else None),
+            started_at    = _ts_to_iso(t0),
+            node_execution_id = self._finish_node(run_id),
         )
+
+    @staticmethod
+    def _is_policy_block(error) -> bool:
+        """True for core.gateway_client.GatewayPolicyBlock, matched by class name so this
+        module does not have to import the app's gateway client."""
+        return any(c.__name__ == "GatewayPolicyBlock" for c in type(error).__mro__)
 
     def on_tool_end(self, output, **kwargs):
         """Called by LangGraph after every tool call completes."""
