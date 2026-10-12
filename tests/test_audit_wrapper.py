@@ -96,6 +96,10 @@ def test_successful_write():
     """
     Log a real interaction and confirm the row lands in Delta.
     This is the core smoke test.
+
+    regulation_at_time is the regulation applicable to THIS interaction,
+    recomputed from the user_country passed to log_interaction (the
+    request/current country) every call — it does not read customer_pii.
     """
     from audit_wrapper import AuditWrapper
     import time
@@ -180,7 +184,7 @@ def test_pii_redacted():
 # ── test 6: GDPR regulation applied for EU user ───────────────────────────
 
 def test_gdpr_regulation():
-    """EU user must get GDPR regulation, not DPDP."""
+    """EU user must get GDPR regulation, not DPDP — recomputed from the request country."""
     from audit_wrapper import AuditWrapper
     import time
 

@@ -28,10 +28,10 @@ env:
   - name: DATABRICKS_EMBEDDING_ENDPOINT
     value: "databricks-bge-large-en"
   - name: DATABRICKS_CHAT_ENDPOINT
-    value: "databricks-meta-llama-3-1-8b-instruct"
+    value: "system.ai.meta-llama-3-1-8b-instruct"  # For memory summarization
   - name: DATABRICKS_INTENT_ENDPOINT
-    value: "databricks-meta-llama-3-1-8b-instruct"
-
+    value: "system.ai.meta-llama-3-1-8b-instruct"  # For intent classification
+  
   # MCP Vector Store Configuration
   - name: USE_MCP_VECTOR_SEARCH
     value: "false"
@@ -75,3 +75,7 @@ env:
     valueFrom: google-client-id
   - name: GOOGLE_CLIENT_SECRET
     valueFrom: google-client-secret
+
+  # MLflow tracing (experiment defaults to /Shared/shopping-assistant-observability)
+  - name: MLFLOW_TRACKING_URI
+    value: "databricks"

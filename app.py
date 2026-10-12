@@ -5,6 +5,7 @@ Flask backend serving static frontend and API endpoints with LangGraph Workflow
 
 from flask import Flask, send_from_directory, jsonify, request, session, redirect, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
+from core.geoip import get_country_from_request, resolve_registration_country
 import os
 import sys
 import logging
@@ -366,7 +367,6 @@ def oauth_login():
     auth_url = get_google_auth_url(state)
     return redirect(auth_url)
 
-
 @app.route('/oauth/callback')
 def oauth_callback():
     """Handle OAuth callback from Google"""
@@ -395,10 +395,19 @@ def oauth_callback():
 # ── AUDIT: register customer in customer_pii on every login ──
         try:
             if workflow and workflow.audit_wrapper:
+                # Registration country — resolved ONCE here. This seeds customer_pii.user_country
+                # and, from it, the frozen governing regulation. Never recomputed after this.
+                reg_country, reg_country_source = resolve_registration_country(
+                    request, user_info.get("locale", "")
+                )
+                logger.info(
+                    f"[AUDIT] Registration country for {email}: "
+                    f"{reg_country or 'UNKNOWN'} (source={reg_country_source})"
+                )
                 workflow.audit_wrapper.register_customer(
                     user_email      = email,
                     full_name       = name,
-                    user_country    = get_country_from_request(request) or os.getenv("DEFAULT_USER_COUNTRY", ""),
+                    user_country    = reg_country,
                     consent_version = "tnc_v2.1",
                 )
         except Exception as _re:
@@ -490,6 +499,9 @@ def search():
     query = data.get('query', '').strip()
     session_id = data.get('session_id') or str(uuid.uuid4())
     user_id = getattr(request, 'user_id', None)
+    # Where THIS request is coming from right now — independent of, and never
+    # used to recompute, the user's frozen governing regulation.
+    request_country = get_country_from_request(request)
 
     with RequestTrace(query=query, user_id=user_id):
       try:
@@ -509,7 +521,9 @@ def search():
 
         # Execute workflow with user_id for personalization
         with track_time("workflow_execution"):
-            final_state = workflow.process_query(query, session_id, user_id=user_id)
+            final_state = workflow.process_query(
+                query, session_id, user_id=user_id, request_country=request_country
+            )
         
         # Check for errors
         if final_state.get("error"):
@@ -859,7 +873,6 @@ def health():
         "service": "shopping-assistant",
         "workflow": workflow_status
     })
-
 
 @app.route('/api/test-extended-tools', methods=['GET'])
 @token_required

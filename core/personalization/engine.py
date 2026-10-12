@@ -135,6 +135,9 @@ class PersonalizationEngine:
         try:
             extraction = self.extractor.extract(user_message)
         except Exception as e:
+            from ..gateway_client import GatewayPolicyBlock
+            if isinstance(e, GatewayPolicyBlock):
+                raise
             logger.error(f"LLM extraction failed for user {user_id}: {e}")
             extraction = {
                 "intent_type": "query",

@@ -14,7 +14,7 @@ from ..audit_logger import log_tool_call
 
 class DatabricksAdapter(VectorStoreInterface):
     """Databricks Vector Search implementation of VectorStoreInterface"""
-    
+
     def __init__(
         self,
         host: Optional[str] = None,
@@ -24,7 +24,7 @@ class DatabricksAdapter(VectorStoreInterface):
     ):
         """
         Initialize Databricks Vector Search adapter
-        
+
         Args:
             host: Databricks workspace URL (defaults to env var DATABRICKS_HOST)
             token: Databricks access token (defaults to env var DATABRICKS_TOKEN)
@@ -39,7 +39,7 @@ class DatabricksAdapter(VectorStoreInterface):
         self.token = token or os.getenv("DATABRICKS_TOKEN")
         self.index_name = index_name or os.getenv("DATABRICKS_VECTOR_INDEX", "bags_embeddings_index")
         self.endpoint_name = endpoint_name or os.getenv("DATABRICKS_VECTOR_ENDPOINT")
-        
+
         # DEBUG: Print what we're getting
         print(f"[DATABRICKS ADAPTER DEBUG] host param: {host}", file=sys.stderr)
         print(f"[DATABRICKS ADAPTER DEBUG] token param: {'***' + token[-4:] if token else None}", file=sys.stderr)
@@ -49,16 +49,16 @@ class DatabricksAdapter(VectorStoreInterface):
         print(f"[DATABRICKS ADAPTER DEBUG] self.token: {'***' + self.token[-4:] if self.token else None}", file=sys.stderr)
         print(f"[DATABRICKS ADAPTER DEBUG] self.endpoint_name: {self.endpoint_name}", file=sys.stderr)
         print(f"[DATABRICKS ADAPTER DEBUG] self.index_name: {self.index_name}", file=sys.stderr)
-        
+
         if not self.endpoint_name:
             raise ValueError("DATABRICKS_VECTOR_ENDPOINT is required")
-        
+
         # Initialize Databricks Vector Search client
         try:
             # In Databricks Apps, credentials are automatically available via the runtime
             # VectorSearchClient will use the app's service principal or default credentials
             print(f"[DATABRICKS ADAPTER] Initializing Vector Search client...", file=sys.stderr)
-            
+
             # Check if we have explicit credentials (for local development)
             sp_client_id = os.getenv("DATABRICKS_CLIENT_ID")
             sp_client_secret = os.getenv("DATABRICKS_CLIENT_SECRET")
@@ -82,20 +82,20 @@ class DatabricksAdapter(VectorStoreInterface):
                 # Databricks notebooks/clusters use default auth
                 print(f"[DATABRICKS ADAPTER] Using default workspace credentials", file=sys.stderr)
                 self.client = VectorSearchClient(disable_notice=True)
-            
+
             # Get the index
             self.index = self.client.get_index(
                 endpoint_name=self.endpoint_name,
                 index_name=self.index_name
             )
-            
+
             print(f"[DATABRICKS ADAPTER] Connected to index: {self.index_name}", file=sys.stderr)
             print(f"[DATABRICKS ADAPTER] Using endpoint: {self.endpoint_name}", file=sys.stderr)
-            
+
         except Exception as e:
             print(f"[DATABRICKS ADAPTER] Initialization error: {e}", file=sys.stderr)
             raise
-    
+
     def search(
         self,
         vector: List[float],
@@ -149,7 +149,7 @@ class DatabricksAdapter(VectorStoreInterface):
                 num_results=top_k,
                 filters=filter_dict
             )
-            
+
             # Debug: Print raw response
             print(f"[DATABRICKS ADAPTER DEBUG] Raw results type: {type(results)}", file=sys.stderr)
             if isinstance(results, dict):
@@ -161,20 +161,20 @@ class DatabricksAdapter(VectorStoreInterface):
                 if results.data_array and len(results.data_array) > 0:
                     print(f"[DATABRICKS ADAPTER DEBUG] First row sample: {results.data_array[0]}", file=sys.stderr)
             print(f"[DATABRICKS ADAPTER DEBUG] Results dir: {dir(results)}", file=sys.stderr)
-            
+
             # Standardize format to match Pinecone adapter
             standardized_results = []
-            
+
             # Handle dict response format (from VectorSearchClient)
             if isinstance(results, dict) and 'result' in results and 'data_array' in results['result']:
                 data_array = results['result']['data_array']
                 for row in data_array:
-                    # Row format: [product_id, name_clean, brand_clean, category_clean, gender, 
-                    #              price_from, price_tier, primary_color, material_type, 
+                    # Row format: [product_id, name_clean, brand_clean, category_clean, gender,
+                    #              price_from, price_tier, primary_color, material_type,
                     #              is_available, on_sale, primary_image_url, embedding_text, score]
-                    
+
                     score = float(row[-1]) if len(row) > 0 and row[-1] is not None else 0.0
-                    
+
                     # Build metadata dict from available columns
                     metadata = {}
                     if len(row) > 0:
@@ -206,7 +206,7 @@ class DatabricksAdapter(VectorStoreInterface):
                         metadata['url_full'] = str(row[12]) if row[12] is not None else ""
                     if len(row) > 13:
                         metadata['description'] = str(row[13]) if row[13] is not None else ""
-                    
+
                     standardized_results.append({
                         'id': str(row[0]) if len(row) > 0 and row[0] is not None else "",
                         'score': score,
@@ -216,7 +216,7 @@ class DatabricksAdapter(VectorStoreInterface):
             elif hasattr(results, 'data_array'):
                 for row in results.data_array:
                     score = float(row[-1]) if len(row) > 0 and row[-1] is not None else 0.0
-                    
+
                     # Build metadata dict from available columns
                     metadata = {}
                     if len(row) > 0:
@@ -248,13 +248,13 @@ class DatabricksAdapter(VectorStoreInterface):
                         metadata['url_full'] = str(row[12]) if row[12] is not None else ""
                     if len(row) > 13:
                         metadata['description'] = str(row[13]) if row[13] is not None else ""
-                    
+
                     standardized_results.append({
                         'id': str(row[0]) if row[0] is not None else "",
                         'score': score,
                         'metadata': metadata
                     })
-            
+
             print(f"[DATABRICKS ADAPTER] Found {len(standardized_results)} results", file=sys.stderr)
             log_tool_call(
                 tool_name="databricks_vector_search",
@@ -283,7 +283,7 @@ class DatabricksAdapter(VectorStoreInterface):
                 **(audit_context or {}),
             )
             return []
-    
+
     def fetch_by_id(self, vector_id: str) -> Optional[Dict[str, Any]]:
         """
         Fetch a single product from the Silver Delta table by product_id.
@@ -370,24 +370,24 @@ class DatabricksAdapter(VectorStoreInterface):
             import traceback
             traceback.print_exc(file=sys.stderr)
             return None
-    
+
     def get_index_stats(self) -> Dict[str, Any]:
         """
         Get Databricks Vector Search index statistics
-        
+
         Returns:
             Dictionary with index stats
         """
         try:
             # Get index description
             index_info = self.index.describe()
-            
+
             stats = {
                 'index_name': self.index_name,
                 'endpoint_name': self.endpoint_name,
                 'type': 'databricks_vector_search'
             }
-            
+
             # Extract status info
             if isinstance(index_info, dict):
                 if 'status' in index_info:
@@ -397,10 +397,10 @@ class DatabricksAdapter(VectorStoreInterface):
                     stats['source_table'] = spec.get('source_table', 'unknown')
                     if 'embedding_vector_columns' in spec and len(spec['embedding_vector_columns']) > 0:
                         stats['dimension'] = spec['embedding_vector_columns'][0].get('embedding_dimension', 'unknown')
-            
+
             print(f"[DATABRICKS ADAPTER] Stats retrieved: {stats}", file=sys.stderr)
             return stats
-            
+
         except Exception as e:
             print(f"[DATABRICKS ADAPTER] Stats error: {e}", file=sys.stderr)
             return {
@@ -409,162 +409,112 @@ class DatabricksAdapter(VectorStoreInterface):
                 'endpoint_name': self.endpoint_name,
                 'type': 'databricks_vector_search'
             }
-    
+
     def upsert(self, vectors: List[Dict[str, Any]]) -> None:
         """
         Upload vectors to Databricks Vector Search
         Note: Databricks uses Delta Sync, so direct upsert is not typical
-        
+
         Args:
             vectors: List of vectors with id, values, and metadata
         """
         print(f"[DATABRICKS ADAPTER] Upsert not supported - use Delta table updates", file=sys.stderr)
         raise NotImplementedError("Databricks Vector Search uses Delta Sync - update source table instead")
-    
+
     def delete(self, ids: List[str]) -> None:
         """
         Delete vectors from Databricks Vector Search
         Note: Databricks uses Delta Sync, so delete from source table
-        
+
         Args:
             ids: List of vector IDs to delete
         """
         print(f"[DATABRICKS ADAPTER] Delete not supported - update Delta table instead", file=sys.stderr)
         raise NotImplementedError("Databricks Vector Search uses Delta Sync - delete from source table instead")
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """
         Get Databricks Vector Search index statistics
         Alias for get_index_stats for interface compatibility
-        
+
         Returns:
             Dictionary with index stats
         """
         return self.get_index_stats()
-    
+
     def _build_filter_dict(self, filters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Convert Pinecone/MongoDB-style filters to Databricks Vector Search Python SDK format.
+        Convert a MongoDB-style filters dict to the Databricks Vector Search
+        filter dict format required by STANDARD endpoints: {"column[ op]": value}.
+        (STANDARD endpoints reject SQL WHERE-clause strings; only the newer
+        STORAGE_OPTIMIZED endpoint type accepts those.)
 
-        Databricks SDK filter format:
-          {"col": value}          equality
-          {"col": [v1, v2]}       IN list
-          {"col NOT": value}      not-equal
-          {"col NOT": [v1, v2]}   NOT IN list
-          {"col >": value}        greater-than  (also >=, <, <=)
-          Multiple keys = AND
+        Supported operators, mapped to Databricks filter-key suffixes:
+          - Scalar equality  : {"field": "value"}            -> {"field": "value"}
+          - $gt / $gte       : {"field": {"$gt": 100}}        -> {"field >": 100}
+          - $lt / $lte       : {"field": {"$lt": 200}}        -> {"field <": 200}
+          - $ne              : {"field": {"$ne": "black"}}    -> {"field NOT": "black"}
+          - $in              : {"field": {"$in": [...]}}      -> {"field": [...]}
+          - $nin             : {"field": {"$nin": [...]}}     -> {"field NOT": [...]}
+          - $and             : {"$and": [{"field1": …}, …]}   -> merged into one dict
+
+        Unknown operators are skipped and logged. Conflicting keys across an
+        $and (e.g. two clauses targeting the same field+operator) overwrite
+        each other — callers should keep such filters on distinct fields.
         """
-        if not filters:
-            return None
+        def _merge(target: Dict[str, Any], key: str, value: Any) -> None:
+            if key in target:
+                print(
+                    f"[DATABRICKS ADAPTER] Duplicate filter key '{key}' — "
+                    f"overwriting previous value",
+                    file=sys.stderr,
+                )
+            target[key] = value
 
-        result = {}
-
-        def _convert_one(col: str, expr: Any):
-            if isinstance(expr, (str, int, float, bool)):
-                result[col] = expr
-            elif isinstance(expr, list):
-                result[col] = expr
-            elif isinstance(expr, dict):
-                for op, val in expr.items():
-                    if op == "$in":
-                        result[col] = val if isinstance(val, list) else [val]
-                    elif op == "$nin":
-                        result[f"{col} NOT"] = val if isinstance(val, list) else [val]
-                    elif op == "$ne":
-                        result[f"{col} NOT"] = val
-                    elif op == "$gt":
-                        result[f"{col} >"] = val
-                    elif op == "$gte":
-                        result[f"{col} >="] = val
-                    elif op == "$lt":
-                        result[f"{col} <"] = val
-                    elif op == "$lte":
-                        result[f"{col} <="] = val
-
-        for key, value in filters.items():
-            if key == "$and" and isinstance(value, list):
-                for sub in value:
-                    if isinstance(sub, dict):
-                        merged = self._build_filter_dict(sub)
-                        if merged:
-                            result.update(merged)
-            else:
-                _convert_one(key, value)
-
-        return result if result else None
-
-    def _build_filter_clause(self, filters: Dict[str, Any]) -> Optional[str]:
-        """
-        Convert a MongoDB-style filters dict to a Databricks SQL WHERE clause string.
-
-        Supported operators:
-          - Scalar equality  : {"field": "value"} or {"field": 123}
-          - $gt / $gte       : {"field": {"$gt": 100}}
-          - $lt / $lte       : {"field": {"$lt": 200}}
-          - $ne              : {"field": {"$ne": "black"}}
-          - $in              : {"field": {"$in": ["red", "blue"]}}
-          - $nin             : {"field": {"$nin": ["red", "blue"]}}
-          - $and             : {"$and": [{"field1": …}, {"field2": …}]}
-
-        String values are single-quoted with internal quotes escaped.
-        Unknown operators are skipped and logged.
-        """
-        def _quote(val) -> str:
-            """Return a SQL literal for a scalar value."""
-            if isinstance(val, str):
-                return "'" + val.replace("'", "''") + "'"
-            return str(val)
-
-        def _parse_one(key: str, value: Any) -> Optional[str]:
+        def _parse_one(target: Dict[str, Any], key: str, value: Any) -> None:
             if isinstance(value, (str, int, float, bool)):
-                return f"{key} = {_quote(value)}"
-            if isinstance(value, list):
+                _merge(target, key, value)
+            elif isinstance(value, list):
                 # Bare list treated as $in
-                items = ", ".join(_quote(v) for v in value)
-                return f"{key} IN ({items})" if value else None
-            if isinstance(value, dict):
-                sub = []
+                if value:
+                    _merge(target, key, value)
+            elif isinstance(value, dict):
                 for op, val in value.items():
                     if op == "$gt":
-                        sub.append(f"{key} > {_quote(val)}")
+                        _merge(target, f"{key} >", val)
                     elif op == "$gte":
-                        sub.append(f"{key} >= {_quote(val)}")
+                        _merge(target, f"{key} >=", val)
                     elif op == "$lt":
-                        sub.append(f"{key} < {_quote(val)}")
+                        _merge(target, f"{key} <", val)
                     elif op == "$lte":
-                        sub.append(f"{key} <= {_quote(val)}")
+                        _merge(target, f"{key} <=", val)
                     elif op == "$ne":
-                        sub.append(f"{key} != {_quote(val)}")
+                        _merge(target, f"{key} NOT", val)
                     elif op == "$in":
                         if val:
-                            items = ", ".join(_quote(v) for v in val)
-                            sub.append(f"{key} IN ({items})")
+                            _merge(target, key, val)
                     elif op == "$nin":
                         if val:
-                            items = ", ".join(_quote(v) for v in val)
-                            sub.append(f"{key} NOT IN ({items})")
+                            _merge(target, f"{key} NOT", val)
                     else:
                         print(
                             f"[DATABRICKS ADAPTER] Unknown filter operator '{op}' "
                             f"for key '{key}' — skipped",
                             file=sys.stderr,
                         )
-                return " AND ".join(sub) if sub else None
-            return None
 
-        clauses = []
+        result: Dict[str, Any] = {}
         for key, value in filters.items():
             if key == "$and":
                 # {"$and": [{"field1": …}, {"field2": …}]}
                 if isinstance(value, list):
                     for sub_filter in value:
                         if isinstance(sub_filter, dict):
-                            sub = self._build_filter_clause(sub_filter)
+                            sub = self._build_filter_dict(sub_filter)
                             if sub:
-                                clauses.append(f"({sub})")
+                                for sub_key, sub_val in sub.items():
+                                    _merge(result, sub_key, sub_val)
             else:
-                clause = _parse_one(key, value)
-                if clause:
-                    clauses.append(clause)
+                _parse_one(result, key, value)
 
-        return " AND ".join(clauses) if clauses else None
+        return result if result else None
