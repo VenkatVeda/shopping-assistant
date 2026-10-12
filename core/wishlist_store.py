@@ -24,7 +24,7 @@ TABLE   = f"{CATALOG}.user_data.wishlist_items"
 # ── DDL ───────────────────────────────────────────────────────────────────────
 DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
-    wishlist_id   STRING    NOT NULL,
+    wishlist_item_id STRING NOT NULL,
     subject_ref   STRING    NOT NULL,
     app_id        STRING    NOT NULL,
     product_id    STRING    NOT NULL,
@@ -108,7 +108,7 @@ class WishlistStore:
         from databricks.sdk.service.sql import StatementParameterListItem
         wishlist_id = str(uuid.uuid4())
 
-        cols   = ["wishlist_id", "subject_ref", "app_id", "product_id", "added_at", "is_active"]
+        cols   = ["wishlist_item_id", "subject_ref", "app_id", "product_id", "added_at", "is_active"]
         vals   = [wishlist_id, subject_ref, self.app_id, product_id, "current_timestamp()", "true"]
         params = []
 
@@ -124,7 +124,7 @@ class WishlistStore:
         _p("image_url",    image_url)
         _p("retailer_url", retailer_url)
 
-        literal_cols = ["wishlist_id", "subject_ref", "app_id", "product_id", "added_at", "is_active"]
+        literal_cols = ["wishlist_item_id", "subject_ref", "app_id", "product_id", "added_at", "is_active"]
         col_list  = ", ".join(cols)
         val_parts = []
         for c, v in zip(cols, vals):
@@ -137,10 +137,10 @@ class WishlistStore:
         sql = f"INSERT INTO {TABLE} ({col_list}) VALUES ({val_str})"
 
         # Rebuild cleanly using parameterised approach
-        param_cols  = ["wishlist_id", "subject_ref", "app_id", "product_id"]
+        param_cols  = ["wishlist_item_id", "subject_ref", "app_id", "product_id"]
         param_vals  = [wishlist_id, subject_ref, self.app_id, product_id]
         param_items = [
-            StatementParameterListItem(name="wishlist_id",  value=wishlist_id),
+            StatementParameterListItem(name="wishlist_item_id", value=wishlist_id),
             StatementParameterListItem(name="subject_ref",  value=subject_ref),
             StatementParameterListItem(name="app_id",       value=self.app_id),
             StatementParameterListItem(name="product_id",   value=product_id),
@@ -184,7 +184,7 @@ class WishlistStore:
         """Return all active wishlist items for a user. Synchronous."""
         from databricks.sdk.service.sql import StatementParameterListItem
         sql = (
-            f"SELECT wishlist_id, product_id, product_name, brand, price, image_url, retailer_url, added_at "
+            f"SELECT wishlist_item_id, product_id, product_name, brand, price, image_url, retailer_url, added_at "
             f"FROM {TABLE} "
             f"WHERE subject_ref = :subject_ref AND app_id = :app_id AND is_active = true "
             f"ORDER BY added_at DESC"
