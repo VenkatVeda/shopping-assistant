@@ -33,7 +33,41 @@ class GatewayPolicyBlock(Exception):
         self.content = content
         self.reason = reason
         self.action = action
+        self.calling_node = None  # set by GatewayChatModel.invoke
         super().__init__(f"Blocked by policy: {policy}")
+
+
+_MSG_HARMFUL   = "Your query has been blocked because it contains harmful content."
+_MSG_VIOLATION = "Your query has been blocked because it violates our usage policies."
+_MSG_OFF_TOPIC = ("Your query has been blocked because it is outside the scope of this assistant. "
+                  "I can only help with shopping for bags, wallets and accessories.")
+_MSG_SPAM      = "Your query has been blocked because it looks like spam or abusive use of this service."
+_MSG_PII       = ("Your query has been blocked because it contains personal information. "
+                  "Please remove it and try again.")
+_MSG_RESPONSE  = ("I couldn't provide a response to that request because it conflicts with our usage "
+                  "policies. Please try rephrasing your question.")
+
+# Nodes whose gateway prompt is written by the app, not typed by the user: a block there says
+# nothing about the user's query, so it must not be reported as "your query was blocked".
+_INTERNAL_PROMPT_NODES = {"output_guardrail"}
+
+
+def user_message_for_block(policy: str, phase: str = None, calling_node: str = None) -> str:
+    """User-facing text for a gateway policy block, chosen by the policy that fired."""
+    if phase == "post_call" or calling_node in _INTERNAL_PROMPT_NODES:
+        return _MSG_RESPONSE
+    p = (policy or "").lower()
+    if "jailbreak" in p:
+        return _MSG_VIOLATION
+    if any(k in p for k in ("unsafe", "harm", "toxic", "violen")):
+        return _MSG_HARMFUL
+    if "topic" in p:
+        return _MSG_OFF_TOPIC
+    if "spam" in p or "abuse" in p:
+        return _MSG_SPAM
+    if any(k in p for k in ("pii", "personal", "privacy")):
+        return _MSG_PII
+    return _MSG_VIOLATION
 
 
 class _GatewayResponse:
@@ -203,6 +237,7 @@ class GatewayChatModel:
         try:
             response = self._invoke(messages, max_tokens, temperature, info)
         except GatewayPolicyBlock as b:
+            b.calling_node = info.get("calling_node")
             info.update(policy=b.policy, phase=b.phase, policy_reason=b.reason,
                         policy_decision=(b.action or "").upper() or None)
             _record_gateway_call(self.endpoint, "blocked", t0, info, error_msg=str(b))

@@ -2149,16 +2149,17 @@ class ShoppingAssistantWorkflow:
             ).start()
 
         _graph_t0 = time.time()
-        from .gateway_client import GatewayPolicyBlock
+        from .gateway_client import GatewayPolicyBlock, user_message_for_block
         with RequestTrace(query=query, user_id=user_id, session_id=session_id) as rt:
             try:
                 final_state = self.app.invoke(initial_state, config=config)
             except GatewayPolicyBlock as b:
-                print(f"[WORKFLOW] Gateway policy block: {b.policy} ({b.phase})")
+                print(f"[WORKFLOW] Gateway policy block: {b.policy} ({b.phase}) in {b.calling_node}")
+                _block_msg = user_message_for_block(b.policy, b.phase, b.calling_node)
                 final_state = {
                     **initial_state,
-                    "generated_response": "I can only help with shopping for bags and accessories.",
-                    "safe_response": "I can only help with shopping for bags and accessories.",
+                    "generated_response": _block_msg,
+                    "safe_response": _block_msg,
                     "guardrail_status": "blocked",
                     "guardrail_issues": [f"Blocked by gateway policy: {b.policy}"],
                     "blocked_by_policy": b.policy,
