@@ -3,6 +3,7 @@ Output Guardrails for Shopping Assistant
 Implements content safety, factual validation, and response quality checks
 """
 
+import difflib
 import re
 import time
 from typing import Dict, Any, List, Optional, Tuple
@@ -57,9 +58,9 @@ class OutputGuardrail:
             return safety_check
 
         if products and len(products) > 0:
-            accuracy_check = self._check_factual_accuracy(response, query, products)
+            accuracy_check = self._check_product_facts(response, query, products)
             if accuracy_check["status"] in ["fail", "warning"]:
-                print(f"[OUTPUT GUARDRAIL] Accuracy check {accuracy_check['status']}: {accuracy_check['issues']}")
+                print(f"[OUTPUT GUARDRAIL] Fact check {accuracy_check['status']}: {accuracy_check['issues']}")
                 log_guardrail(
                     guardrail_type="output",
                     status=accuracy_check["status"],
@@ -188,72 +189,109 @@ class OutputGuardrail:
         #     return {"status": "pass", "safe_response": response, "issues": [f"Safety check error: {str(e)}"], "corrections_made": False}
         return {"status": "pass", "safe_response": response, "issues": [], "corrections_made": False}
 
-    def _check_factual_accuracy(self, response: str, query: str, products: List[dict]) -> Dict[str, Any]:
+    # ── deterministic fact check: product names, brands and prices (no model call) ──
+
+    _PRICE_RE = re.compile(r'\$\s?(\d[\d,]*(?:\.\d{1,2})?)')
+    _CLAIM_RE = re.compile(r'\*\*([^*\n]+?)\*\*\s+by\s+', re.IGNORECASE)   # "**Name** by Brand"
+    _PRICE_WINDOW = 160   # chars after a product name in which its price is expected
+
+    @staticmethod
+    def _norm(text: Any) -> str:
+        return re.sub(r'[^a-z0-9]+', '', str(text or '').lower())
+
+    @staticmethod
+    def _product_facts(product: Any) -> Dict[str, Any]:
+        src = product.get('metadata') if isinstance(product, dict) and product.get('metadata') else product
+        src = src if isinstance(src, dict) else {}
         try:
-            query_stripped = query.strip()
-            if re.match(r'^\d+$', query_stripped):
-                print(f"[OUTPUT GUARDRAIL] Skipping accuracy check for product selection: '{query_stripped}'")
-                return {"status": "pass", "safe_response": response, "issues": [], "corrections_made": False}
+            price = float(str(src.get('price', src.get('product_price'))).replace('$', '').replace(',', '').strip())
+        except (ValueError, TypeError):
+            price = None
+        return {
+            "name":  str(src.get('name') or src.get('product_name') or ''),
+            "brand": str(src.get('brand') or src.get('product_brand') or ''),
+            "price": price,
+        }
 
-            selection_phrases = ['tell me about', 'show me', 'what about', 'more details', 'more info']
-            if any(phrase in query.lower() for phrase in selection_phrases) and len(query.split()) <= 5:
-                print(f"[OUTPUT GUARDRAIL] Skipping accuracy check for product selection phrase")
-                return {"status": "pass", "safe_response": response, "issues": [], "corrections_made": False}
+    def _match_product(self, claimed: str, facts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        c = self._norm(claimed)
+        if not c:
+            return None
+        best, best_ratio = None, 0.0
+        for f in facts:
+            n = self._norm(f["name"])
+            if not n:
+                continue
+            if c == n or (min(len(c), len(n)) >= 6 and (c in n or n in c)):
+                return f
+            ratio = difflib.SequenceMatcher(None, c, n).ratio()
+            if ratio > best_ratio:
+                best, best_ratio = f, ratio
+        return best if best_ratio >= 0.88 else None
 
-            products_data = self._format_products_for_validation(products[:10])
+    def _rebuild_response(self, response: str, facts: List[Dict[str, Any]]) -> str:
+        """Keep the model's opening sentences; rewrite the product lines from the real data."""
+        first = response.find('**')
+        intro = response[:first].strip() if first > 0 else ''
+        if not (20 <= len(intro) <= 500) or '$' in intro or '[' in intro:
+            intro = "Here are the best matches I found for you:"
+        lines = []
+        for f in facts[:3]:
+            line = f"**{f['name']}**" + (f" by {f['brand']}" if f['brand'] else "")
+            if f['price'] is not None:
+                line += f"\n**${f['price']:.2f}**"
+            lines.append(line)
+        return intro + "\n\n" + "\n\n".join(lines)
 
-            prompt = load_prompt("output_factual_validation", {
-                "response": response,
-                "products_data": products_data,
-                "query": query
-            })
+    def _check_product_facts(self, response: str, query: str, products: List[dict]) -> Dict[str, Any]:
+        """
+        Compare what the reply says about the described products with the product data.
+        Conservative on purpose: only "**Name** by Brand" claims and the price right after
+        them are checked, so free-form replies (product discussion, chat) are never rewritten.
+        A wrong or invented product line is rewritten from the data; any other price that
+        matches nothing is reported as a warning and the reply is left as written.
+        """
+        ok = {"status": "pass", "safe_response": response, "issues": [], "corrections_made": False}
+        facts = [f for f in (self._product_facts(p) for p in products) if f["name"]]
+        if not facts:
+            return ok
 
-            llm_response = self.llm.invoke(prompt)
-            content = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
+        query_numbers = {round(float(n.replace(',', '')), 2) for n in re.findall(r'\d[\d,]*(?:\.\d+)?', query or '')}
+        known_prices = {round(f["price"], 2) for f in facts if f["price"] is not None}
+        issues: List[str] = []
+        rewrite = False
 
-            status, errors, corrected = self._parse_validation_response(content)
+        claims = list(self._CLAIM_RE.finditer(response))
+        for i, m in enumerate(claims):
+            fact = self._match_product(m.group(1), facts)
+            if fact is None:
+                issues.append(f"Product not in the results: {m.group(1).strip()}")
+                rewrite = True
+                continue
+            end = claims[i + 1].start() if i + 1 < len(claims) else len(response)
+            block = response[m.end():end]
+            if fact["brand"] and self._norm(fact["brand"]) not in self._norm(block[:len(fact["brand"]) + 30]):
+                issues.append(f"Brand does not match for {fact['name']}")
+                rewrite = True
+            for raw in self._PRICE_RE.findall(block[:self._PRICE_WINDOW]):
+                value = round(float(raw.replace(',', '')), 2)
+                if fact["price"] is not None and abs(value - fact["price"]) > 0.01 and value not in query_numbers:
+                    issues.append(f"Price ${value:.2f} does not match {fact['name']} (${fact['price']:.2f})")
+                    rewrite = True
 
-            if status == "FAIL":
-                return {
-                    "status": "fail",
-                    "safe_response": corrected if corrected != "No correction needed" else response,
-                    "issues": errors,
-                    "corrections_made": True
-                }
-            elif status == "WARNING":
-                return {
-                    "status": "warning",
-                    "safe_response": corrected if corrected != "No correction needed" else response,
-                    "issues": errors,
-                    "corrections_made": corrected != "No correction needed"
-                }
+        # prices outside any product line (opening text, or a reply with no product lines)
+        outside = response[:claims[0].start()] if claims else response
+        for raw in self._PRICE_RE.findall(outside):
+            value = round(float(raw.replace(',', '')), 2)
+            if value not in known_prices and value not in query_numbers:
+                issues.append(f"Price ${value:.2f} matches no product in the results")
 
-            return {"status": "pass", "safe_response": response, "issues": [], "corrections_made": False}
-
-        except Exception as e:
-            from .gateway_client import GatewayPolicyBlock
-            if isinstance(e, GatewayPolicyBlock):
-                raise
-            print(f"[OUTPUT GUARDRAIL] Accuracy check error: {e}")
-            return {"status": "pass", "safe_response": response, "issues": [f"Accuracy check error: {str(e)}"], "corrections_made": False}
-
-    def _format_products_for_validation(self, products: List[dict]) -> str:
-        formatted = []
-        for idx, product in enumerate(products, 1):
-            metadata = product.get('metadata', {})
-            name = metadata.get('name', 'Unknown')
-            brand = metadata.get('brand', 'Unknown')
-            price = metadata.get('price', '0')
-
-            try:
-                price_float = float(str(price).replace('$', '').replace(',', ''))
-                price_str = f"${price_float:.2f}"
-            except (ValueError, TypeError):
-                price_str = str(price)
-
-            formatted.append(f"{idx}. {name} by {brand} - {price_str}")
-
-        return "\n".join(formatted)
+        if not issues:
+            return ok
+        if rewrite:
+            return {"status": "warning", "safe_response": self._rebuild_response(response, facts),
+                    "issues": issues, "corrections_made": True}
+        return {"status": "warning", "safe_response": response, "issues": issues, "corrections_made": False}
 
     def _parse_guardrail_response(self, content: str) -> Tuple[str, List[str], str]:
         status = "PASS"
@@ -275,24 +313,3 @@ class OutputGuardrail:
             corrected = corrected_match.group(1).strip()
 
         return status, issues, corrected
-
-    def _parse_validation_response(self, content: str) -> Tuple[str, List[str], str]:
-        status = "PASS"
-        errors = []
-        corrected = ""
-
-        status_match = re.search(r'ACCURACY_STATUS:\s*(PASS|FAIL|WARNING)', content, re.IGNORECASE)
-        if status_match:
-            status = status_match.group(1).upper()
-
-        errors_match = re.search(r'ERRORS_FOUND:\s*(.+?)(?=CORRECTED_RESPONSE:|$)', content, re.DOTALL | re.IGNORECASE)
-        if errors_match:
-            errors_text = errors_match.group(1).strip()
-            if errors_text.lower() != "none":
-                errors = [e.strip() for e in errors_text.split('\n') if e.strip() and not e.strip().startswith('CORRECTED')]
-
-        corrected_match = re.search(r'CORRECTED_RESPONSE:\s*(.+)', content, re.DOTALL | re.IGNORECASE)
-        if corrected_match:
-            corrected = corrected_match.group(1).strip()
-
-        return status, errors, corrected

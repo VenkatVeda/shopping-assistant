@@ -7,7 +7,7 @@ import os, subprocess, sys
 here = os.path.dirname(os.path.abspath(__file__))
 env = dict(os.environ, MLFLOW_DISABLE_AGENT_HINT="1", PYTHONIOENCODING="utf-8")
 bad = []
-MY_TESTS = ['test_callback_dedupe.py', 'test_callback_errors_and_timing.py', 'test_callback_latency.py', 'test_gateway_client_request_id.py', 'test_sync_gateway_policies.py', 'test_tracer_runs_node_once.py', 'test_e2e_blocked_request.py', 'test_guardrail_and_output_logging.py', 'test_block_messages.py']
+MY_TESTS = ['test_callback_dedupe.py', 'test_callback_errors_and_timing.py', 'test_callback_latency.py', 'test_gateway_client_request_id.py', 'test_sync_gateway_policies.py', 'test_tracer_runs_node_once.py', 'test_e2e_blocked_request.py', 'test_guardrail_and_output_logging.py', 'test_block_messages.py', 'test_output_fact_check.py']
 for name in MY_TESTS:
     r = subprocess.run([sys.executable, os.path.join(here, name)], capture_output=True, text=True, env=env, encoding="utf-8")
     out = r.stdout
