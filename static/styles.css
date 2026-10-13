@@ -800,12 +800,13 @@ button:hover {
     position: absolute;
     top: 8px;
     right: 8px;
-    background: rgba(255,255,255,0.85);
-    border: none;
+    background: rgba(255,255,255,0.95);
+    color: #f15f2e;
+    border: 1.5px solid rgba(241,95,46,0.45);
     border-radius: 50%;
     width: 32px;
     height: 32px;
-    font-size: 18px;
+    font-size: 20px;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -817,7 +818,7 @@ button:hover {
 }
 
 .wishlist-heart-btn:hover { transform: scale(1.15); }
-.wishlist-heart-btn.in-wishlist { background: #fff0e8; }
+.wishlist-heart-btn.in-wishlist { background: #fff0e8; border-color: #f15f2e; color: #d9431a; }
 
 /* Wishlist item card */
 .wishlist-item {

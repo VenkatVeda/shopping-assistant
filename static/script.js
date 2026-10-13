@@ -45,7 +45,12 @@ document.addEventListener('DOMContentLoaded', () => {
 function getCookie(name) {
     const value = `; ${document.cookie}`;
     const parts = value.split(`; ${name}=`);
-    if (parts.length === 2) return parts.pop().split(';').shift();
+    if (parts.length === 2) {
+        // a value containing a space is stored quoted ("Venkat Vedanarayanan"); unquote it
+        return parts.pop().split(';').shift()
+            .replace(/^"(.*)"$/, '$1')
+            .replace(/\\(\d{3})/g, (m, oct) => String.fromCharCode(parseInt(oct, 8)));
+    }
     return null;
 }
 
