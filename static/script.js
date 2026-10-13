@@ -270,7 +270,7 @@ async function handleSend() {
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60-second timeout
+    const timeoutId = setTimeout(() => controller.abort(), 150000); // 150 s: gateway calls run one after another (~9-16 s each); the Apps proxy allows 300 s
 
     try {
         // Call API
