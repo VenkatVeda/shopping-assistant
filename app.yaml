@@ -7,8 +7,9 @@ env:
   - name: FLASK_SECRET_KEY
     valueFrom: flask-secret-key
 
+  # Off until profile storage is rebuilt (user_profiles schema mismatch; ~10-15 s per request)
   - name: ENABLE_PERSONALIZATION
-    value: "true"
+    value: "false"
 
   # JWT Configuration
   - name: JWT_SECRET_KEY
