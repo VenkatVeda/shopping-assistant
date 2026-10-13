@@ -53,7 +53,7 @@ import logging
 import threading
 import uuid
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -1099,3 +1099,375 @@ class AuditTrailCallback(BaseCallbackHandler):
             status       = "success",
             subject_ref  = _current_subject_ref.get() or None,
         )
+
+
+# ── Erasure job ───────────────────────────────────────────────────────────
+# Weekly Databricks job that carries out "Delete My Account" requests.
+#
+#   python audit_wrapper.py process-erasures --app-id myre_app --warehouse-id <id> [--execute]
+#   python audit_wrapper.py vacuum-erasures  --app-id myre_app --warehouse-id <id> [--execute]
+#
+# Without --execute both commands only READ and print what they would do.
+# Works in the shopping_assistant catalog only. It does NOT touch user_data.cart_items,
+# wishlist_items, orders, the three *_events_raw tables or anything outside the catalog.
+
+ERASURE_CATALOG        = "shopping_assistant"
+ERASURE_PII_TABLES     = ("raw_logs.customer_pii", "raw_logs.feedback_pii")
+ERASURE_FLAG_TABLES    = ("ai_interactions_raw", "sessions_raw", "node_executions_raw",
+                          "guardrail_results_raw", "model_outputs_raw", "tool_calls_raw",
+                          "human_feedback_raw")
+ERASURE_ACTIVE_STATES  = ("pending", "processing", "failed")
+ERASURE_DEFAULT_DAYS   = 30          # used when a regulation has no active retention_policy row
+ERASURE_MIN_VACUUM_HRS = 168         # Delta will not vacuum below the 7-day file retention
+ERASURE_ACTION_TAKEN   = "pii_deleted_audit_flagged"
+
+
+class _ErasureSql:
+    """Synchronous SQL on a warehouse: waits for the result and raises on failure
+    (the fire-and-forget _write_row cannot tell the caller that a DELETE worked)."""
+
+    def __init__(self, warehouse_id: str):
+        from databricks.sdk import WorkspaceClient
+        self._w = WorkspaceClient()
+        self._wh = warehouse_id
+
+    def run(self, sql: str, params: Optional[dict] = None) -> list:
+        from databricks.sdk.service.sql import StatementParameterListItem, StatementState
+        plist = [StatementParameterListItem(name=k, value=None if v is None else str(v))
+                 for k, v in (params or {}).items()]
+        r = self._w.statement_execution.execute_statement(
+            warehouse_id=self._wh, statement=sql, parameters=plist or None, wait_timeout="50s")
+        give_up = time.time() + 900          # a stopped serverless warehouse needs a moment to start
+        while r.status.state in (StatementState.PENDING, StatementState.RUNNING):
+            if time.time() > give_up:
+                raise RuntimeError("SQL statement did not finish in 15 minutes")
+            time.sleep(3)
+            r = self._w.statement_execution.get_statement(r.statement_id)
+        if r.status.state != StatementState.SUCCEEDED:
+            msg = r.status.error.message if r.status.error else str(r.status.state)
+            raise RuntimeError(f"SQL failed: {msg}")
+        return (r.result.data_array if r.result and r.result.data_array else [])
+
+
+def _parse_ts(value) -> datetime:
+    """'2026-10-12 08:30:00' (UTC) -> aware datetime."""
+    return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+class ErasureProcessor:
+    """Carries out erasure requests for ONE app_id.
+
+    Per request: intake -> delete PII -> append erasure flag rows -> verify -> record proof.
+    Any failure is recorded as status 'failed' with a reason and retried by the next run.
+    """
+
+    def __init__(self, wrapper: "AuditWrapper", sql=None, warehouse_id: str = None,
+                 execute: bool = False, max_requests: int = 20, out=print):
+        if wrapper.catalog != ERASURE_CATALOG:
+            raise ValueError(f"Erasure job works in catalog '{ERASURE_CATALOG}' only, got '{wrapper.catalog}'")
+        self.w            = wrapper
+        self.app_id       = wrapper.app_id
+        self.sql          = sql or _ErasureSql(warehouse_id)
+        self.execute      = execute
+        self.max_requests = max_requests
+        self.out          = out
+        self.t_req        = f"{ERASURE_CATALOG}.user_data.erasure_requests"
+        self.t_rep_req    = self.w._tbl("reporting.erasure_requests")
+        self.t_rep_audit  = self.w._tbl("reporting.erasure_audit_records")
+        self.t_policy     = self.w._tbl("reporting.retention_policy")
+        self.t_log        = self.w._tbl("reporting.retention_enforcement_log")
+
+    # ── small helpers ─────────────────────────────────────────────────────
+
+    def _insert(self, table: str, row: dict) -> None:
+        cols = [c for c, v in row.items() if v is not None and v != ""]
+        self.sql.run(
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join(':' + c for c in cols)})",
+            {c: row[c] for c in cols})
+
+    def _count(self, sql: str, params: dict) -> int:
+        rows = self.sql.run(sql, params)
+        return int(rows[0][0]) if rows else 0
+
+    def _policy_days(self) -> dict:
+        """regulation -> (erasure_days, erasure_vacuum_days) from the ACTIVE pii_tables policy rows."""
+        rows = self.sql.run(
+            f"SELECT regulation, max(erasure_days), max(erasure_vacuum_days) FROM {self.t_policy} "
+            f"WHERE app_id = :app AND data_type = 'pii_tables' AND is_active = true GROUP BY regulation",
+            {"app": self.app_id})
+        return {r[0]: (int(r[1]), int(r[2])) for r in rows}
+
+    def _days_for(self, regulation: str, policy: dict) -> tuple:
+        if regulation in policy:
+            return policy[regulation]
+        return policy.get("INTERNAL_POLICY", (ERASURE_DEFAULT_DAYS, 7))
+
+    # ── process-erasures ──────────────────────────────────────────────────
+
+    def process_pending(self) -> dict:
+        policy = self._policy_days()
+        reqs = self.sql.run(
+            f"SELECT request_id, subject_ref, regulation, date_format(requested_at, 'yyyy-MM-dd HH:mm:ss') "
+            f"FROM {self.t_req} WHERE app_id = :app AND status IN "
+            f"({', '.join(repr(s) for s in ERASURE_ACTIVE_STATES)})", {"app": self.app_id})
+        todo = []
+        for rid, sref, reg, requested_at in reqs:
+            reg = reg or "UNKNOWN"
+            days, _ = self._days_for(reg, policy)
+            received = _parse_ts(requested_at)
+            todo.append({"request_id": rid, "subject_ref": sref, "regulation": reg,
+                         "received": received, "deadline": received + timedelta(days=days)})
+        todo.sort(key=lambda r: r["deadline"])          # nearest deadline first
+        self.out(f"[ERASURE] app={self.app_id} mode={'EXECUTE' if self.execute else 'DRY RUN'} "
+                 f"requests found={len(todo)} (processing at most {self.max_requests})")
+        result = {"found": len(todo), "completed": 0, "failed": 0, "planned": 0}
+        for req in todo[: self.max_requests]:
+            try:
+                self._process_one(req)
+                result["completed" if self.execute else "planned"] += 1
+            except Exception as exc:                                 # one bad request must not stop the rest
+                result["failed"] += 1
+                self.out(f"[ERASURE] request {req['request_id']} FAILED: {exc}")
+                if self.execute:
+                    self._mark_failed(req, str(exc))
+        self.out(f"[ERASURE] done: {result}")
+        return result
+
+    def _process_one(self, req: dict) -> None:
+        rid, sref, reg = req["request_id"], req["subject_ref"], req["regulation"]
+        app = self.app_id
+        self.out(f"[ERASURE] request {rid} regulation={reg} deadline={req['deadline']:%Y-%m-%d}")
+
+        pii_where = {
+            "raw_logs.customer_pii": ("subject_ref", {"sr": sref, "app": app}),
+            "raw_logs.feedback_pii": ("reviewer_subject_ref", {"sr": sref, "app": app}),
+        }
+        before = {t: self._count(f"SELECT count(*) FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app", p)
+                  for t, (col, p) in pii_where.items()}
+        traces = sorted(r[0] for r in self.sql.run(
+            f"SELECT DISTINCT trace_id FROM {self.w._tbl('raw_logs.ai_interactions_raw')} "
+            f"WHERE subject_ref = :sr AND app_id = :app AND NOT coalesce(is_erasure_flag, false) "
+            f"AND trace_id IS NOT NULL", {"sr": sref, "app": app}))
+        self.out(f"           personal-data rows: {before}; traces: {len(traces)}")
+
+        if not self.execute:
+            for t in ERASURE_FLAG_TABLES:
+                self.out(f"           would flag {t}: {len(self._unflagged(t, sref, traces))} new row(s)")
+            return
+
+        self._set_state(rid, "processing")
+        if not self._intake_exists(rid):
+            self._insert(self.t_rep_req, self._req_row(req, "pending"))
+
+        # 1. delete the personal data (customer_pii + reviewer rows in feedback_pii)
+        for t, (col, p) in pii_where.items():
+            self.sql.run(f"DELETE FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app", p)
+
+        # 2. append the erasure flag rows (originals are never changed; the tables are append-only)
+        flagged = {}
+        for t in ERASURE_FLAG_TABLES:
+            rows = self._unflagged(t, sref, traces)
+            for row in rows:
+                self._insert(self.w._tbl(f"raw_logs.{t}"), self._flag_row(t, row, req))
+            flagged[t] = len(rows)
+
+        # 3. verify before anything is recorded as completed
+        for t, (col, p) in pii_where.items():
+            left = self._count(f"SELECT count(*) FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app", p)
+            if left:
+                raise RuntimeError(f"{t} still has {left} row(s) for the subject after delete")
+        for t in ERASURE_FLAG_TABLES:
+            if self._originals(t, sref) and not self._flags_exist(t, sref):
+                raise RuntimeError(f"no erasure flag row found in {t}")
+
+        # 4. proof + close the request
+        erased_at = datetime.now(timezone.utc)
+        deleted = sum(before.values())
+        self._insert(self.t_rep_audit, {
+            "audit_id": str(uuid.uuid4()), "request_id": rid, "app_id": app, "regulation": reg,
+            "traces_affected": len(traces), "pii_rows_deleted": deleted,
+            "action_taken": ERASURE_ACTION_TAKEN,
+            "verification_hash": self.w._hmac("|".join(traces)),
+            "legal_basis": f"{reg} right to erasure",
+            "within_deadline": "true" if erased_at <= req["deadline"] else "false",
+            "erased_at": erased_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": erased_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "schema_version": self.w.schema_version,
+        })
+        self._insert(self.t_rep_req, self._req_row(req, "completed", completed_at=erased_at))
+        self._set_state(rid, "completed", notes=f"pii_rows_deleted={deleted}; traces_flagged={len(traces)}")
+        self.out(f"           completed: pii_rows_deleted={deleted}, flag rows={flagged}")
+
+    # ── flag-row helpers ──────────────────────────────────────────────────
+
+    def _originals(self, table: str, sref: str) -> int:
+        extra = " OR reviewer_subject_ref = :sr" if table == "human_feedback_raw" else ""
+        return self._count(
+            f"SELECT count(*) FROM {self.w._tbl('raw_logs.' + table)} WHERE app_id = :app AND "
+            f"(subject_ref = :sr{extra}) AND NOT coalesce(is_erasure_flag, false)",
+            {"sr": sref, "app": self.app_id})
+
+    def _flags_exist(self, table: str, sref: str) -> int:
+        return self._count(
+            f"SELECT count(*) FROM {self.w._tbl('raw_logs.' + table)} WHERE app_id = :app AND "
+            f"subject_ref = :sr AND is_erasure_flag = true", {"sr": sref, "app": self.app_id})
+
+    def _unflagged(self, table: str, sref: str, traces: list) -> list:
+        """What still needs a flag row. ai_interactions_raw: one per trace. Other tables: one
+        per subject (the safe views match a flag row to a subject_ref in the same table)."""
+        if table == "ai_interactions_raw":
+            done = {r[0] for r in self.sql.run(
+                f"SELECT DISTINCT trace_id FROM {self.w._tbl('raw_logs.ai_interactions_raw')} "
+                f"WHERE app_id = :app AND subject_ref = :sr AND is_erasure_flag = true AND trace_id IS NOT NULL",
+                {"sr": sref, "app": self.app_id})}
+            return [t for t in traces if t not in done]
+        if self._originals(table, sref) and not self._flags_exist(table, sref):
+            return [None]
+        return []
+
+    def _flag_row(self, table: str, trace_id, req: dict) -> dict:
+        now = _now_iso()
+        base = {"app_id": self.app_id, "subject_ref": req["subject_ref"], "is_erasure_flag": "true",
+                "created_at": now, "schema_version": self.w.schema_version}
+        tid = f"erasure-{req['request_id']}"
+        per_table = {
+            "ai_interactions_raw": {"trace_id": trace_id, "request_timestamp": now, "model_name": "ERASED",
+                                    "status": "erased", "app_metadata": f"erasure_{req['regulation']}"},
+            "sessions_raw":        {"session_id": str(uuid.uuid4()), "started_at": now},
+            "node_executions_raw": {"node_execution_id": str(uuid.uuid4()), "trace_id": tid,
+                                    "node_name": "erasure_flag", "status": "erased", "started_at": now},
+            "guardrail_results_raw": {"guardrail_id": str(uuid.uuid4()), "trace_id": tid,
+                                      "policy_name": "erasure_flag", "result": "erased",
+                                      "triggered_block": "false", "checked_at": now},
+            "model_outputs_raw":   {"output_id": str(uuid.uuid4()), "trace_id": tid, "generated_at": now},
+            "tool_calls_raw":      {"tool_call_id": str(uuid.uuid4()), "trace_id": tid,
+                                    "tool_name": "erasure_flag", "status": "erased", "called_at": now},
+            "human_feedback_raw":  {"feedback_id": str(uuid.uuid4()), "trace_id": tid,
+                                    "feedback_type": "erasure_flag", "feedback_at": now},
+        }
+        return {**base, **per_table[table]}
+
+    # ── request bookkeeping ───────────────────────────────────────────────
+
+    def _req_row(self, req: dict, status: str, completed_at=None, blocked_reason=None) -> dict:
+        now = _now_iso()
+        return {
+            "request_id": req["request_id"], "app_id": self.app_id, "subject_ref": req["subject_ref"],
+            "regulation": req["regulation"],
+            "request_received_at": req["received"].strftime("%Y-%m-%d %H:%M:%S"),
+            "request_deadline":    req["deadline"].strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status, "blocked_reason": blocked_reason,
+            "completed_at": completed_at.strftime("%Y-%m-%d %H:%M:%S") if completed_at else None,
+            "created_at": now, "schema_version": self.w.schema_version,
+        }
+
+    def _intake_exists(self, rid: str) -> bool:
+        return self._count(f"SELECT count(*) FROM {self.t_rep_req} WHERE request_id = :rid", {"rid": rid}) > 0
+
+    def _set_state(self, rid: str, status: str, notes: str = None) -> None:
+        stamp = ", processed_at = current_timestamp()" if status == "completed" else ""
+        self.sql.run(f"UPDATE {self.t_req} SET status = :st, notes = :notes{stamp} "
+                     f"WHERE request_id = :rid AND app_id = :app",
+                     {"st": status, "notes": notes, "rid": rid, "app": self.app_id})
+
+    def _mark_failed(self, req: dict, reason: str) -> None:
+        try:
+            if not self._intake_exists(req["request_id"]):
+                self._insert(self.t_rep_req, self._req_row(req, "pending"))
+            self._insert(self.t_rep_req, self._req_row(req, "failed", blocked_reason=reason[:500]))
+            self._set_state(req["request_id"], "failed", notes=reason[:500])
+        except Exception as exc:
+            self.out(f"[ERASURE] could not record failure for {req['request_id']}: {exc}")
+
+    # ── vacuum-erasures ───────────────────────────────────────────────────
+
+    def vacuum_completed(self) -> dict:
+        """VACUUM the two personal-data tables once a completed request has aged past its
+        erasure_vacuum_days. Until then the deleted rows can be recovered with time travel."""
+        policy = self._policy_days()
+        done = self.sql.run(
+            f"SELECT r.request_id, r.regulation, date_format(r.completed_at, 'yyyy-MM-dd HH:mm:ss') "
+            f"FROM {self.t_rep_req} r WHERE r.app_id = :app AND r.status = 'completed' AND r.completed_at IS NOT NULL",
+            {"app": self.app_id})
+        last = self.sql.run(
+            f"SELECT date_format(max(created_at), 'yyyy-MM-dd HH:mm:ss') FROM {self.t_log} "
+            f"WHERE app_id = :app AND vacuum_type = 'pii_erasure_vacuum' AND status = 'success'", {"app": self.app_id})
+        last_run = _parse_ts(last[0][0]) if last and last[0][0] else None
+        now = datetime.now(timezone.utc)
+        eligible = []
+        for rid, reg, completed in done:
+            completed_at = _parse_ts(completed)
+            days = self._days_for(reg or "UNKNOWN", policy)[1]
+            if completed_at + timedelta(days=days) <= now and (last_run is None or completed_at > last_run):
+                eligible.append(days)
+        self.out(f"[VACUUM] app={self.app_id} mode={'EXECUTE' if self.execute else 'DRY RUN'} "
+                 f"completed requests now past their vacuum window and not yet vacuumed: {len(eligible)}")
+        if not eligible:
+            return {"vacuumed": 0}
+        hours = max(ERASURE_MIN_VACUUM_HRS, min(eligible) * 24)
+        for t in ERASURE_PII_TABLES:
+            self.out(f"[VACUUM] {t} RETAIN {hours} HOURS" + ("" if self.execute else "  (not run)"))
+            if not self.execute:
+                continue
+            status, err = "success", None
+            try:
+                self.sql.run(f"VACUUM {self.w._tbl(t)} RETAIN {hours} HOURS")
+            except Exception as exc:
+                status, err = "failed", str(exc)[:500]
+            self._insert(self.t_log, {
+                "log_id": str(uuid.uuid4()), "app_id": self.app_id, "run_date": now.strftime("%Y-%m-%d"),
+                "table_name": t.split(".")[-1], "vacuum_run": "true" if status == "success" else "false",
+                "vacuum_type": "pii_erasure_vacuum", "vacuum_threshold_days": hours // 24, "status": status,
+                "error_message": err, "created_at": _now_iso(), "schema_version": self.w.schema_version})
+            if status == "failed":
+                raise RuntimeError(f"VACUUM {t} failed: {err}")
+        return {"vacuumed": len(ERASURE_PII_TABLES)}
+
+
+def _split_app_ids(value: str) -> list:
+    """'a, b,a' -> ['a', 'b'] (order kept, duplicates and blanks dropped)."""
+    seen, out = set(), []
+    for part in (value or "").split(","):
+        part = part.strip()
+        if part and part not in seen:
+            seen.add(part)
+            out.append(part)
+    return out
+
+
+def run_erasure_cli(argv=None) -> int:
+    """Entry point for the weekly job. Returns 0 on success, 1 if anything failed.
+    --app-id may list several app ids (comma separated); each is processed on its own,
+    and every delete is filtered by that app_id."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="audit_wrapper.py", description="Erasure job")
+    ap.add_argument("command", choices=["process-erasures", "vacuum-erasures"])
+    ap.add_argument("--app-id", required=True, help="one app id, or several separated by commas")
+    ap.add_argument("--warehouse-id", required=True)
+    ap.add_argument("--catalog", default=ERASURE_CATALOG)
+    ap.add_argument("--execute", action="store_true", help="really delete/write; default is a dry run")
+    ap.add_argument("--max-requests", type=int, default=20)
+    a = ap.parse_args(argv)
+    app_ids = _split_app_ids(a.app_id)
+    if not app_ids:
+        print("[ERASURE] no app id given")
+        return 1
+    os.environ["DATABRICKS_SQL_WAREHOUSE_ID"] = a.warehouse_id
+    rc = 0
+    for app_id in app_ids:
+        try:
+            wrapper = AuditWrapper(app_id=app_id, catalog=a.catalog)
+            proc = ErasureProcessor(wrapper, warehouse_id=a.warehouse_id, execute=a.execute,
+                                    max_requests=a.max_requests)
+            res = proc.process_pending() if a.command == "process-erasures" else proc.vacuum_completed()
+            if res.get("failed"):
+                rc = 1
+        except Exception as exc:
+            print(f"[ERASURE] {a.command} FAILED for app {app_id}: {exc}")
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(run_erasure_cli())

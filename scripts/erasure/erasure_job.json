@@ -1,0 +1,39 @@
+{
+  "name": "shopping-assistant-erasure-weekly",
+  "description": "Weekly: delete personal data of users who clicked Delete My Account (customer_pii, feedback_pii), flag their audit rows, then VACUUM after the recovery window. Starts as a DRY RUN (execute=false). shopping_assistant catalog only.",
+  "max_concurrent_runs": 1,
+  "queue": { "enabled": true },
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 ? * MON",
+    "timezone_id": "Asia/Kolkata",
+    "pause_status": "PAUSED"
+  },
+  "email_notifications": { "on_failure": ["nupur@xponent.ai"] },
+  "tasks": [
+    {
+      "task_key": "process_erasures",
+      "notebook_task": {
+        "notebook_path": "/Users/nupur@xponent.ai/Audit-trail-main/09_erasure_job",
+        "base_parameters": {
+          "command": "process-erasures",
+          "app_id": "myre_app,ecom-shop-assistant-dev",
+          "warehouse_id": "8eba55b5eb828697",
+          "execute": "false"
+        }
+      }
+    },
+    {
+      "task_key": "vacuum_erasures",
+      "depends_on": [ { "task_key": "process_erasures" } ],
+      "notebook_task": {
+        "notebook_path": "/Users/nupur@xponent.ai/Audit-trail-main/09_erasure_job",
+        "base_parameters": {
+          "command": "vacuum-erasures",
+          "app_id": "myre_app,ecom-shop-assistant-dev",
+          "warehouse_id": "8eba55b5eb828697",
+          "execute": "false"
+        }
+      }
+    }
+  ]
+}
