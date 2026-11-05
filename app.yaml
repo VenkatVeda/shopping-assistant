@@ -61,7 +61,7 @@ env:
 
   # Audit Trail Configuration
   - name: AUDIT_APP_ID
-    value: "myre_app"
+    value: "ecom-shop-assistant-dev"
   - name: AUDIT_CATALOG
     valueFrom: audit-catalog
   - name: AUDIT_SECRET_SCOPE
