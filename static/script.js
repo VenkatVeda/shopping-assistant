@@ -572,6 +572,119 @@ function displaySingleProduct(productContext) {
 }
 
 // Create product card HTML
+// ── Inventory check ("Check if the product is in stock") ──────────
+
+const INVENTORY_CHECK_URL = `${API_BASE_URL}/inventory/check`;
+const INVENTORY_CHECK_TIMEOUT_MS = 75000;  // backend allows 30 s plus one retry
+const INVENTORY_SLOW_HINT_MS = 5000;
+const inventoryInFlight = new Set();       // product ids with a check running
+
+const INVENTORY_MESSAGES = {
+    loading:      'Checking stock…',
+    slow:         'Still checking — this can take a few seconds…',
+    in_stock:     'In stock',
+    out_of_stock: 'Out of stock',
+    not_found:    "We couldn't find this product in our inventory.",
+    unknown:      "We couldn't check this right now, please try again.",
+    rateLimited:  'Too many checks — please try again shortly.',
+    error:        'Something went wrong while checking this product. Please try again.',
+};
+const INVENTORY_ICONS = { in_stock: '✓', out_of_stock: '✕', not_found: '?', unknown: '!', error: '!' };
+
+function buildInventoryCheckHtml(productId) {
+    return `
+        <div class="inventory-check">
+            <button type="button" class="inventory-check-btn" data-product-id="${escapeHtml(productId)}"
+                onclick="checkInventory(this, event)">Check if the product is in stock</button>
+            <div class="inventory-result" role="status" aria-live="polite"></div>
+        </div>`;
+}
+
+function showInventoryResult(resultEl, state, text, asOf) {
+    resultEl.className = `inventory-result inventory-result--${state}`;
+    resultEl.textContent = '';
+
+    const icon = document.createElement('span');
+    icon.setAttribute('aria-hidden', 'true');
+    if (state === 'loading') {
+        icon.className = 'inventory-spinner';
+    } else {
+        icon.className = 'inventory-icon';
+        icon.textContent = INVENTORY_ICONS[state] || '';
+    }
+    const body = document.createElement('span');
+    body.className = 'inventory-text';
+    body.textContent = text;
+    resultEl.append(icon, body);
+
+    const when = asOf ? new Date(asOf) : null;
+    if (when && !isNaN(when.getTime())) {
+        const stamp = document.createElement('span');
+        stamp.className = 'inventory-asof';
+        stamp.textContent = `Updated ${when.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`;
+        body.append(stamp);
+    }
+}
+
+async function interpretInventoryResponse(resp) {
+    if (resp.status === 429) return { state: 'error', text: INVENTORY_MESSAGES.rateLimited };
+    if (!resp.ok) return { state: 'error', text: INVENTORY_MESSAGES.error };   // 400, 401, 5xx
+    let data = null;
+    try { data = await resp.json(); } catch (_) { /* handled below */ }
+    // Only an exact in_stock / out_of_stock / not_found is shown as such; anything else is "unknown".
+    switch (data && data.status) {
+        case 'in_stock':     return { state: 'in_stock',     text: INVENTORY_MESSAGES.in_stock,     asOf: data.as_of };
+        case 'out_of_stock': return { state: 'out_of_stock', text: INVENTORY_MESSAGES.out_of_stock, asOf: data.as_of };
+        case 'not_found':    return { state: 'not_found',    text: INVENTORY_MESSAGES.not_found };
+        default:             return { state: 'unknown',      text: INVENTORY_MESSAGES.unknown };
+    }
+}
+
+async function checkInventory(btn, event) {
+    if (event) event.stopPropagation();
+    const productId = btn.dataset.productId;
+    if (!productId || inventoryInFlight.has(productId)) return;
+    inventoryInFlight.add(productId);
+
+    const resultEl = btn.parentElement.querySelector('.inventory-result');
+    const hadFocus = document.activeElement === btn;   // a disabled button drops focus; give it back afterwards
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    showInventoryResult(resultEl, 'loading', INVENTORY_MESSAGES.loading);
+
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), INVENTORY_CHECK_TIMEOUT_MS);
+    const slowTimer = setTimeout(
+        () => showInventoryResult(resultEl, 'loading', INVENTORY_MESSAGES.slow), INVENTORY_SLOW_HINT_MS);
+
+    let outcome;
+    try {
+        const body = { product_id: productId };
+        // test only: ?inventory_mock=<status> asks a mock-mode backend for that status
+        const mock = new URLSearchParams(window.location.search).get('inventory_mock');
+        if (mock) body.mock_status = mock;
+        const resp = await fetch(INVENTORY_CHECK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            signal: controller.signal,
+            body: JSON.stringify(body),
+        });
+        outcome = await interpretInventoryResponse(resp);
+    } catch (_) {
+        outcome = { state: 'unknown', text: INVENTORY_MESSAGES.unknown };   // network error or timeout
+    } finally {
+        clearTimeout(abortTimer);
+        clearTimeout(slowTimer);
+        inventoryInFlight.delete(productId);
+    }
+
+    showInventoryResult(resultEl, outcome.state, outcome.text, outcome.asOf);
+    btn.disabled = false;
+    btn.removeAttribute('aria-busy');
+    if (hadFocus) btn.focus();
+}
+
 function createProductCard(product, index) {
     const name = escapeHtml(product.name || 'N/A').substring(0, 80);
     const brand = product.brand || 'N/A';
@@ -579,6 +692,7 @@ function createProductCard(product, index) {
     const imageUrl = product.image || '';
     const url = product.url || '#';
     const productId = product.id || index;
+    const inventoryHtml = product.id ? buildInventoryCheckHtml(String(product.id)) : '';
 
     // Clean up values — hide anything that is empty/unknown/not-specified
     const style   = formatBagStyle(product.bag_style);
@@ -629,6 +743,7 @@ function createProductCard(product, index) {
                         ${cartBtnIcon}
                     </button>
                 </div>
+                ${inventoryHtml}
                 <a href="${url || '#'}" target="_blank" class="product-link" onclick="event.stopPropagation()" ${!url || url === '#' ? 'style="opacity: 0.5; pointer-events: none;"' : ''}>View Product →</a>
             </div>
         </div>

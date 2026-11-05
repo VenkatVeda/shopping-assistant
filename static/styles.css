@@ -393,6 +393,67 @@ button:hover {
     transform: translateX(4px);
 }
 
+/* ── Inventory check ────────────────────────────── */
+.inventory-check { margin-bottom: 10px; }
+
+.inventory-check-btn {
+    display: block;
+    width: 100%;
+    background: #fff;
+    color: #c8441a;
+    border: 1.5px solid #F15F2E;
+    border-radius: 6px;
+    padding: 8px 12px;
+    min-height: 40px;
+    font-weight: 600;
+    font-size: 0.82rem;
+    line-height: 1.25;
+    text-align: center;
+    white-space: normal;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.inventory-check-btn:hover:not(:disabled) { background: #fff0e8; }
+.inventory-check-btn:focus-visible { outline: 3px solid rgba(241, 95, 46, 0.45); outline-offset: 2px; }
+.inventory-check-btn:disabled { opacity: 0.65; cursor: progress; }
+
+.inventory-result {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+.inventory-result:empty { display: none; }
+.inventory-icon { font-weight: 700; flex-shrink: 0; }
+.inventory-text { min-width: 0; }
+.inventory-asof { display: block; margin-top: 2px; font-size: 0.75rem; opacity: 0.85; }
+
+.inventory-result--loading      { background: #f5f5f5; color: #444; }
+.inventory-result--in_stock     { background: #e8f5ec; color: #17612f; }
+.inventory-result--out_of_stock { background: #fdecea; color: #a1261b; }
+.inventory-result--not_found    { background: #f0f0f0; color: #444; }
+.inventory-result--unknown,
+.inventory-result--error        { background: #fff4e0; color: #7a4b00; }
+
+.inventory-spinner {
+    width: 14px;
+    height: 14px;
+    margin-top: 2px;
+    flex-shrink: 0;
+    border: 2px solid #ccc;
+    border-top-color: #F15F2E;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+    .inventory-spinner { animation-duration: 3s; }
+}
+
 /* System Messages */
 .message-system {
     background: #E3F2FD;
