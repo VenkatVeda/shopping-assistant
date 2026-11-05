@@ -28,6 +28,7 @@ from core.auth import (
 )
 from core.performance import get_monitor, get_tracker, track_time
 from core.observability import metrics_store, RequestTrace
+from core.inventory_service import check_inventory, InvalidProductId, unknown_result
 from core.evals import EvalRunner
 from core.geoip import get_country_from_request
 from core.shopping_audit import log_wishlist_action, log_cart_action
@@ -867,6 +868,22 @@ def select_product():
     except Exception as e:
         logger.error(f"Error in select_product: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/inventory/check', methods=['POST'])
+@token_required
+def inventory_check():
+    """Check whether one product is in stock (used by the 'Check if the product is in stock' button)."""
+    data = request.get_json(silent=True) or {}
+    product_id = data.get('product_id')
+    try:
+        return jsonify(check_inventory(product_id, data.get('mock_status'))), 200
+    except InvalidProductId as e:
+        return jsonify({'error': 'Invalid product_id', 'message': str(e)}), 400
+    except Exception as e:
+        # Any failure ends as "unknown", never as a stock status.
+        logger.error(f"Error in inventory_check: {e}", exc_info=True)
+        return jsonify(unknown_result(str(product_id)[:64])), 200
 
 
 @app.route('/api/health', methods=['GET'])
