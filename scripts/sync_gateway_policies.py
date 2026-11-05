@@ -139,6 +139,9 @@ def prepare_gateway_span(row):
         "blocked_policy": row.get("blocked_policy"),
         "action":        (row.get("action") or "").upper(),
         "events":        parse_policy_events(row.get("events_json")),
+        # the last user message and the reply as the gateway stored them, i.e. after its policies ran
+        "final_user_text":  row.get("final_user_text") or None,
+        "final_reply_text": row.get("final_reply_text") or None,
     }
 
 
@@ -297,9 +300,49 @@ def build_child_rows(call, span, children, base):
     return rows, lines
 
 
+FINAL_IO_NODE = "gateway_final_io"
+FINAL_IO_MAX_CHARS = 2000
+
+
+def build_final_io_row(call, span, base, checked_at):
+    """
+    One row with the text the gateway finally sent to the model (last user message) and what the
+    model answered, both as stored in the gateway trace, i.e. after the gateway's own policies.
+    The regex runs over them once more before they are stored.
+
+    Returns None for a blocked call: the gateway keeps the raw prompt of a blocked call, so its
+    text is never copied (only the policy rows are), and for a call whose spans carry no text.
+    """
+    if call["status"] != "success" or span.get("action") == "DENY":
+        return None
+    user_text, reply_text = span.get("final_user_text"), span.get("final_reply_text")
+    if not user_text and not reply_text:
+        return None
+    return {
+        **base,
+        "node_execution_id": str(uuid.uuid4()),
+        "node_name":      FINAL_IO_NODE,
+        "node_type":      "llm",
+        "parent_node_id": call["node_execution_id"],
+        "status":         "success",
+        "model_name":     call.get("model_name"),
+        "input_summary":  _redact_pii(user_text)[:FINAL_IO_MAX_CHARS] if user_text else None,
+        "output_summary": _redact_pii(reply_text)[:FINAL_IO_MAX_CHARS] if reply_text else None,
+        "started_at":     checked_at,
+        "ended_at":       checked_at,
+        "node_metadata":  json.dumps({
+            "source": "gateway_trace",
+            "gateway_request_id": span["gw_request_id"],
+            "otel_trace_id": span["otel_trace_id"],
+            "note": "last user message and reply as the gateway stored them, after its policies; masked again by regex",
+        }),
+    }
+
+
 def build_rows(call, span, children, method, gap_ms, now_iso=None):
     """Return (guardrail_rows, node_rows, display_lines) for one matched call.
-    guardrail_rows: one per policy and phase. node_rows: the judge calls and the model call."""
+    guardrail_rows: one per policy and phase. node_rows: the judge calls, the model call and, for an
+    allowed call, the final text the gateway sent and received (gateway_final_io)."""
     now = now_iso or _now_iso()
     checked_at = _ts_to_iso(span["start_ms"] / 1000.0)
     base = {"trace_id": call["trace_id"], "app_id": call["app_id"], "subject_ref": call["subject_ref"],
@@ -359,6 +402,10 @@ def build_rows(call, span, children, method, gap_ms, now_iso=None):
         lines.append(display_string(name, action, reason))
 
     child_rows, child_lines = build_child_rows(call, span, children or [], base)
+    final_io = build_final_io_row(call, span, base, checked_at)
+    if final_io:
+        child_rows.append(final_io)
+        child_lines.append("final text saved (gateway_final_io)")
     return guardrail_rows, policy_rows + child_rows, lines + child_lines
 
 
@@ -390,6 +437,9 @@ def fetch_audit_calls(w, wh, catalog, since):
         ORDER BY n.created_at""")
 
 
+_MESSAGES_SCHEMA = "array<struct<role:string,parts:array<struct<type:string,content:string>>>>"
+
+
 def fetch_gateway_spans(w, wh, gateway_table, lo_ms, hi_ms, endpoints, agent_id=None):
     ep = ", ".join("'" + e.replace("'", "''") + "'" for e in endpoints)
     agent = f"AND attributes:['gen_ai.agent.id']::string = '{agent_id}'" if agent_id else ""
@@ -403,7 +453,11 @@ def fetch_gateway_spans(w, wh, gateway_table, lo_ms, hi_ms, endpoints, agent_id=
                attributes:['databricks.time_to_first_byte_ms']::string AS ttfb_ms,
                attributes:['databricks.policy.name']::string AS blocked_policy,
                attributes:['databricks.policy.action']::string AS action,
-               to_json(events) AS events_json
+               to_json(events) AS events_json,
+               element_at(filter(from_json(attributes:['gen_ai.input.messages']::string, '{_MESSAGES_SCHEMA}'),
+                                 x -> x.role = 'user'), -1).parts[0].content AS final_user_text,
+               element_at(filter(from_json(attributes:['gen_ai.output.messages']::string, '{_MESSAGES_SCHEMA}'),
+                                 x -> x.role = 'assistant'), -1).parts[0].content AS final_reply_text
         FROM {gateway_table}
         WHERE name LIKE 'ai-gateway%'
           AND unix_millis(time) BETWEEN {lo_ms} AND {hi_ms}
@@ -454,7 +508,9 @@ def insert_rows(w, wh, table, rows, max_params=MAX_PARAMS):
 # ── main ──────────────────────────────────────────────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--profile", help="Databricks CLI profile (never defaulted)", required=True)
+    ap.add_argument("--profile", help="Databricks CLI profile (never defaulted when run by hand)")
+    ap.add_argument("--default-auth", action="store_true",
+                    help="use the ambient credentials instead of a profile (for the scheduled job, where there is no profile)")
     ap.add_argument("--catalog", default=os.getenv("AUDIT_CATALOG", "shopping_assistant"))
     ap.add_argument("--warehouse-id", default=os.getenv("DATABRICKS_SQL_WAREHOUSE_ID"))
     ap.add_argument("--gateway-table", default=GATEWAY_TABLE)
@@ -466,9 +522,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not a.warehouse_id:
         sys.exit("Set --warehouse-id or DATABRICKS_SQL_WAREHOUSE_ID")
+    if not a.profile and not a.default_auth:
+        sys.exit("Pass --profile <name> (a profile is never chosen for you), or --default-auth inside the scheduled job")
 
     from databricks.sdk import WorkspaceClient
-    w = WorkspaceClient(profile=a.profile)
+    w = WorkspaceClient(profile=a.profile) if a.profile else WorkspaceClient()
     since = a.since or (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
 
     calls = [prepare_audit_call(r) for r in fetch_audit_calls(w, a.warehouse_id, a.catalog, since)][: a.limit]

@@ -31,6 +31,7 @@ from core.observability import metrics_store, RequestTrace
 from core.evals import EvalRunner
 from core.geoip import get_country_from_request
 from core.shopping_audit import log_wishlist_action, log_cart_action
+from audit_wrapper import redact_query_report
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -496,7 +497,10 @@ def search():
 
     # Parse early so RequestTrace gets the query string
     data = request.json or {}
-    query = data.get('query', '').strip()
+    # Level-1 redaction: the raw query is redacted here, once, before tracing, logging or the
+    # graph. Everything after this line (history, MLflow, audit tables, the gateway prompt)
+    # only ever sees the redacted text.
+    query, pii_types_found = redact_query_report(data.get('query', '').strip())
     session_id = data.get('session_id') or str(uuid.uuid4())
     user_id = getattr(request, 'user_id', None)
     # Where THIS request is coming from right now — independent of, and never
@@ -522,7 +526,8 @@ def search():
         # Execute workflow with user_id for personalization
         with track_time("workflow_execution"):
             final_state = workflow.process_query(
-                query, session_id, user_id=user_id, request_country=request_country
+                query, session_id, user_id=user_id, request_country=request_country,
+                pii_types_found=pii_types_found,
             )
         
         # Check for errors
@@ -621,7 +626,7 @@ def search():
         generated_response = final_state.get("generated_response")
         safe_response = final_state.get("safe_response")  # Guardrail-validated response
         relaxation_message = final_state.get("relaxation_message")
-        
+
         # Prefer safe_response from guardrail, then generated_response
         if safe_response:
             message = safe_response
@@ -639,7 +644,7 @@ def search():
             message = relaxation_message
         else:
             message = f"Found {len(results)} products matching your criteria!" if results else "No products found. Try adjusting your search criteria."
-        
+
         logger.info(f"Returning {len(formatted_results)} results")
         
         # Check if we're in product discussion mode
@@ -1891,22 +1896,24 @@ def account_delete_request():
         return jsonify({'error': 'Service unavailable'}), 503
 
     try:
-        from core.erasure_store import ErasureStore, ensure_table as erasure_ensure_table
+        from audit_wrapper import (
+            _determine_regulation, erasure_ensure_table,
+            erasure_has_pending_request, erasure_raise_request,
+        )
         erasure_ensure_table()
-        store = ErasureStore(app_id=os.getenv('AUDIT_APP_ID', 'myre_app'))
+        erasure_app_id = os.getenv('AUDIT_APP_ID', 'myre_app')
 
         _, subject_ref = workflow.audit_wrapper._compute_refs(user_id)
 
-        if store.has_pending_request(subject_ref):
+        if erasure_has_pending_request(subject_ref, erasure_app_id):
             return jsonify({
                 'status': 'already_pending',
                 'message': 'A deletion request is already pending for your account.',
             }), 200
 
-        from audit_wrapper import _determine_regulation
         country    = get_country_from_request(request) or os.getenv('DEFAULT_USER_COUNTRY', '')
         regulation = _determine_regulation(country)
-        request_id = store.raise_request(subject_ref=subject_ref, regulation=regulation)
+        request_id = erasure_raise_request(subject_ref, erasure_app_id, regulation)
 
         return jsonify({
             'status':     'raised',

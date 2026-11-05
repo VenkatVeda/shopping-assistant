@@ -231,5 +231,59 @@ sg.fetch_gateway_children(None, "wh", "xponent_prod.`xponent-creds`.unity_gatewa
 check("children are read only for the matched traces, CLIENT spans only",
       "SPAN_KIND_CLIENT" in sent[0][0] and "'o-1', 'o-2'" in sent[0][0])
 
+# ── gateway_final_io: the text the gateway finally sent and received ──────
+# Shape read from the live trace table (6 Oct 2026): the user message already holds [EMAIL_ADDRESS].
+fio_span = {"gw_request_id": "gw-4", "otel_trace_id": "o-4", "start_ms": 1790000000123, "action": "ALLOW", "events": [],
+            "final_user_text": "my name is Tina and email id is [EMAIL_ADDRESS] show me pink bags",
+            "final_reply_text": "Sure, call 555-123-4567 or mail a@b.com for pink bags"}
+_, n_rows, lines = sg.build_rows(call(13, 0, "success", 22, 60), fio_span, [], "request_id", 0)
+fio = [r for r in n_rows if r["node_name"] == "gateway_final_io"]
+check("an allowed call with gateway text gets one gateway_final_io row", len(fio) == 1)
+f = fio[0]
+check("final_io row points at the gateway call and keeps the request id",
+      f["parent_node_id"] == "call-13" and f["node_type"] == "llm" and json.loads(f["node_metadata"])["gateway_request_id"] == "gw-4")
+check("the gateway's placeholder is kept and the regex still masks the name",
+      "[EMAIL_ADDRESS]" in f["input_summary"] and "Tina" not in f["input_summary"] and "[NAME]" in f["input_summary"])
+check("personal data left in the reply is masked again before it is stored",
+      "555-123-4567" not in f["output_summary"] and "a@b.com" not in f["output_summary"]
+      and "[PHONE]" in f["output_summary"] and "[EMAIL]" in f["output_summary"])
+check("the display lines say the final text was saved", "final text saved (gateway_final_io)" in lines)
+long_span = dict(fio_span, final_user_text="x" * 5000)
+_, n_rows, _ = sg.build_rows(call(14, 0, "success", 22, 60), long_span, [], "request_id", 0)
+check("stored text is cut to 2000 characters",
+      len(next(r for r in n_rows if r["node_name"] == "gateway_final_io")["input_summary"]) == 2000)
+_, n_rows, _ = sg.build_rows(call(15, 0, "blocked", policy="block-jailbreak"), dict(fio_span, action="DENY"), [], "request_id", 0)
+check("a blocked call never gets its text copied", not any(r["node_name"] == "gateway_final_io" for r in n_rows))
+_, n_rows, _ = sg.build_rows(call(16, 0, "success", 22, 60), dict(fio_span, action="DENY"), [], "request_id", 0)
+check("a span marked DENY never gets its text copied, whatever the audit status says",
+      not any(r["node_name"] == "gateway_final_io" for r in n_rows))
+_, n_rows, _ = sg.build_rows(call(17, 0, "success", 22, 60), dict(fio_span, final_user_text=None, final_reply_text=None), [], "request_id", 0)
+check("no text in the span -> no gateway_final_io row", not any(r["node_name"] == "gateway_final_io" for r in n_rows))
+check("prepare_gateway_span carries the two texts through",
+      sg.prepare_gateway_span({"final_user_text": "u", "final_reply_text": "r"})["final_user_text"] == "u"
+      and sg.prepare_gateway_span({})["final_reply_text"] is None)
+sent.clear()
+sg.fetch_gateway_spans(None, "wh", "t", 1, 2, ["system.ai.x"])
+check("the span query reads the last user message and the last reply",
+      "gen_ai.input.messages" in sent[0][0] and "gen_ai.output.messages" in sent[0][0] and "-1).parts[0].content" in sent[0][0])
+
+# ── scheduled job: no profile by hand, ambient auth only when asked ────────
+try:
+    sg.main(["--warehouse-id", "wh"])
+    refused = False
+except SystemExit as e:
+    refused = "--profile" in str(e) and "--default-auth" in str(e)
+check("run by hand without --profile or --default-auth, it refuses (a profile is never chosen for you)", refused)
+
+job_path = os.path.join(HERE, "..", "scripts", "gateway_sync", "gateway_sync_job.json")
+job = json.load(open(job_path, encoding="utf-8"))
+check("job file is valid and starts paused and as a dry run",
+      job["schedule"]["pause_status"] == "PAUSED" and job["tasks"][0]["notebook_task"]["base_parameters"]["write"] == "false")
+check("job runs every 15 minutes and never overlaps itself",
+      job["schedule"]["quartz_cron_expression"] == "0 0/15 * * * ?" and job["max_concurrent_runs"] == 1)
+nb = open(os.path.join(HERE, "..", "scripts", "gateway_sync", "10_gateway_sync_job.py"), encoding="utf-8").read()
+check("notebook uses ambient auth and passes --write only when the widget says true",
+      '"--default-auth"' in nb and 'args.append("--write")' in nb and 'get("write") == "true"' in nb)
+
 print("\nRESULT:", "ALL PASSED" if not failures else f"FAILED: {failures}")
 sys.exit(1 if failures else 0)

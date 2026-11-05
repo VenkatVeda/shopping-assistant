@@ -2069,10 +2069,17 @@ class ShoppingAssistantWorkflow:
         haystack = category_clean.lower()
         return any(kw in haystack for kw in self._generate_category_variations(categories))
 
-    def process_query(self, query: str, session_id: str, user_id: str = None, request_country: str = None) -> dict:
+    def process_query(self, query: str, session_id: str, user_id: str = None, request_country: str = None,
+                      pii_types_found: list = None) -> dict:
         """Main entry point for the app"""
+        # Already redacted by app.py::search (which passes the kinds of personal data it found);
+        # repeated here so no other caller can send raw text into the graph. Redacting redacted
+        # text changes nothing, and anything this second pass still finds is added to the labels.
+        from audit_wrapper import redact_query_report
+        query, _found_here = redact_query_report(query)
+        pii_types_found = sorted(set(pii_types_found or []) | set(_found_here))
         config = {"configurable": {"thread_id": session_id}}
-        
+
         try:
             state_snapshot = self.app.get_state(config)
             if state_snapshot and state_snapshot.values:
@@ -2131,6 +2138,20 @@ class ShoppingAssistantWorkflow:
             print(f"[AUDIT] subject_ref computation failed (non-blocking): {_e}")
             _subj = ''
         _current_subject_ref.set(_subj)
+
+        # ── Level-1 redaction record: written now, before the graph runs, so it exists even if a ──
+        # ── later step fails. Level 2 (the gateway's own redaction) is added later by the sync job. ──
+        if self.audit_wrapper:
+            threading.Thread(
+                target=self.audit_wrapper.log_level1_redaction,
+                kwargs={
+                    "trace_id":       pre_trace_id,
+                    "redacted_query": query,
+                    "pii_types":      pii_types_found,
+                    "subject_ref":    _subj or None,
+                },
+                daemon=True,
+            ).start()
 
         # ── KEPT: session logging — needs user email, stays manual ────────────
         _is_new_session = not (

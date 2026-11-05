@@ -51,6 +51,7 @@ import hmac as hmac_lib
 import hashlib
 import logging
 import threading
+import unicodedata
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -101,32 +102,342 @@ def _determine_regulation(country: str = "", state: str = "", sector: str = "") 
     return "INTERNAL_POLICY"
 
 # ── PII redactor ───────────────────────────────────────────────────────────
-_PII_PATTERNS = [
-    ("EMAIL",   r'\b[\w\.-]+@[\w\.-]+\.\w{2,}\b'),
-    ("PHONE",   r'\b(\+?\d{1,3}[\s-]?)?\d{10}\b'),
-    ("AADHAAR", r'\b\d{4}\s?\d{4}\s?\d{4}\b'),
-    ("PAN",     r'\b[A-Z]{5}\d{4}[A-Z]\b'),
-    ("CARD",    r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b'),
-    ("SSN",     r'\b\d{3}-\d{2}-\d{4}\b'),
+# One ordered list of rules. Each rule is (label, regex, flags, check):
+#   * a named group "v" in the regex means only that part is replaced (the keyword before it
+#     stays, e.g. "aadhaar [AADHAAR]"); without it the whole match is replaced
+#   * check (optional) gets the matched value and may veto the match (digit counts, Luhn)
+# The order matters: more specific rules run first, so a 16-digit card is not half-eaten by the
+# Aadhaar or phone rules, and a number that has already been replaced is never matched again
+# (placeholders such as [PHONE] contain no digits, "@" or capital-letter codes).
+# Names are handled by _redact_names (they depend on the words around them, not on a shape).
+
+_DOT = r'(?:\.|\s?[\(\[]dot[\)\]]\s?|\s+dot\s+)'
+_AT = r'(?:@|\s?[\(\[\{]at[\)\]\}]\s?)'
+_EMAIL_DOMAIN = rf'[A-Za-z0-9-]+(?:{_DOT}[A-Za-z0-9-]+)*{_DOT}[A-Za-z]{{2,}}'
+_STD = r'(?:\+?(?:1|44|61|65|91|971|49|33)[\s.-]?)?'    # country codes that may precede a number
+_IN_PREFIX = r'(?:(?:\+?91|0091|0)[\s.-]?)?'
+
+
+def _digits_of(value: str) -> str:
+    return re.sub(r'\D', '', value)
+
+
+def _luhn_ok(digits: str) -> bool:
+    total, flip = 0, False
+    for ch in reversed(digits):
+        n = int(ch)
+        if flip:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+        flip = not flip
+    return total % 10 == 0
+
+
+def _digit_count_between(lo: int, hi: int):
+    return lambda v: lo <= len(_digits_of(v)) <= hi
+
+
+def _intl_ok(v: str) -> bool:
+    """+ or 00 followed by 8 to 15 digits (a UUID piece such as 00972333- is far shorter)."""
+    d = _digits_of(v)
+    if v.lstrip().startswith("00"):
+        d = d[2:]
+    return 8 <= len(d) <= 15
+
+
+def _plain_card_ok(v: str) -> bool:
+    d = _digits_of(v)
+    return len(d) == 16 or _luhn_ok(d)
+
+
+def _iban_ok(v: str) -> bool:
+    flat = re.sub(r'\s', '', v)
+    return 15 <= len(flat) <= 34 and len(_digits_of(flat)) >= 8
+
+
+def _ip_ok(v: str) -> bool:
+    return all(int(p) <= 255 for p in v.split('.'))
+
+
+_I = re.IGNORECASE
+_FILL = r'(?:\s*(?:no\.?|number|num|#|is))*'            # "account number is 123..."
+_RULES = [
+    # ── 1. email and payment handles ──────────────────────────────────────
+    # "john@x.com", "diya @gmail.com", "diya [at] gmail [dot] com", "diya at gmail dot com"
+    ("EMAIL", rf'(?<![\w.+-])[\w.+-]+\s{{0,3}}{_AT}\s{{0,3}}{_EMAIL_DOMAIN}(?![\w-])', 0, None),
+    ("EMAIL", r'(?<![\w.+-])[\w.+-]+\s+at\s+[A-Za-z0-9-]+\s+dot\s+[A-Za-z]{2,}(?![\w-])', _I, None),
+    # UPI id: name@bank, with no dot in the part after the @
+    ("UPI", r'(?<![\w.+-])[\w.+-]{2,}@[A-Za-z][A-Za-z0-9]{1,24}(?![\w.@-])', 0, None),
+
+    # ── 2. numbers introduced by a keyword ("aadhaar ...", "account no ...", "dob ...") ──
+    # These run before the shape rules below so the number gets the right label.
+    ("AADHAAR", rf'\b(?:aadh?aa?r|adh?aa?r|uidai?)\b(?:\s*(?:card|id))*{_FILL}\W{{0,12}}?(?P<v>\d(?:[ \t-]?\d){{11}})(?!\d)', _I, None),
+    ("BANK_ACCOUNT", rf'\b(?:a/c|ac|acct|account)\b{_FILL}\W{{0,8}}?(?P<v>\d(?:[ -]?\d){{7,17}})(?!\d)', _I, _digit_count_between(8, 18)),
+    ("PASSPORT", rf'\bpassport\b{_FILL}\W{{0,8}}?(?P<v>(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{{6,9}})\b', _I, None),
+    ("VOTER_ID", rf'\b(?:voter\s*(?:id|card)|epic)\b{_FILL}\W{{0,8}}?(?P<v>(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{{8,12}})\b', _I, None),
+    ("DRIVING_LICENCE", rf'\b(?:driving\s*licen[cs]e|licen[cs]e|dl)\b{_FILL}\W{{0,8}}?(?P<v>(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{{9,20}})\b', _I, None),
+    ("SSN", r'\bssn\b\W{0,6}(?P<v>\d{9})(?!\d)', _I, None),
+    ("CARD", rf'\b(?:card|credit|debit|cc|visa|master\s?card|amex|rupay)\b(?:\s*card)?{_FILL}\W{{0,6}}?(?P<v>\d[\d \t-]{{11,22}}\d)(?!\d)', _I, _digit_count_between(13, 19)),
+    ("CVV", r'\b(?:cvv2?|cvc2?|security\s+code)\b\W{0,6}(?P<v>\d{3,4})(?!\d)', _I, None),
+    ("CARD_EXPIRY", r'\bexp(?:iry|iration)?(?:\s+date)?\b\W{0,6}(?P<v>\d{1,2}\s?[/-]\s?\d{2,4})(?!\d)', _I, None),
+    ("DOB", r"\b(?:dob|d\.o\.b\.?|date\s+of\s+birth|born\s+(?:on|in)|birth\s*date|birthday|b'?day)\b(?:\s+(?:is|was))?\W{0,8}?"
+            r"(?P<v>\d{1,2}(?:st|nd|rd|th)?[\s/.-]+(?:\d{1,2}|[A-Za-z]{3,9})[\s/.,-]+\d{2,4}"
+            r"|\d{4}[\s/.-]\d{1,2}[\s/.-]\d{1,2}"
+            r"|[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{2,4}|\d{4})(?!\d)", _I, None),
+    ("PINCODE", r'\b(?:pin\s*code|pincode|pin|zip\s*code|zipcode|zip|postal\s+code)\b\W{0,5}(?P<v>\d{5,6}|[A-Z]\d[A-Z]\s?\d[A-Z]\d)(?!\d)', _I, None),
+    # The address stops where the shopping request starts (", show me ...", " and I need ..."),
+    # so the request itself stays readable.
+    ("ADDRESS", r'\bmy\s+(?:(?:home|office|shipping|delivery|billing|current|permanent)\s+)?address(?:\s+is)?\b\W{0,3}'
+                r'(?P<v>(?!\s*\[?[A-Z_]+\])(?:(?!,?\s+(?:and\s+)?(?:please|show|find|get|give|suggest|recommend|need|want|looking|i\s+(?:want|need|am|would)|can\s+you|could\s+you)\b)[^.\n;]){6,80})', _I, None),
+    ("ADDRESS", r'\bi\s+live\s+at\b\W{0,3}'
+                r'(?P<v>(?!\s*\[?[A-Z_]+\])(?:(?!,?\s+(?:and\s+)?(?:please|show|find|get|give|suggest|recommend|need|want|looking|i\s+(?:want|need|am|would)|can\s+you|could\s+you)\b)[^.\n;]){6,80})', _I, None),
+
+    # ── 3. ids with a fixed shape ─────────────────────────────────────────
+    ("IBAN", r'(?<![A-Za-z0-9])[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?(?![A-Za-z0-9])', 0, _iban_ok),
+    ("GSTIN", r'(?<![A-Za-z0-9])\d{2}[A-Za-z]{5}\d{4}[A-Za-z][1-9A-Za-z]Z[0-9A-Za-z](?![A-Za-z0-9])', 0, None),
+    ("IFSC", r'(?<![A-Za-z0-9])[A-Z]{4}0[A-Z0-9]{6}(?![A-Za-z0-9])', 0, None),
+    ("PAN", r'(?<![A-Za-z0-9])[A-Za-z]{5}\d{4}[A-Za-z](?![A-Za-z0-9])', 0, None),
+    ("VEHICLE_NO", r'(?<![A-Za-z0-9])[A-Z]{2}[ -]?\d{2}[ -]?[A-Z]{1,3}[ -]?\d{4}(?![A-Za-z0-9])', 0, None),
+
+    # ── 4. cards (16 digits in groups, 15 digits Amex, or a long run that passes the Luhn check) ──
+    ("CARD", r'(?<![\d-])(?:\d{4}[ \t-]\d{4}[ \t-]\d{4}[ \t-]\d{1,7}|\d{4}[ \t-]\d{6}[ \t-]\d{4,5})(?![\d-])', 0, None),
+    ("CARD", r'(?<![\w.])[3-6]\d{12,18}(?!\d)', 0, _plain_card_ok),
+
+    # ── 5. Aadhaar grouped 4-4-4 ──────────────────────────────────────────
+    ("AADHAAR", r'(?<![\d-])\d{4}[ \t-]\d{4}[ \t-]\d{4}(?![\d-])', 0, None),
+
+    # ── 6. phone numbers ──────────────────────────────────────────────────
+    # with + or 00 in front, any country: +91 84512 45789, +44 7911 123456, 0091-98765-43210
+    ("PHONE", r'(?<![\w.])(?:\+|00)\s?\d{1,3}[\s.-]?\(?\d{1,5}\)?(?:[\s.-]?\d{2,5}){1,4}(?!\w)', 0, _intl_ok),
+    # India mobile, optionally with 91 / 0 in front: 9876543210, 98765 43210, 987-654-3210, 98-7654-3210
+    ("PHONE", rf'(?<![\w.]){_IN_PREFIX}\(?[6-9]\d{{4}}\)?[\s.-]?\d{{5}}(?!\w)', 0, None),
+    ("PHONE", rf'(?<![\w.]){_IN_PREFIX}[6-9]\d{{2}}[\s.-]\d{{3}}[\s.-]\d{{4}}(?!\w)', 0, None),
+    ("PHONE", rf'(?<![\w.]){_IN_PREFIX}[6-9]\d[\s.-]\d{{4}}[\s.-]\d{{4}}(?!\w)', 0, None),
+    ("PHONE", rf'(?<![\w.]){_IN_PREFIX}[6-9]\d{{3}}[\s.-]\d{{3}}[\s.-]\d{{3}}(?!\w)', 0, None),
+    # US / generic 10 digits: 5551234567, 555-123-4567, 555.123.4567, (555) 123-4567
+    ("PHONE", rf'(?<![\w.]){_STD}(?:\(\d{{3}}\)[\s.-]?\d{{3}}[\s.-]?\d{{4}}|\d{{3}}[\s-]?\d{{3}}[\s-]?\d{{4}}|\d{{3}}\.\d{{3}}\.\d{{4}})(?!\w)', 0, None),
+    # landlines with an STD code: 011 23456789, 022-12345678, (011) 23456789; UK mobile 07911 123456
+    ("PHONE", r'(?<![\w.])(?:0\d{2,4}[\s-]\d{6,8}|\(0\d{2,4}\)\s?\d{6,8}|07\d{3}[\s-]?\d{6})(?!\w)', 0, None),
+    # digits spread out one by one: 9 8 7 6 5 4 3 2 1 0
+    ("PHONE", r'(?<![\d])(?:\d[ \t.,-]){9,14}\d(?!\d)', 0, _digit_count_between(10, 15)),
+    # digits written as words: "nine eight seven six five four three two one zero"
+    ("PHONE", r'\b(?:(?:zero|one|two|three|four|five|six|seven|eight|nine|oh)[\s,.-]+){9,}(?:zero|one|two|three|four|five|six|seven|eight|nine|oh)\b', _I, None),
+    # a number that follows "phone", "mobile", "call me", "my number" ... (7 to 15 digits)
+    ("PHONE", rf'\b(?:phone|mobile|mob|cell(?:\s?phone)?|contact|whatsapp|telephone|tel|ph|call\s+me(?:\s+(?:on|at))?|reach\s+me(?:\s+(?:on|at))?|my\s+(?:number|no\.?|num))\b{_FILL}\W{{0,10}}?(?P<v>\+?\(?\d[\d \t().-]{{5,18}}\d)', _I, _digit_count_between(7, 15)),
+
+    # ── 7. what is left: 12 digits in a row, US social security shape, addresses, IPs ──
+    ("AADHAAR", r'(?<![\w.])\d{12}(?!\d)', 0, None),
+    ("SSN", r'(?<![\d-])\d{3}[- ]\d{2}[- ]\d{4}(?![\d-])', 0, None),
+    ("ADDRESS", r'\b\d{1,5}[A-Za-z]?[, ]+(?:[A-Za-z][A-Za-z.\']*\s+){1,4}(?:street|st|road|rd|avenue|ave|lane|ln|drive|boulevard|blvd|nagar|colony|marg)\b\.?', _I, None),
+    ("IP", r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w]|\.\d)', 0, _ip_ok),
 ]
-_NAME_TRIGGERS = [
-    r'(?:i am|my name is|this is|hi,?\s+i.?m)\s+([A-Z][a-z]+(\s+[A-Z][a-z]+)?)',
-]
+_RULES = [(label, re.compile(rx, flags), check) for label, rx, flags, check in _RULES]
+
+
+# ── names ──────────────────────────────────────────────────────────────────
+# A name is only recognised after a phrase that introduces one. The phrase may be in any case.
+#   strong  ("my name is"):           the name may be a lowercase word too
+#   weak    ("i am", "i'm"):          a lowercase word counts only if it cannot be anything else and
+#                                     the text after it clearly ends the name ("i am diya my no. is")
+#   capital ("myself", "call me",     only a capitalised word counts ("call me tomorrow" stays)
+#            "this is")
+_NAME_RULES = (
+    (re.compile(r"(?i:\b(?:my\s+(?:full\s+|first\s+|last\s+)?name\s+is|my\s+name['’]?s|"
+                r"full\s+name\s*(?:is|[:-])|mera\s+naam(?:\s+hai)?))[\s,:-]*"), "strong"),
+    (re.compile(r"(?i:\b(?:i\s+am|i['’]m|im))[\s,]+"), "weak"),
+    (re.compile(r"(?i:\b(?:myself|call\s+me|this\s+is))[\s,]+"), "capital"),
+)
+_NAME_TOKEN = re.compile(r"[^\W\d_]+(?:['’-][^\W\d_]+)*")
+_NAME_STOP = frozenset("""
+a an the this that these those it its i me my we our you your he she they them his her their
+in on at for from to of with by as and or but so if then than too very just also only even still yet
+not no yes here there where when what how why who which while until since into onto about over under
+new old back going gonna want wanna need looking searching shopping trying planning hoping thinking
+wondering buying interested confused curious sure sorry happy glad ready fine good great nice ok okay
+please pls hi hello hey thanks thank show find get give let can could would should will may might must
+do does did have has had is are was were be been being am tall short petite plus size small tired
+medium large big little first last next another other more less some any all each every both either
+shop store bag bags wallet wallets purse purses tote totes backpack backpacks handbag handbags
+tomorrow today tonight now later soon again always never really actually currently basically
+vegetarian vegan student teacher doctor engineer mother father mom dad man woman girl boy lady male female
+married single pregnant allergic vegetarian fan regular customer member visitor user guest
+""".split())
+# words that follow a lowercase name and show it has ended
+_NAME_END = frozenset("""
+and my i here from please pls show find need want looking search get give can could help email mail
+phone mobile no number contact id so but wanna hi hello thanks thank im
+""".split())
+
+
+def _name_ok_lower(word: str) -> bool:
+    """A lowercase word that is not an ordinary word (so it may be a name)."""
+    lw = word.lower()
+    if lw in _NAME_STOP or not 2 <= len(word) <= 20 or lw.endswith(("ing", "less", "ly")):
+        return False
+    return not (len(word) > 5 and lw.endswith(("ed", "ful", "ous", "ive", "able", "ible")))
+
+
+def _read_tokens(text: str, pos: int, limit: int) -> list:
+    """Up to `limit` words that follow each other (single spaces) from pos: [(start, end, word)]."""
+    tokens, i = [], pos
+    while len(tokens) < limit:
+        m = _NAME_TOKEN.match(text, i)
+        if not m:
+            break
+        tokens.append((m.start(), m.end(), m.group(0)))
+        if text[m.end():m.end() + 1] not in (" ", "\t"):
+            break
+        i = m.end() + 1
+        while text[i:i + 1] in (" ", "\t"):
+            i += 1
+    return tokens
+
+
+def _followed_by_end(text: str, end: int) -> bool:
+    """True when the text after a name is the end, punctuation, or a word that closes a name."""
+    rest = text[end:]
+    if not rest.strip():
+        return True
+    if rest[0] in ".,;:!?)\n":
+        return True
+    m = _NAME_TOKEN.match(rest.lstrip())
+    return bool(m and m.group(0).lower() in _NAME_END)
+
+
+def _name_span(text: str, pos: int, kind: str):
+    """(start, end) of the name that starts at pos, or None."""
+    tokens = _read_tokens(text, pos, 3)
+    if not tokens:
+        return None
+    first = tokens[0][2]
+    if first[0].isupper():
+        # "Diya", "Nupur Kawade": capitalised words; a request word ends it ("Diya Show me bags")
+        if first.lower() in _NAME_STOP or len(first) < 2 or first.lower().endswith("ing"):
+            return None
+        end = tokens[0][1]
+        for _, e, w in tokens[1:]:
+            if not w[0].isupper() or w.lower() in _NAME_STOP:
+                break
+            end = e
+        return tokens[0][0], end
+    if kind == "capital":
+        return None
+    if kind == "strong":
+        if first.lower() in _NAME_STOP or first.lower() in _NAME_END or len(first) < 2:
+            return None
+        return tokens[0][0], tokens[0][1]
+    good = []
+    for s, e, w in tokens[:2]:
+        if not _name_ok_lower(w):
+            break
+        good.append((s, e))
+    while good:
+        if _followed_by_end(text, good[-1][1]):
+            return good[0][0], good[-1][1]
+        good.pop()
+    return None
+
+
+def _redact_names(text: str):
+    """(redacted text, found). Replaces the name that follows an introducing phrase with [NAME]."""
+    spans = []
+    for rx, kind in _NAME_RULES:
+        for m in rx.finditer(text):
+            span = _name_span(text, m.end(), kind)
+            if span and not any(span[0] < e and s < span[1] for s, e in spans):
+                spans.append(span)
+    if not spans:
+        return text, False
+    out, last = [], 0
+    for s, e in sorted(spans):
+        out.append(text[last:s])
+        out.append("[NAME]")
+        last = e
+    out.append(text[last:])
+    return "".join(out), True
+
+
+# ── making the text comparable ─────────────────────────────────────────────
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"), None)
+
+
+def _normalize(text: str) -> str:
+    """Digits from other scripts become 0-9, full-width @ becomes @, zero-width characters go,
+    so ०९८७ or a@b.com with a hidden character cannot slip past the rules."""
+    if text.isascii():
+        return text
+    text = text.translate(_ZERO_WIDTH).replace("\uff20", "@")
+    return "".join(
+        str(unicodedata.decimal(ch)) if (not ch.isascii() and unicodedata.category(ch) == "Nd") else ch
+        for ch in text
+    )
+
+
+_PLACEHOLDER_LEAD = re.compile(r'\W*(?:(?:is|was)\W+)?\[[A-Z_]+\]')
+
+
+def _apply_rule(rule, text: str):
+    label, rx, check = rule
+    hit = []
+
+    def _sub(m):
+        if "v" in rx.groupindex and m.start("v") != -1:
+            # a keyword rule must not fire on a placeholder: "[PHONE] 123-45-6789" is not "phone 123..."
+            if m.start() > 0 and m.string[m.start() - 1] == "[":
+                return m.group(0)
+            s, e = m.span("v")
+            # ... and must not redact a placeholder again ("my address is [ADDRESS]" stays as it is)
+            if _PLACEHOLDER_LEAD.match(m.string[s:e]):
+                return m.group(0)
+        else:
+            s, e = m.span()
+        if check and not check(m.string[s:e]):
+            return m.group(0)
+        hit.append(1)
+        return m.string[m.start():s] + f"[{label}]" + m.string[e:m.end()]
+
+    return rx.sub(_sub, text), bool(hit)
+
+
+def _scan(text: str) -> tuple:
+    """(redacted text, sorted list of the kinds of personal data found)."""
+    text = _normalize(text)
+    found = set()
+    for rule in _RULES:
+        text, hit = _apply_rule(rule, text)
+        if hit:
+            found.add(rule[0])
+    text, name_hit = _redact_names(text)
+    if name_hit:
+        found.add("NAME")
+    return text, sorted(found)
+
 
 def _redact_pii(text: str) -> str:
     if not text:
         return text
-    result = text
-    for label, pattern in _PII_PATTERNS:
-        result = re.sub(pattern, f'[{label}]', result)
-    for pattern in _NAME_TRIGGERS:
-        def _rep(m):
-            name = m.group(1)
-            if name is None:
-                return m.group(0)
-            return m.group(0).replace(name, '[NAME]')
-        result = re.sub(pattern, _rep, result, flags=re.IGNORECASE)
-    return result
+    return _scan(text)[0]
+
+
+def redact_query(text: str) -> str:
+    """
+    Level-1 redaction of a shopper's query: the app calls this once, first thing, and uses
+    the result everywhere after (graph, history, tracing, logs, audit tables, gateway prompt).
+    Safe to call again on already-redacted text: the placeholders do not match any rule.
+    """
+    return _redact_pii(text or "")
+
+
+def redact_query_report(text: str) -> tuple:
+    """
+    redact_query, plus which kinds of personal data were found in the text before redaction:
+    returns (redacted_text, sorted list of labels such as ["EMAIL", "NAME", "PHONE"]).
+    Only the labels are kept for the audit trail, never the values.
+    """
+    return _scan(text or "")
+
 
 _UUID_RE = re.compile(
     r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
@@ -135,7 +446,7 @@ _UUID_RE = re.compile(
 def _redact_pii_keep_ids(text: str) -> str:
     """
     _redact_pii, but UUIDs (trace ids, gateway request ids) are left intact.
-    The phone / Aadhaar patterns match any 10-12 digit run, so a UUID whose last
+    The phone / Aadhaar rules match any 10-12 digit run, so a UUID whose last
     segment happens to be all digits would otherwise be replaced by [PHONE] or
     [AADHAAR] and silently lose its value as a join key.
     """
@@ -151,10 +462,10 @@ def _redact_pii_keep_ids(text: str) -> str:
     return result
 
 def _detect_pii_types(text: str) -> list:
-    """Return the list of PII pattern labels found in text (for pii_types_found)."""
+    """Return the sorted kinds of personal data found in text (for pii_types_found)."""
     if not text:
         return []
-    return [label for label, pattern in _PII_PATTERNS if re.search(pattern, text)]
+    return _scan(text)[1]
 
 # ── low-level writer ───────────────────────────────────────────────────────
 def _now_iso() -> str:
@@ -507,8 +818,8 @@ class AuditWrapper:
         try:
             node_execution_id = node_execution_id or str(uuid.uuid4())
             started    = started_at or _now_iso()
-            input_san  = _redact_pii(str(node_input  or ""))
-            output_san = _redact_pii(str(node_output or ""))
+            input_san  = _redact_pii_keep_ids(str(node_input  or ""))
+            output_san = _redact_pii_keep_ids(str(node_output or ""))
 
             # node_metadata → JSON string, PII-redacted.
             # default=str so non-serialisable values degrade instead of raising.
@@ -822,6 +1133,42 @@ class AuditWrapper:
             except Exception as e:
                 logger.warning("[AUDIT] Skipped one guardrail check entry: %s", e)
 
+    def log_level1_redaction(
+        self,
+        trace_id:       str,
+        redacted_query: str,
+        pii_types:      Optional[list] = None,
+        subject_ref:    Optional[str]  = None,
+    ) -> None:
+        """
+        Record the Level-1 redaction the moment it has happened, before the graph runs. Fire-and-forget.
+        Two rows, same trace_id:
+          node_executions_raw     node_name "level1_redaction": the REDACTED query as input_summary
+                                  and the kinds of personal data found in node_metadata.
+          guardrail_results_raw   policy_name "level1_pii_redaction": result "redacted" or "clean".
+        Only labels (EMAIL, PHONE, NAME ...) are stored about what was found, never the values.
+        The text the gateway finally sends (Level 2) is added later by the gateway sync job.
+        """
+        types = sorted(set(pii_types or []))
+        self.log_node_execution(
+            trace_id      = trace_id,
+            node_name     = "level1_redaction",
+            status        = "success",
+            node_input    = redacted_query,
+            node_type     = "guardrail",
+            subject_ref   = subject_ref,
+            node_metadata = {"level": 1, "pii_types_found": types, "query_changed": bool(types)},
+        )
+        self.log_guardrail(
+            trace_id           = trace_id,
+            policy_name        = "level1_pii_redaction",
+            score              = None,
+            result             = "redacted" if types else "clean",
+            triggered_block    = False,
+            subject_ref        = subject_ref,
+            guardrail_metadata = {"level": 1, "pii_types_found": types},
+        )
+
     def log_tool_call(
         self,
         trace_id:      str,
@@ -1102,24 +1449,46 @@ class AuditTrailCallback(BaseCallbackHandler):
 
 
 # ── Erasure job ───────────────────────────────────────────────────────────
-# Weekly Databricks job that carries out "Delete My Account" requests.
+# Databricks job that carries out "Delete My Account" requests.
 #
 #   python audit_wrapper.py process-erasures --app-id myre_app --warehouse-id <id> [--execute]
 #   python audit_wrapper.py vacuum-erasures  --app-id myre_app --warehouse-id <id> [--execute]
+#   python audit_wrapper.py reset-request    --app-id myre_app --warehouse-id <id> --request-id <id> --reason "<why>" [--execute]
 #
-# Without --execute both commands only READ and print what they would do.
-# Works in the shopping_assistant catalog only. It does NOT touch user_data.cart_items,
-# wishlist_items, orders, the three *_events_raw tables or anything outside the catalog.
+# Stage 1 (process-erasures): claim the request -> delete the personal data -> verify -> status 'deleted' (M1).
+# Stage 2 (vacuum-erasures):  once the recovery window has passed, VACUUM both personal-data tables ->
+#                             final sweep for late rows -> status 'completed' (M2) + receipt.
+# reset-request:              clears the "needs review" flag of a request that stopped after too many failures.
+#
+# Without --execute every command only READS and prints what it would do.
+# Works in the shopping_assistant catalog only. NO rows are added to the audit (*_raw) tables: erased people
+# are recorded in reporting.erasure_requests ('deleted' / 'completed' rows) and the proof receipt in
+# reporting.erasure_audit_records. Old "erased" flag rows already in the audit tables are left alone.
 
 ERASURE_CATALOG        = "shopping_assistant"
 ERASURE_PII_TABLES     = ("raw_logs.customer_pii", "raw_logs.feedback_pii")
-ERASURE_FLAG_TABLES    = ("ai_interactions_raw", "sessions_raw", "node_executions_raw",
-                          "guardrail_results_raw", "model_outputs_raw", "tool_calls_raw",
-                          "human_feedback_raw")
-ERASURE_ACTIVE_STATES  = ("pending", "processing", "failed")
+# column that holds the person's coded ID in each personal-data table
+ERASURE_PII_COLUMN     = {"raw_logs.customer_pii": "subject_ref", "raw_logs.feedback_pii": "reviewer_subject_ref"}
+# OPTIONAL app tables that also hold the person's data (keyed by subject_ref + app_id), e.g. wishlist or cart.
+# Off by default; switch on with --extra-tables schema.table,schema.table. A table that does not exist is skipped.
+ERASURE_EXTRA_TABLES   = ()          # none by default: only customer_pii and feedback_pii are deleted
+ERASURE_ACTIVE_STATES  = ("pending", "processing", "failed")      # the delete stage works on these
 ERASURE_DEFAULT_DAYS   = 30          # used when a regulation has no active retention_policy row
 ERASURE_MIN_VACUUM_HRS = 168         # Delta will not vacuum below the 7-day file retention
-ERASURE_ACTION_TAKEN   = "pii_deleted_audit_flagged"
+ERASURE_ACTION_TAKEN   = "pii_deleted_and_vacuumed"
+ERASURE_SETTLE_MINUTES = 10          # a request must be this old before the job deletes anything
+ERASURE_LEASE_HOURS    = 2           # a claimed request can be taken over by another run after this
+ERASURE_MAX_ATTEMPTS   = 5           # after this many failed tries the request is flagged for review
+ERASURE_MAX_REQUESTS   = 15          # requests handled per run, across all apps
+ERASURE_ALERT_DAYS     = 8           # a deferred request closer than this to its deadline raises an alert
+# columns the job needs on user_data.erasure_requests; added automatically on the first real run
+ERASURE_NEW_COLUMNS    = (
+    ("deadline_at", "TIMESTAMP"), ("deleted_at", "TIMESTAMP"), ("completed_at", "TIMESTAMP"),
+    ("claimed_by", "STRING"), ("claimed_at", "TIMESTAMP"), ("lease_expires_at", "TIMESTAMP"),
+    ("attempts", "INT"), ("cleanup_attempts", "INT"), ("last_error", "STRING"),
+    ("review_required", "BOOLEAN"), ("review_reason", "STRING"), ("deferred_count", "INT"),
+)
+_TS_FMT = "'yyyy-MM-dd HH:mm:ss'"
 
 
 class _ErasureSql:
@@ -1149,20 +1518,122 @@ class _ErasureSql:
         return (r.result.data_array if r.result and r.result.data_array else [])
 
 
+# ── Erasure request intake (the app's "Delete My Account" click) ─────────
+# Replaces the old core/erasure_store.py so every write to the erasure tables is in this file.
+# app.py calls these three functions from the delete-request route.
+
+def _intake_table() -> str:
+    return f"{os.getenv('AUDIT_CATALOG', ERASURE_CATALOG)}.user_data.erasure_requests"
+
+
+def _intake_ddl() -> str:
+    return f"""
+CREATE TABLE IF NOT EXISTS {_intake_table()} (
+    request_id    STRING    NOT NULL,
+    subject_ref   STRING    NOT NULL,
+    app_id        STRING    NOT NULL,
+    regulation    STRING,
+    status        STRING,
+    requested_at  TIMESTAMP,
+    processed_at  TIMESTAMP,
+    notes         STRING
+)
+USING DELTA
+"""
+
+
+def _intake_exec(sql: str, params: list = None):
+    from databricks.sdk import WorkspaceClient
+    wh = os.getenv("DATABRICKS_SQL_WAREHOUSE_ID")
+    if not wh:
+        raise RuntimeError("DATABRICKS_SQL_WAREHOUSE_ID not set")
+    kwargs = dict(warehouse_id=wh, statement=sql, wait_timeout="10s")
+    if params:
+        kwargs["parameters"] = params
+    return WorkspaceClient().statement_execution.execute_statement(**kwargs)
+
+
+def _intake_exec_bg(sql: str, params: list = None) -> None:
+    def _run():
+        try:
+            _intake_exec(sql, params)
+        except Exception as exc:
+            logger.warning("[ERASURE] Background write failed: %s", exc)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def erasure_ensure_table() -> None:
+    """Create user_data.erasure_requests if it does not exist (the app's first columns only)."""
+    try:
+        _intake_exec(_intake_ddl())
+        logger.info("[ERASURE] Table ready: %s", _intake_table())
+    except Exception as exc:
+        logger.warning("[ERASURE] Table creation failed (may already exist): %s", exc)
+
+
+def erasure_has_pending_request(subject_ref: str, app_id: str) -> bool:
+    """True if a 'pending' erasure request already exists for this person in this app."""
+    from databricks.sdk.service.sql import StatementParameterListItem
+    sql = (f"SELECT COUNT(*) FROM {_intake_table()} "
+           f"WHERE subject_ref = :subject_ref AND app_id = :app_id AND status = 'pending'")
+    params = [StatementParameterListItem(name="subject_ref", value=subject_ref),
+              StatementParameterListItem(name="app_id", value=app_id)]
+    try:
+        result = _intake_exec(sql, params)
+        if result.result and result.result.data_array:
+            return int(result.result.data_array[0][0]) > 0
+    except Exception as exc:
+        logger.warning("[ERASURE] has_pending_request error: %s", exc)
+    return False
+
+
+def erasure_raise_request(subject_ref: str, app_id: str, regulation: Optional[str] = None) -> str:
+    """Queue an erasure request as a 'pending' row. Returns request_id. Fire-and-forget."""
+    from databricks.sdk.service.sql import StatementParameterListItem
+    request_id = str(uuid.uuid4())
+    sql = (f"INSERT INTO {_intake_table()} "
+           f"(request_id, subject_ref, app_id, regulation, status, requested_at) "
+           f"VALUES (:request_id, :subject_ref, :app_id, :regulation, 'pending', current_timestamp())")
+    params = [StatementParameterListItem(name="request_id", value=request_id),
+              StatementParameterListItem(name="subject_ref", value=subject_ref),
+              StatementParameterListItem(name="app_id", value=app_id),
+              StatementParameterListItem(name="regulation", value=regulation or "UNKNOWN")]
+    _intake_exec_bg(sql, params)
+    return request_id
+
+
 def _parse_ts(value) -> datetime:
     """'2026-10-12 08:30:00' (UTC) -> aware datetime."""
     return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
+def _fmt_ts(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _kv(notes) -> dict:
+    """'a=1; b=2' -> {'a': '1', 'b': '2'}   (the job's own notes on a request)."""
+    out = {}
+    for part in str(notes or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
 class ErasureProcessor:
     """Carries out erasure requests for ONE app_id.
 
-    Per request: intake -> delete PII -> append erasure flag rows -> verify -> record proof.
-    Any failure is recorded as status 'failed' with a reason and retried by the next run.
+    Delete stage  (process_pending):  claim -> delete personal data -> verify -> status 'deleted'.
+    Clean-up stage (vacuum_completed): VACUUM both personal-data tables per table -> final sweep -> 'completed'.
+    Safe to rerun: a request is claimed by one run at a time (lease), a crashed run is taken over after the
+    lease, a request that keeps failing is flagged for review, and nothing is skipped silently.
     """
 
     def __init__(self, wrapper: "AuditWrapper", sql=None, warehouse_id: str = None,
-                 execute: bool = False, max_requests: int = 20, out=print):
+                 execute: bool = False, max_requests: int = ERASURE_MAX_REQUESTS, out=print,
+                 settle_minutes: int = ERASURE_SETTLE_MINUTES, lease_hours: int = ERASURE_LEASE_HOURS,
+                 max_attempts: int = ERASURE_MAX_ATTEMPTS, extra_tables=None, run_id: str = None):
         if wrapper.catalog != ERASURE_CATALOG:
             raise ValueError(f"Erasure job works in catalog '{ERASURE_CATALOG}' only, got '{wrapper.catalog}'")
         self.w            = wrapper
@@ -1171,6 +1642,13 @@ class ErasureProcessor:
         self.execute      = execute
         self.max_requests = max_requests
         self.out          = out
+        self.settle       = timedelta(minutes=settle_minutes)
+        self.lease_hours  = int(lease_hours)
+        self.max_attempts = int(max_attempts)
+        self.run_id       = run_id or f"run-{uuid.uuid4()}"
+        self._extra_wanted = tuple(ERASURE_EXTRA_TABLES if extra_tables is None else extra_tables)
+        self._extra_found  = None
+        self.has_new_cols  = None
         self.t_req        = f"{ERASURE_CATALOG}.user_data.erasure_requests"
         self.t_rep_req    = self.w._tbl("reporting.erasure_requests")
         self.t_rep_audit  = self.w._tbl("reporting.erasure_audit_records")
@@ -1178,6 +1656,9 @@ class ErasureProcessor:
         self.t_log        = self.w._tbl("reporting.retention_enforcement_log")
 
     # ── small helpers ─────────────────────────────────────────────────────
+
+    def _mode(self) -> str:
+        return "EXECUTE" if self.execute else "DRY RUN"
 
     def _insert(self, table: str, row: dict) -> None:
         cols = [c for c, v in row.items() if v is not None and v != ""]
@@ -1188,6 +1669,14 @@ class ErasureProcessor:
     def _count(self, sql: str, params: dict) -> int:
         rows = self.sql.run(sql, params)
         return int(rows[0][0]) if rows else 0
+
+    def _dml(self, sql: str, params: Optional[dict] = None) -> int:
+        """Run an UPDATE/DELETE and return the number of rows it changed."""
+        rows = self.sql.run(sql, params)
+        try:
+            return int(rows[0][0]) if rows else 0
+        except (TypeError, ValueError, IndexError):
+            return 0
 
     def _policy_days(self) -> dict:
         """regulation -> (erasure_days, erasure_vacuum_days) from the ACTIVE pii_tables policy rows."""
@@ -1202,211 +1691,368 @@ class ErasureProcessor:
             return policy[regulation]
         return policy.get("INTERNAL_POLICY", (ERASURE_DEFAULT_DAYS, 7))
 
-    # ── process-erasures ──────────────────────────────────────────────────
+    def _extras(self) -> list:
+        """App tables (wishlist, cart ...) that exist in this workspace."""
+        if self._extra_found is None:
+            found = []
+            for t in self._extra_wanted:
+                schema, name = t.split(".", 1)
+                n = self._count(
+                    f"SELECT count(*) FROM {ERASURE_CATALOG}.information_schema.tables "
+                    f"WHERE table_schema = :s AND table_name = :t", {"s": schema, "t": name})
+                if n:
+                    found.append(t)
+                else:
+                    self.out(f"[ERASURE] extra table {t} not found in this workspace, skipped")
+            self._extra_found = found
+        return self._extra_found
 
-    def process_pending(self) -> dict:
-        policy = self._policy_days()
-        reqs = self.sql.run(
-            f"SELECT request_id, subject_ref, regulation, date_format(requested_at, 'yyyy-MM-dd HH:mm:ss') "
-            f"FROM {self.t_req} WHERE app_id = :app AND status IN "
-            f"({', '.join(repr(s) for s in ERASURE_ACTIVE_STATES)})", {"app": self.app_id})
-        todo = []
-        for rid, sref, reg, requested_at in reqs:
-            reg = reg or "UNKNOWN"
-            days, _ = self._days_for(reg, policy)
-            received = _parse_ts(requested_at)
-            todo.append({"request_id": rid, "subject_ref": sref, "regulation": reg,
-                         "received": received, "deadline": received + timedelta(days=days)})
-        todo.sort(key=lambda r: r["deadline"])          # nearest deadline first
-        self.out(f"[ERASURE] app={self.app_id} mode={'EXECUTE' if self.execute else 'DRY RUN'} "
-                 f"requests found={len(todo)} (processing at most {self.max_requests})")
-        result = {"found": len(todo), "completed": 0, "failed": 0, "planned": 0}
-        for req in todo[: self.max_requests]:
-            try:
-                self._process_one(req)
-                result["completed" if self.execute else "planned"] += 1
-            except Exception as exc:                                 # one bad request must not stop the rest
-                result["failed"] += 1
-                self.out(f"[ERASURE] request {req['request_id']} FAILED: {exc}")
-                if self.execute:
-                    self._mark_failed(req, str(exc))
-        self.out(f"[ERASURE] done: {result}")
-        return result
+    def _scope(self) -> list:
+        """[(table, column)] holding the person's data: the two personal-data tables plus the extra tables."""
+        return [(t, ERASURE_PII_COLUMN[t]) for t in ERASURE_PII_TABLES] + [(t, "subject_ref") for t in self._extras()]
 
-    def _process_one(self, req: dict) -> None:
-        rid, sref, reg = req["request_id"], req["subject_ref"], req["regulation"]
-        app = self.app_id
-        self.out(f"[ERASURE] request {rid} regulation={reg} deadline={req['deadline']:%Y-%m-%d}")
-
-        pii_where = {
-            "raw_logs.customer_pii": ("subject_ref", {"sr": sref, "app": app}),
-            "raw_logs.feedback_pii": ("reviewer_subject_ref", {"sr": sref, "app": app}),
-        }
-        before = {t: self._count(f"SELECT count(*) FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app", p)
-                  for t, (col, p) in pii_where.items()}
-        traces = sorted(r[0] for r in self.sql.run(
-            f"SELECT DISTINCT trace_id FROM {self.w._tbl('raw_logs.ai_interactions_raw')} "
-            f"WHERE subject_ref = :sr AND app_id = :app AND NOT coalesce(is_erasure_flag, false) "
-            f"AND trace_id IS NOT NULL", {"sr": sref, "app": app}))
-        self.out(f"           personal-data rows: {before}; traces: {len(traces)}")
-
-        if not self.execute:
-            for t in ERASURE_FLAG_TABLES:
-                self.out(f"           would flag {t}: {len(self._unflagged(t, sref, traces))} new row(s)")
-            return
-
-        self._set_state(rid, "processing")
-        if not self._intake_exists(rid):
-            self._insert(self.t_rep_req, self._req_row(req, "pending"))
-
-        # 1. delete the personal data (customer_pii + reviewer rows in feedback_pii)
-        for t, (col, p) in pii_where.items():
-            self.sql.run(f"DELETE FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app", p)
-
-        # 2. append the erasure flag rows (originals are never changed; the tables are append-only)
-        flagged = {}
-        for t in ERASURE_FLAG_TABLES:
-            rows = self._unflagged(t, sref, traces)
-            for row in rows:
-                self._insert(self.w._tbl(f"raw_logs.{t}"), self._flag_row(t, row, req))
-            flagged[t] = len(rows)
-
-        # 3. verify before anything is recorded as completed
-        for t, (col, p) in pii_where.items():
-            left = self._count(f"SELECT count(*) FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app", p)
-            if left:
-                raise RuntimeError(f"{t} still has {left} row(s) for the subject after delete")
-        for t in ERASURE_FLAG_TABLES:
-            if self._originals(t, sref) and not self._flags_exist(t, sref):
-                raise RuntimeError(f"no erasure flag row found in {t}")
-
-        # 4. proof + close the request
-        erased_at = datetime.now(timezone.utc)
-        deleted = sum(before.values())
-        self._insert(self.t_rep_audit, {
-            "audit_id": str(uuid.uuid4()), "request_id": rid, "app_id": app, "regulation": reg,
-            "traces_affected": len(traces), "pii_rows_deleted": deleted,
-            "action_taken": ERASURE_ACTION_TAKEN,
-            "verification_hash": self.w._hmac("|".join(traces)),
-            "legal_basis": f"{reg} right to erasure",
-            "within_deadline": "true" if erased_at <= req["deadline"] else "false",
-            "erased_at": erased_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "created_at": erased_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "schema_version": self.w.schema_version,
-        })
-        self._insert(self.t_rep_req, self._req_row(req, "completed", completed_at=erased_at))
-        self._set_state(rid, "completed", notes=f"pii_rows_deleted={deleted}; traces_flagged={len(traces)}")
-        self.out(f"           completed: pii_rows_deleted={deleted}, flag rows={flagged}")
-
-    # ── flag-row helpers ──────────────────────────────────────────────────
-
-    def _originals(self, table: str, sref: str) -> int:
-        extra = " OR reviewer_subject_ref = :sr" if table == "human_feedback_raw" else ""
+    def _count_person(self, table: str, col: str, sref: str) -> int:
         return self._count(
-            f"SELECT count(*) FROM {self.w._tbl('raw_logs.' + table)} WHERE app_id = :app AND "
-            f"(subject_ref = :sr{extra}) AND NOT coalesce(is_erasure_flag, false)",
+            f"SELECT count(*) FROM {self.w._tbl(table)} WHERE {col} = :sr AND app_id = :app",
             {"sr": sref, "app": self.app_id})
 
-    def _flags_exist(self, table: str, sref: str) -> int:
-        return self._count(
-            f"SELECT count(*) FROM {self.w._tbl('raw_logs.' + table)} WHERE app_id = :app AND "
-            f"subject_ref = :sr AND is_erasure_flag = true", {"sr": sref, "app": self.app_id})
+    def _stored_regulation(self, sref: str, fallback: str) -> str:
+        """The regulation stored with the person at sign-up (the request's own value is only a fallback)."""
+        rows = self.sql.run(
+            f"SELECT regulation FROM {self.w._tbl('raw_logs.customer_pii')} "
+            f"WHERE subject_ref = :sr AND app_id = :app LIMIT 1", {"sr": sref, "app": self.app_id})
+        stored = rows[0][0] if rows and rows[0] and rows[0][0] else None
+        return stored or fallback or "UNKNOWN"
 
-    def _unflagged(self, table: str, sref: str, traces: list) -> list:
-        """What still needs a flag row. ai_interactions_raw: one per trace. Other tables: one
-        per subject (the safe views match a flag row to a subject_ref in the same table)."""
-        if table == "ai_interactions_raw":
-            done = {r[0] for r in self.sql.run(
-                f"SELECT DISTINCT trace_id FROM {self.w._tbl('raw_logs.ai_interactions_raw')} "
-                f"WHERE app_id = :app AND subject_ref = :sr AND is_erasure_flag = true AND trace_id IS NOT NULL",
-                {"sr": sref, "app": self.app_id})}
-            return [t for t in traces if t not in done]
-        if self._originals(table, sref) and not self._flags_exist(table, sref):
-            return [None]
-        return []
+    # ── request table: the job's own columns ──────────────────────────────
 
-    def _flag_row(self, table: str, trace_id, req: dict) -> dict:
-        now = _now_iso()
-        base = {"app_id": self.app_id, "subject_ref": req["subject_ref"], "is_erasure_flag": "true",
-                "created_at": now, "schema_version": self.w.schema_version}
-        tid = f"erasure-{req['request_id']}"
-        per_table = {
-            "ai_interactions_raw": {"trace_id": trace_id, "request_timestamp": now, "model_name": "ERASED",
-                                    "status": "erased", "app_metadata": f"erasure_{req['regulation']}"},
-            "sessions_raw":        {"session_id": str(uuid.uuid4()), "started_at": now},
-            "node_executions_raw": {"node_execution_id": str(uuid.uuid4()), "trace_id": tid,
-                                    "node_name": "erasure_flag", "status": "erased", "started_at": now},
-            "guardrail_results_raw": {"guardrail_id": str(uuid.uuid4()), "trace_id": tid,
-                                      "policy_name": "erasure_flag", "result": "erased",
-                                      "triggered_block": "false", "checked_at": now},
-            "model_outputs_raw":   {"output_id": str(uuid.uuid4()), "trace_id": tid, "generated_at": now},
-            "tool_calls_raw":      {"tool_call_id": str(uuid.uuid4()), "trace_id": tid,
-                                    "tool_name": "erasure_flag", "status": "erased", "called_at": now},
-            "human_feedback_raw":  {"feedback_id": str(uuid.uuid4()), "trace_id": tid,
-                                    "feedback_type": "erasure_flag", "feedback_at": now},
-        }
-        return {**base, **per_table[table]}
+    def _ensure_columns(self) -> None:
+        """Add the job's columns to user_data.erasure_requests if missing (real run only)."""
+        rows = self.sql.run(
+            f"SELECT column_name FROM {ERASURE_CATALOG}.information_schema.columns "
+            f"WHERE table_schema = 'user_data' AND table_name = 'erasure_requests'")
+        have = {str(r[0]).lower() for r in rows}
+        missing = [(c, t) for c, t in ERASURE_NEW_COLUMNS if c not in have]
+        if not missing:
+            self.has_new_cols = True
+            return
+        names = ", ".join(c for c, _ in missing)
+        if self.execute:
+            self.out(f"[ERASURE] adding {len(missing)} column(s) to {self.t_req}: {names}")
+            self.sql.run(f"ALTER TABLE {self.t_req} ADD COLUMNS ({', '.join(f'{c} {t}' for c, t in missing)})")
+            self.has_new_cols = True
+        else:
+            self.out(f"[ERASURE] DRY RUN: would add {len(missing)} column(s) to {self.t_req}: {names}")
+            self.has_new_cols = False
 
-    # ── request bookkeeping ───────────────────────────────────────────────
+    def _requests(self, states) -> list:
+        """Open requests of this app in the given states, oldest first."""
+        cols = ["request_id", "subject_ref", "regulation",
+                f"date_format(requested_at, {_TS_FMT})", "status"]
+        if self.has_new_cols:
+            cols += [f"date_format(deadline_at, {_TS_FMT})", "coalesce(attempts, 0)",
+                     "coalesce(cleanup_attempts, 0)", "coalesce(review_required, false)",
+                     f"date_format(lease_expires_at, {_TS_FMT})", f"date_format(deleted_at, {_TS_FMT})", "notes"]
+        in_list = ", ".join(repr(s) for s in states)
+        rows = self.sql.run(
+            f"SELECT {', '.join(cols)} FROM {self.t_req} WHERE app_id = :app AND status IN ({in_list})",
+            {"app": self.app_id})
+        out = []
+        for r in rows:
+            received = _parse_ts(r[3])
+            req = {"request_id": r[0], "subject_ref": r[1], "regulation": r[2] or "UNKNOWN",
+                   "received": received, "status": r[4],
+                   "deadline": received + timedelta(days=ERASURE_DEFAULT_DAYS), "deadline_set": False,
+                   "attempts": 0, "cleanup_attempts": 0, "review": False,
+                   "lease": None, "deleted_at": None, "notes": None}
+            if self.has_new_cols:
+                if r[5]:
+                    req["deadline"], req["deadline_set"] = _parse_ts(r[5]), True
+                req["attempts"] = int(r[6] or 0)
+                req["cleanup_attempts"] = int(r[7] or 0)
+                req["review"] = str(r[8]).lower() == "true"
+                req["lease"] = _parse_ts(r[9]) if r[9] else None
+                req["deleted_at"] = _parse_ts(r[10]) if r[10] else None
+                req["notes"] = r[11]
+            out.append(req)
+        out.sort(key=lambda q: q["received"])
+        return out
+
+    # ── history log: reporting.erasure_requests ───────────────────────────
 
     def _req_row(self, req: dict, status: str, completed_at=None, blocked_reason=None) -> dict:
         now = _now_iso()
         return {
             "request_id": req["request_id"], "app_id": self.app_id, "subject_ref": req["subject_ref"],
             "regulation": req["regulation"],
-            "request_received_at": req["received"].strftime("%Y-%m-%d %H:%M:%S"),
-            "request_deadline":    req["deadline"].strftime("%Y-%m-%d %H:%M:%S"),
+            "request_received_at": _fmt_ts(req["received"]),
+            "request_deadline":    _fmt_ts(req["deadline"]),
             "status": status, "blocked_reason": blocked_reason,
-            "completed_at": completed_at.strftime("%Y-%m-%d %H:%M:%S") if completed_at else None,
+            "completed_at": _fmt_ts(completed_at) if completed_at else None,
             "created_at": now, "schema_version": self.w.schema_version,
         }
 
-    def _intake_exists(self, rid: str) -> bool:
-        return self._count(f"SELECT count(*) FROM {self.t_rep_req} WHERE request_id = :rid", {"rid": rid}) > 0
+    def _log_exists(self, rid: str, status: str) -> bool:
+        return self._count(
+            f"SELECT count(*) FROM {self.t_rep_req} WHERE request_id = :rid AND status = :st",
+            {"rid": rid, "st": status}) > 0
 
-    def _set_state(self, rid: str, status: str, notes: str = None) -> None:
-        stamp = ", processed_at = current_timestamp()" if status == "completed" else ""
-        self.sql.run(f"UPDATE {self.t_req} SET status = :st, notes = :notes{stamp} "
-                     f"WHERE request_id = :rid AND app_id = :app",
-                     {"st": status, "notes": notes, "rid": rid, "app": self.app_id})
+    def _log_status(self, req: dict, status: str, completed_at=None, reason=None) -> None:
+        """Append one history row. 'deleted', 'completed' ... are written once; 'failed' every time."""
+        if status != "failed" and self._log_exists(req["request_id"], status):
+            return
+        self._insert(self.t_rep_req, self._req_row(req, status, completed_at=completed_at, blocked_reason=reason))
 
-    def _mark_failed(self, req: dict, reason: str) -> None:
+    def _reconcile(self) -> None:
+        """Repair the history log: add the row for any 'deleted'/'completed' request that is missing one."""
+        if not self.has_new_cols:
+            return
+        rows = self.sql.run(
+            f"SELECT q.request_id, q.subject_ref, q.regulation, date_format(q.requested_at, {_TS_FMT}), q.status, "
+            f"date_format(q.deadline_at, {_TS_FMT}), date_format(q.completed_at, {_TS_FMT}) "
+            f"FROM {self.t_req} q WHERE q.app_id = :app AND q.status IN ('deleted', 'completed') AND NOT EXISTS "
+            f"(SELECT 1 FROM {self.t_rep_req} r WHERE r.request_id = q.request_id AND r.status = q.status)",
+            {"app": self.app_id})
+        for rid, sref, reg, requested, status, deadline, completed in rows:
+            received = _parse_ts(requested)
+            req = {"request_id": rid, "subject_ref": sref, "regulation": reg or "UNKNOWN", "received": received,
+                   "deadline": _parse_ts(deadline) if deadline else received + timedelta(days=ERASURE_DEFAULT_DAYS)}
+            self.out(f"[ERASURE] history log is missing the '{status}' row of request {rid}"
+                     + ("" if self.execute else "  (not written)"))
+            if self.execute:
+                self._log_status(req, status, completed_at=_parse_ts(completed) if completed else None)
+
+    # ── claim, fencing and failure ────────────────────────────────────────
+
+    def _claim(self, req: dict) -> bool:
+        """Claim the request for this run. False if another run holds it or it is flagged for review."""
+        n = self._dml(
+            f"UPDATE {self.t_req} SET status = 'processing', claimed_by = :run, claimed_at = current_timestamp(), "
+            f"lease_expires_at = current_timestamp() + INTERVAL {self.lease_hours} HOURS, "
+            f"attempts = coalesce(attempts, 0) + 1, last_error = NULL, "
+            f"deadline_at = coalesce(deadline_at, to_timestamp(:dl)) "
+            f"WHERE request_id = :rid AND app_id = :app AND coalesce(review_required, false) = false AND "
+            f"(status IN ('pending', 'failed') OR (status = 'processing' AND "
+            f"(lease_expires_at IS NULL OR lease_expires_at < current_timestamp())))",
+            {"run": self.run_id, "rid": req["request_id"], "app": self.app_id, "dl": _fmt_ts(req["deadline"])})
+        return n == 1
+
+    def _own(self, set_clause: str, rid: str, params: Optional[dict] = None) -> None:
+        """Change a request this run has claimed. Raises if the run lost its claim."""
+        p = {"run": self.run_id, "rid": rid, "app": self.app_id}
+        p.update(params or {})
+        n = self._dml(
+            f"UPDATE {self.t_req} SET {set_clause} WHERE request_id = :rid AND app_id = :app "
+            f"AND claimed_by = :run AND status = 'processing'", p)
+        if n != 1:
+            raise RuntimeError(f"request {rid}: this run no longer holds the claim (lease lost)")
+
+    def _attempts(self, rid: str) -> int:
+        return self._count(f"SELECT coalesce(attempts, 0) FROM {self.t_req} WHERE request_id = :rid AND app_id = :app",
+                           {"rid": rid, "app": self.app_id})
+
+    def _mark_failed(self, req: dict, exc: Exception) -> None:
+        reason = str(exc)[:500]
         try:
-            if not self._intake_exists(req["request_id"]):
-                self._insert(self.t_rep_req, self._req_row(req, "pending"))
-            self._insert(self.t_rep_req, self._req_row(req, "failed", blocked_reason=reason[:500]))
-            self._set_state(req["request_id"], "failed", notes=reason[:500])
-        except Exception as exc:
-            self.out(f"[ERASURE] could not record failure for {req['request_id']}: {exc}")
+            attempts = req.get("attempts_now") or self._attempts(req["request_id"])
+            flag = attempts >= self.max_attempts
+            review = ", review_required = true, review_reason = :rr" if flag else ""
+            params = {"run": self.run_id, "rid": req["request_id"], "app": self.app_id, "err": reason}
+            if flag:
+                params["rr"] = f"stopped after {attempts} failed attempts: {reason}"[:500]
+                self.out(f"[ERASURE] ALERT: request {req['request_id']} failed {attempts} times and is flagged for review")
+            self._dml(
+                f"UPDATE {self.t_req} SET status = 'failed', last_error = :err, lease_expires_at = NULL{review} "
+                f"WHERE request_id = :rid AND app_id = :app AND claimed_by = :run AND status = 'processing'", params)
+            self._log_status(req, "failed", reason=reason)
+        except Exception as inner:
+            self.out(f"[ERASURE] could not record failure for {req['request_id']}: {inner}")
 
-    # ── vacuum-erasures ───────────────────────────────────────────────────
+    # ── stage 1: process-erasures ─────────────────────────────────────────
+
+    def process_pending(self) -> dict:
+        policy = self._policy_days()
+        self._ensure_columns()
+        self._reconcile()
+        rows = self._requests(("pending", "processing", "failed", "deleted"))
+        self.out(f"[ERASURE] app={self.app_id} mode={self._mode()} open requests={len(rows)} "
+                 f"(this run handles at most {self.max_requests})")
+        result = {"found": len(rows), "deleted": 0, "failed": 0, "planned": 0, "deferred": 0, "waiting": 0,
+                  "duplicates": 0, "flagged": 0, "skipped": 0, "processed": 0}
+
+        # one request per person: the earliest wins, later open requests of the same person are closed
+        first, todo = {}, []
+        for r in rows:
+            prior = first.get(r["subject_ref"])
+            if prior is None:
+                first[r["subject_ref"]] = r
+                if r["status"] != "deleted":
+                    todo.append(r)
+            else:
+                result["duplicates"] += 1
+                self._close_duplicate(r, prior)
+
+        now = datetime.now(timezone.utc)
+        ready = []
+        for r in todo:
+            r["regulation"] = self._stored_regulation(r["subject_ref"], r["regulation"])
+            if not r["deadline_set"]:
+                r["deadline"] = r["received"] + timedelta(days=self._days_for(r["regulation"], policy)[0])
+            if r["review"]:
+                result["flagged"] += 1
+                self.out(f"[ERASURE] ALERT: request {r['request_id']} is flagged for review and is not processed")
+            elif r["status"] == "processing" and r["lease"] and r["lease"] > now:
+                result["skipped"] += 1
+                self.out(f"[ERASURE] request {r['request_id']} is being processed by another run, skipped")
+            elif now - r["received"] < self.settle:
+                result["waiting"] += 1
+                self.out(f"[ERASURE] request {r['request_id']} is younger than {int(self.settle.total_seconds() // 60)} "
+                         f"minutes, waiting")
+            else:
+                ready.append(r)
+        ready.sort(key=lambda q: q["deadline"])                       # nearest deadline first
+
+        for req in ready[: self.max_requests]:
+            result["processed"] += 1
+            try:
+                result[self._process_one(req)] += 1
+            except Exception as exc:                                  # one bad request must not stop the rest
+                result["failed"] += 1
+                self.out(f"[ERASURE] request {req['request_id']} FAILED: {exc}")
+                if self.execute:
+                    self._mark_failed(req, exc)
+        for req in ready[self.max_requests:]:
+            result["deferred"] += 1
+            self.out(f"[ERASURE] request {req['request_id']} DEFERRED by the per-run cap, deadline "
+                     f"{req['deadline']:%Y-%m-%d}; it goes first in the next run")
+            if (req["deadline"] - now).days < ERASURE_ALERT_DAYS:
+                self.out(f"[ERASURE] ALERT: deferred request {req['request_id']} is close to its deadline")
+            if self.execute and self.has_new_cols:
+                self._dml(f"UPDATE {self.t_req} SET deferred_count = coalesce(deferred_count, 0) + 1, "
+                          f"last_error = :e WHERE request_id = :rid AND app_id = :app "
+                          f"AND status IN ('pending', 'failed')",
+                          {"e": "deferred by the per-run cap", "rid": req["request_id"], "app": self.app_id})
+        self.out(f"[ERASURE] done: {result}")
+        return result
+
+    def _close_duplicate(self, req: dict, prior: dict) -> None:
+        self.out(f"[ERASURE] request {req['request_id']} is a duplicate of {prior['request_id']} (same person)"
+                 + ("" if self.execute else "  (not closed)"))
+        if not self.execute or req["status"] not in ("pending", "failed"):
+            return
+        n = self._dml(
+            f"UPDATE {self.t_req} SET status = 'cancelled', notes = :n WHERE request_id = :rid AND app_id = :app "
+            f"AND status IN ('pending', 'failed')",
+            {"n": f"duplicate of {prior['request_id']}", "rid": req["request_id"], "app": self.app_id})
+        if n:
+            self._log_status(req, "cancelled", reason=f"duplicate of {prior['request_id']}")
+
+    def _process_one(self, req: dict) -> str:
+        rid, sref = req["request_id"], req["subject_ref"]
+        scope = self._scope()
+        before = {t: self._count_person(t, col, sref) for t, col in scope}
+        traces = sorted(r[0] for r in self.sql.run(
+            f"SELECT DISTINCT trace_id FROM {self.w._tbl('raw_logs.ai_interactions_raw')} "
+            f"WHERE subject_ref = :sr AND app_id = :app AND NOT coalesce(is_erasure_flag, false) "
+            f"AND trace_id IS NOT NULL", {"sr": sref, "app": self.app_id}))
+        self.out(f"[ERASURE] request {rid} regulation={req['regulation']} deadline={req['deadline']:%Y-%m-%d}")
+        self.out(f"           rows to delete: {before}; traces kept as evidence: {len(traces)}")
+        if not self.execute:
+            self.out("           would claim the request, delete these rows and mark it 'deleted'")
+            return "planned"
+
+        if not self._claim(req):
+            self.out("           not claimed: another run holds it, or it is flagged for review")
+            return "skipped"
+        req["attempts_now"] = self._attempts(rid)
+        if not self._log_exists(rid, "pending"):
+            self._log_status(req, "pending")                          # the legal "we received it" record
+
+        for t, col in scope:                                          # 1. delete the personal data
+            self.sql.run(f"DELETE FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app",
+                         {"sr": sref, "app": self.app_id})
+        for t, col in scope:                                          # 2. verify before anything is recorded
+            left = self._count_person(t, col, sref)
+            if left:
+                raise RuntimeError(f"{t} still has {left} row(s) for the person after delete")
+
+        pii = sum(before[t] for t in ERASURE_PII_TABLES)
+        extra = sum(n for t, n in before.items() if t not in ERASURE_PII_TABLES)
+        notes = (f"pii_rows_deleted={pii}; extra_rows_deleted={extra}; traces={len(traces)}; "
+                 f"hash={self.w._hmac('|'.join(traces))}")
+        self._own("status = 'deleted', deleted_at = current_timestamp(), lease_expires_at = NULL, "
+                  "last_error = NULL, notes = :notes", rid, {"notes": notes})   # 3. M1
+        self._log_status(req, "deleted")
+        self.out(f"           deleted: {notes.split('; hash=')[0]}")
+        return "deleted"
+
+    # ── operator: reset a flagged request ─────────────────────────────────
+
+    def reset_request(self, rid: str, reason: str) -> dict:
+        if not reason or not reason.strip():
+            raise ValueError("a written reason is required to reset a request")
+        self._ensure_columns()
+        self.out(f"[RESET] app={self.app_id} mode={self._mode()} request={rid} reason={reason!r}")
+        if not self.execute:
+            return {"reset": 0}
+        n = self._dml(
+            f"UPDATE {self.t_req} SET review_required = false, attempts = 0, cleanup_attempts = 0, "
+            f"review_reason = :why, last_error = NULL WHERE request_id = :rid AND app_id = :app "
+            f"AND coalesce(review_required, false) = true", {"why": f"reset: {reason.strip()}"[:500], "rid": rid, "app": self.app_id})
+        self.out(f"[RESET] {'cleared the review flag' if n else 'no flagged request with that id'}")
+        return {"reset": n}
+
+    # ── stage 2: vacuum-erasures ──────────────────────────────────────────
+
+    def _covered(self, table: str, deleted_at: datetime) -> bool:
+        """True if a successful VACUUM of this table kept fewer hours than the time since the delete,
+        so the old files holding the deleted rows are gone."""
+        return self._count(
+            f"SELECT count(*) FROM {self.t_log} WHERE app_id = :app AND vacuum_type = 'pii_erasure_vacuum' "
+            f"AND table_name = :t AND status = 'success' "
+            f"AND timestampadd(DAY, -vacuum_threshold_days, created_at) >= to_timestamp(:d)",
+            {"app": self.app_id, "t": table.split(".")[-1], "d": _fmt_ts(deleted_at)}) > 0
 
     def vacuum_completed(self) -> dict:
-        """VACUUM the two personal-data tables once a completed request has aged past its
-        erasure_vacuum_days. Until then the deleted rows can be recovered with time travel."""
+        """VACUUM the two personal-data tables once a deleted request has aged past its recovery window,
+        then run a final sweep and mark the request 'completed'. Until then the deleted rows can be
+        recovered with time travel."""
         policy = self._policy_days()
-        done = self.sql.run(
-            f"SELECT r.request_id, r.regulation, date_format(r.completed_at, 'yyyy-MM-dd HH:mm:ss') "
-            f"FROM {self.t_rep_req} r WHERE r.app_id = :app AND r.status = 'completed' AND r.completed_at IS NOT NULL",
-            {"app": self.app_id})
-        last = self.sql.run(
-            f"SELECT date_format(max(created_at), 'yyyy-MM-dd HH:mm:ss') FROM {self.t_log} "
-            f"WHERE app_id = :app AND vacuum_type = 'pii_erasure_vacuum' AND status = 'success'", {"app": self.app_id})
-        last_run = _parse_ts(last[0][0]) if last and last[0][0] else None
+        self._ensure_columns()
+        if not self.has_new_cols:
+            self.out("[VACUUM] the request table has no delete-stage columns yet, nothing to clean up")
+            return {"found": 0, "eligible": 0, "vacuumed": 0, "completed": 0, "failed": 0, "waiting": 0, "flagged": 0}
+        self._reconcile()
+        rows = self._requests(("deleted",))
         now = datetime.now(timezone.utc)
-        eligible = []
-        for rid, reg, completed in done:
-            completed_at = _parse_ts(completed)
-            days = self._days_for(reg or "UNKNOWN", policy)[1]
-            if completed_at + timedelta(days=days) <= now and (last_run is None or completed_at > last_run):
-                eligible.append(days)
-        self.out(f"[VACUUM] app={self.app_id} mode={'EXECUTE' if self.execute else 'DRY RUN'} "
-                 f"completed requests now past their vacuum window and not yet vacuumed: {len(eligible)}")
+        eligible, waiting, flagged = [], 0, 0
+        for r in rows:
+            if r["review"]:
+                flagged += 1
+                self.out(f"[VACUUM] ALERT: request {r['request_id']} is flagged for review and is not cleaned up")
+                continue
+            if r["deleted_at"] is None:
+                self.out(f"[VACUUM] request {r['request_id']} has no delete time recorded, skipped")
+                continue
+            days = self._days_for(r["regulation"], policy)[1]
+            if r["deleted_at"] + timedelta(days=days) <= now:
+                eligible.append((r, days))
+            else:
+                waiting += 1
+        self.out(f"[VACUUM] app={self.app_id} mode={self._mode()} deleted requests={len(rows)}, "
+                 f"past their recovery window={len(eligible)}, still waiting={waiting}, flagged={flagged}")
+        result = {"found": len(rows), "eligible": len(eligible), "vacuumed": 0, "completed": 0,
+                  "failed": 0, "waiting": waiting, "flagged": flagged}
         if not eligible:
-            return {"vacuumed": 0}
-        hours = max(ERASURE_MIN_VACUUM_HRS, min(eligible) * 24)
-        for t in ERASURE_PII_TABLES:
-            self.out(f"[VACUUM] {t} RETAIN {hours} HOURS" + ("" if self.execute else "  (not run)"))
+            return result
+
+        for t in ERASURE_PII_TABLES:                                  # vacuum each table on its own
+            todo = [(r, d) for r, d in eligible if not self._covered(t, r["deleted_at"])]
+            if not todo:
+                continue
+            hours = max(ERASURE_MIN_VACUUM_HRS, min(d for _, d in todo) * 24)
+            self.out(f"[VACUUM] {t} RETAIN {hours} HOURS for {len(todo)} request(s)"
+                     + ("" if self.execute else "  (not run)"))
             if not self.execute:
                 continue
             status, err = "success", None
@@ -1415,13 +2061,91 @@ class ErasureProcessor:
             except Exception as exc:
                 status, err = "failed", str(exc)[:500]
             self._insert(self.t_log, {
-                "log_id": str(uuid.uuid4()), "app_id": self.app_id, "run_date": now.strftime("%Y-%m-%d"),
+                "log_id": str(uuid.uuid4()), "app_id": self.app_id, "run_date": _now_iso()[:10],
                 "table_name": t.split(".")[-1], "vacuum_run": "true" if status == "success" else "false",
                 "vacuum_type": "pii_erasure_vacuum", "vacuum_threshold_days": hours // 24, "status": status,
                 "error_message": err, "created_at": _now_iso(), "schema_version": self.w.schema_version})
-            if status == "failed":
-                raise RuntimeError(f"VACUUM {t} failed: {err}")
-        return {"vacuumed": len(ERASURE_PII_TABLES)}
+            if status == "success":
+                result["vacuumed"] += 1
+            else:
+                self.out(f"[VACUUM] {t} FAILED: {err}")
+                for r, _ in todo:
+                    self._cleanup_failed(r, f"VACUUM {t} failed: {err}")
+                result["failed"] += len(todo)
+
+        for r, _ in eligible:                                         # complete what is fully cleaned up
+            if not self.execute:
+                self.out(f"[VACUUM] request {r['request_id']} would be completed after the vacuum")
+                continue
+            if not all(self._covered(t, r["deleted_at"]) for t in ERASURE_PII_TABLES):
+                continue                                               # a table failed above; retried next run
+            try:
+                self._complete(r)
+                result["completed"] += 1
+            except Exception as exc:
+                result["failed"] += 1
+                self.out(f"[VACUUM] request {r['request_id']} could not be completed: {exc}")
+                self._cleanup_failed(r, str(exc))
+        self.out(f"[VACUUM] done: {result}")
+        return result
+
+    def _sweep(self, sref: str) -> int:
+        """Delete any row of the person that appeared after the delete (late writes). Raise if one stays."""
+        swept = 0
+        for t, col in self._scope():
+            n = self._count_person(t, col, sref)
+            if not n:
+                continue
+            self.out(f"[SWEEP] {n} late row(s) of the person in {t}, deleting")
+            self.sql.run(f"DELETE FROM {self.w._tbl(t)} WHERE {col} = :sr AND app_id = :app",
+                         {"sr": sref, "app": self.app_id})
+            swept += n
+            left = self._count_person(t, col, sref)
+            if left:
+                raise RuntimeError(f"{t} still has {left} row(s) after the final sweep")
+        return swept
+
+    def _complete(self, req: dict) -> None:
+        rid, sref = req["request_id"], req["subject_ref"]
+        self._sweep(sref)
+        kv = _kv(req["notes"])
+        completed_at = datetime.now(timezone.utc)
+        if not self._count(f"SELECT count(*) FROM {self.t_rep_audit} WHERE request_id = :rid", {"rid": rid}):
+            self._insert(self.t_rep_audit, {
+                "audit_id": str(uuid.uuid4()), "request_id": rid, "app_id": self.app_id, "regulation": req["regulation"],
+                "traces_affected": int(kv.get("traces", 0) or 0),
+                "pii_rows_deleted": int(kv.get("pii_rows_deleted", 0) or 0),
+                "action_taken": ERASURE_ACTION_TAKEN,
+                "verification_hash": kv.get("hash") or None,
+                "legal_basis": f"{req['regulation']} right to erasure",
+                "within_deadline": "true" if completed_at <= req["deadline"] else "false",
+                "erased_at": _fmt_ts(completed_at), "created_at": _fmt_ts(completed_at),
+                "schema_version": self.w.schema_version})
+        n = self._dml(
+            f"UPDATE {self.t_req} SET status = 'completed', completed_at = current_timestamp(), "
+            f"processed_at = current_timestamp(), last_error = NULL WHERE request_id = :rid AND app_id = :app "
+            f"AND status = 'deleted' AND coalesce(review_required, false) = false", {"rid": rid, "app": self.app_id})
+        if n != 1:
+            raise RuntimeError(f"request {rid} is no longer in status 'deleted'")
+        self._log_status(req, "completed", completed_at=completed_at)
+        self.out(f"[VACUUM] request {rid} completed (within deadline: {completed_at <= req['deadline']})")
+
+    def _cleanup_failed(self, req: dict, reason: str) -> None:
+        """A clean-up failure keeps the request 'deleted' (the person stays hidden) and counts the attempt."""
+        try:
+            attempts = req["cleanup_attempts"] + 1
+            flag = attempts >= self.max_attempts
+            params = {"err": reason[:500], "rid": req["request_id"], "app": self.app_id}
+            review = ""
+            if flag:
+                review = ", review_required = true, review_reason = :rr"
+                params["rr"] = f"clean-up stopped after {attempts} failed attempts: {reason}"[:500]
+                self.out(f"[VACUUM] ALERT: request {req['request_id']} failed clean-up {attempts} times, flagged for review")
+            self._dml(
+                f"UPDATE {self.t_req} SET cleanup_attempts = coalesce(cleanup_attempts, 0) + 1, last_error = :err{review} "
+                f"WHERE request_id = :rid AND app_id = :app AND status = 'deleted'", params)
+        except Exception as inner:
+            self.out(f"[VACUUM] could not record the failure for {req['request_id']}: {inner}")
 
 
 def _split_app_ids(value: str) -> list:
@@ -1436,31 +2160,49 @@ def _split_app_ids(value: str) -> list:
 
 
 def run_erasure_cli(argv=None) -> int:
-    """Entry point for the weekly job. Returns 0 on success, 1 if anything failed.
+    """Entry point for the job. Returns 0 on success, 1 if anything failed, was deferred or needs review.
     --app-id may list several app ids (comma separated); each is processed on its own,
     and every delete is filtered by that app_id."""
     import argparse
     ap = argparse.ArgumentParser(prog="audit_wrapper.py", description="Erasure job")
-    ap.add_argument("command", choices=["process-erasures", "vacuum-erasures"])
+    ap.add_argument("command", choices=["process-erasures", "vacuum-erasures", "reset-request"])
     ap.add_argument("--app-id", required=True, help="one app id, or several separated by commas")
     ap.add_argument("--warehouse-id", required=True)
     ap.add_argument("--catalog", default=ERASURE_CATALOG)
     ap.add_argument("--execute", action="store_true", help="really delete/write; default is a dry run")
-    ap.add_argument("--max-requests", type=int, default=20)
+    ap.add_argument("--max-requests", type=int, default=ERASURE_MAX_REQUESTS,
+                    help="requests handled per run, across all apps")
+    ap.add_argument("--settle-minutes", type=int, default=ERASURE_SETTLE_MINUTES)
+    ap.add_argument("--lease-hours", type=int, default=ERASURE_LEASE_HOURS)
+    ap.add_argument("--max-attempts", type=int, default=ERASURE_MAX_ATTEMPTS)
+    ap.add_argument("--extra-tables", default="", help="optional extra tables to delete from, schema.table,schema.table")
+    ap.add_argument("--request-id", help="reset-request: the request to reset")
+    ap.add_argument("--reason", help="reset-request: why it is safe to retry")
     a = ap.parse_args(argv)
     app_ids = _split_app_ids(a.app_id)
     if not app_ids:
         print("[ERASURE] no app id given")
         return 1
+    if a.command == "reset-request" and (not a.request_id or not a.reason):
+        print("[ERASURE] reset-request needs --request-id and --reason")
+        return 1
     os.environ["DATABRICKS_SQL_WAREHOUSE_ID"] = a.warehouse_id
-    rc = 0
+    rc, remaining = 0, a.max_requests
     for app_id in app_ids:
         try:
             wrapper = AuditWrapper(app_id=app_id, catalog=a.catalog)
             proc = ErasureProcessor(wrapper, warehouse_id=a.warehouse_id, execute=a.execute,
-                                    max_requests=a.max_requests)
-            res = proc.process_pending() if a.command == "process-erasures" else proc.vacuum_completed()
-            if res.get("failed"):
+                                    max_requests=max(remaining, 0), settle_minutes=a.settle_minutes,
+                                    lease_hours=a.lease_hours, max_attempts=a.max_attempts,
+                                    extra_tables=_split_app_ids(a.extra_tables))
+            if a.command == "process-erasures":
+                res = proc.process_pending()
+                remaining -= res.get("processed", 0)
+            elif a.command == "vacuum-erasures":
+                res = proc.vacuum_completed()
+            else:
+                res = proc.reset_request(a.request_id, a.reason)
+            if res.get("failed") or res.get("deferred") or res.get("flagged"):
                 rc = 1
         except Exception as exc:
             print(f"[ERASURE] {a.command} FAILED for app {app_id}: {exc}")

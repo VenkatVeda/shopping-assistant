@@ -1,0 +1,25 @@
+{
+  "name": "shopping-assistant-gateway-sync-15min",
+  "description": "Every 15 minutes: copy the AI Gateway's policy decisions, and the final user message and reply as the gateway sent them after its policies, into shopping_assistant.raw_logs (guardrail_results_raw, node_executions_raw). Insert only; calls already synced are skipped and calls whose gateway trace has not landed yet are retried next run. Starts as a DRY RUN (write=false) and PAUSED.",
+  "max_concurrent_runs": 1,
+  "queue": { "enabled": true },
+  "schedule": {
+    "quartz_cron_expression": "0 0/15 * * * ?",
+    "timezone_id": "Asia/Kolkata",
+    "pause_status": "PAUSED"
+  },
+  "email_notifications": { "on_failure": ["nupur@xponent.ai"] },
+  "tasks": [
+    {
+      "task_key": "sync_gateway_policies",
+      "notebook_task": {
+        "notebook_path": "/Users/nupur@xponent.ai/Audit-trail-main/scripts/gateway_sync/10_gateway_sync_job",
+        "base_parameters": {
+          "warehouse_id": "8eba55b5eb828697",
+          "since_hours": "48",
+          "write": "false"
+        }
+      }
+    }
+  ]
+}
