@@ -75,3 +75,72 @@ def test_route_returns_the_status(client, auth_headers):
 def test_route_rejects_a_bad_id(client, auth_headers):
     resp = client.post("/api/inventory/check", json={"product_id": "bad id"}, headers=auth_headers)
     assert resp.status_code == 400
+
+
+# ---- audit trail (SAGOI-16) -------------------------------------------------
+
+class _FakeAudit:
+    def __init__(self):
+        self.calls = []
+
+    def _compute_refs(self, user_id):
+        return "subject-id", "ref-" + user_id
+
+    def log_tool_call(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+class _FakeWorkflow:
+    def __init__(self):
+        self.audit_wrapper = _FakeAudit()
+
+
+def test_audit_row_has_outcome_and_subject_ref_but_no_email(client, auth_headers, monkeypatch):
+    import app as app_module
+    fake = _FakeWorkflow()
+    monkeypatch.setattr(app_module, "workflow", fake)
+    resp = client.post("/api/inventory/check", json={"product_id": "998643070", "mock_status": "out_of_stock"},
+                       headers=auth_headers)
+    assert resp.status_code == 200
+    (row,) = fake.audit_wrapper.calls
+    assert row["tool_name"] == "inventory_check"
+    assert row["status"] == "success"
+    assert row["subject_ref"] == "ref-u1"
+    assert row["tool_inputs"] == {"product_id": "998643070", "mode": "mock"}
+    assert row["tool_outputs"]["status"] == "out_of_stock"
+    assert row["tool_outputs"]["source"] == "mock"
+    assert "tester@example.com" not in str(row)
+    assert row["latency_ms"] >= 0
+
+
+def test_unknown_result_is_audited_as_an_error(client, auth_headers, monkeypatch):
+    import app as app_module
+    fake = _FakeWorkflow()
+    monkeypatch.setattr(app_module, "workflow", fake)
+    client.post("/api/inventory/check", json={"product_id": "998643070", "mock_status": "unknown"},
+                headers=auth_headers)
+    (row,) = fake.audit_wrapper.calls
+    assert row["status"] == "error"
+    assert row["error_message"] == "upstream_error"
+
+
+def test_bad_id_writes_no_audit_row(client, auth_headers, monkeypatch):
+    import app as app_module
+    fake = _FakeWorkflow()
+    monkeypatch.setattr(app_module, "workflow", fake)
+    client.post("/api/inventory/check", json={"product_id": "bad id"}, headers=auth_headers)
+    assert fake.audit_wrapper.calls == []
+
+
+def test_audit_failure_never_breaks_the_check(client, auth_headers, monkeypatch):
+    import app as app_module
+    fake = _FakeWorkflow()
+
+    def boom(**kwargs):
+        raise RuntimeError("audit down")
+
+    fake.audit_wrapper.log_tool_call = boom
+    monkeypatch.setattr(app_module, "workflow", fake)
+    resp = client.post("/api/inventory/check", json={"product_id": "998643070"}, headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "in_stock"

@@ -28,10 +28,10 @@ from core.auth import (
 )
 from core.performance import get_monitor, get_tracker, track_time
 from core.observability import metrics_store, RequestTrace
-from core.inventory_service import check_inventory, InvalidProductId, unknown_result
+from core.inventory_service import check_inventory, InvalidProductId, unknown_result, get_mode as get_inventory_mode
 from core.evals import EvalRunner
 from core.geoip import get_country_from_request
-from core.shopping_audit import log_wishlist_action, log_cart_action
+from core.shopping_audit import log_wishlist_action, log_cart_action, log_inventory_check
 from audit_wrapper import redact_query_report
 
 # Configure logging
@@ -876,14 +876,40 @@ def inventory_check():
     """Check whether one product is in stock (used by the 'Check if the product is in stock' button)."""
     data = request.get_json(silent=True) or {}
     product_id = data.get('product_id')
+    started = time.time()
     try:
-        return jsonify(check_inventory(product_id, data.get('mock_status'))), 200
+        result = check_inventory(product_id, data.get('mock_status'))
+        _audit_inventory_check(product_id, result, started)
+        return jsonify(result), 200
     except InvalidProductId as e:
         return jsonify({'error': 'Invalid product_id', 'message': str(e)}), 400
     except Exception as e:
         # Any failure ends as "unknown", never as a stock status.
         logger.error(f"Error in inventory_check: {e}", exc_info=True)
-        return jsonify(unknown_result(str(product_id)[:64])), 200
+        result = unknown_result(str(product_id)[:64])
+        _audit_inventory_check(product_id, result, started, error=type(e).__name__)
+        return jsonify(result), 200
+
+
+def _audit_inventory_check(product_id, result, started, error=None):
+    """Write the audit row for one inventory check. Never raises, never delays the response."""
+    try:
+        if workflow is None:
+            return
+        user_id = getattr(request, 'user_id', None)
+        subject_ref = workflow.audit_wrapper._compute_refs(user_id)[1] if user_id else None
+        log_inventory_check(
+            workflow.audit_wrapper,
+            trace_id=str(uuid.uuid4()),
+            product_id=str(product_id)[:64],
+            result=result,
+            latency_ms=(time.time() - started) * 1000,
+            mode=get_inventory_mode(),
+            error=error,
+            subject_ref=subject_ref,
+        )
+    except Exception as e:
+        logger.warning(f"inventory audit skipped: {e}")
 
 
 @app.route('/api/health', methods=['GET'])
