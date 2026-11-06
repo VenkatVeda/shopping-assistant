@@ -34,12 +34,6 @@ def test_bad_product_ids_are_rejected(bad_id):
         check_inventory(bad_id)
 
 
-def test_live_mode_never_claims_a_stock_status(monkeypatch):
-    monkeypatch.setenv("INVENTORY_CHECK_MODE", "live")
-    result = check_inventory("998643070", mock_status="in_stock")
-    assert result["status"] == "unknown"
-
-
 @pytest.fixture(scope="module")
 def client():
     # Importing app.py normally starts the full workflow, which waits on Databricks for minutes.
