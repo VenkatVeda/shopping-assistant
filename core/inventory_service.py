@@ -1,15 +1,25 @@
-"""Inventory check behind the "Check if the product is in stock" button (SAGOI-11).
+"""Inventory check behind the "Check if the product is in stock" button (SAGOI-11, SAGOI-13).
 
 Mock mode returns a chosen status after a short delay so the UI can be built
-before the live Genie One lookup exists. Live mode is added in SAGOI-12 and 13.
+without the live lookup. Live mode asks the Genie One MCP (core/genie_one_client.py)
+and maps every failure to `unknown` with a reason: timeout, denied or upstream_error.
+It never answers in_stock or out_of_stock unless the lookup returned that status.
 """
+import logging
 import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from core.genie_one_client import GenieOneAccessDenied, GenieOneTimeout, get_client
+from core.inventory_limits import cache_seconds, result_cache
+
+logger = logging.getLogger(__name__)
+
 STATUSES = ("in_stock", "out_of_stock", "not_found", "unknown")
+LIVE_SOURCE = "genie_one_mcp"
 
 # v2 product ids are plain numbers (up to 19 characters); allow a safe superset.
 _PRODUCT_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -20,8 +30,13 @@ class InvalidProductId(ValueError):
 
 
 def get_mode() -> str:
+    """`mock` when the setting is absent (development). Any value other than mock or live is treated
+    as live, so a typo can never make a deployed app serve fake answers."""
     mode = os.getenv("INVENTORY_CHECK_MODE", "mock").strip().lower()
-    return mode if mode in ("mock", "live") else "mock"
+    if mode in ("mock", "live"):
+        return mode
+    logger.warning("INVENTORY_CHECK_MODE=%r is not 'mock' or 'live'; using live", mode)
+    return "live"
 
 
 def validate_product_id(product_id) -> str:
@@ -57,11 +72,60 @@ def _mock_check(product_id, mock_status) -> dict:
     return _result(product_id, status, "mock", as_of=as_of)
 
 
-def check_inventory(product_id, mock_status=None) -> dict:
-    """Return the stock status for one product. Raises InvalidProductId for a bad id."""
+def _failed(product_id, reason, error) -> dict:
+    """A check that could not be completed. Logs the error type and message (the client keeps secrets out
+    of its messages) and answers `unknown`, never a stock status."""
+    logger.warning("inventory check failed: reason=%s error=%s: %s", reason, type(error).__name__, str(error)[:200])
+    return unknown_result(product_id, reason=reason, source=LIVE_SOURCE)
+
+
+def _live_check(product_id) -> dict:
+    try:
+        lookup = get_client().lookup(product_id)       # the 60-second limit covers the whole check, retry included
+    except GenieOneAccessDenied as e:
+        return _failed(product_id, "denied", e)
+    except GenieOneTimeout as e:
+        return _failed(product_id, "timeout", e)
+    except Exception as e:  # noqa: BLE001 - any other client error, or anything unexpected
+        return _failed(product_id, "upstream_error", e)
+    if lookup.status not in STATUSES or lookup.status == "unknown":
+        return unknown_result(product_id, reason=lookup.reason or "upstream_error", source=LIVE_SOURCE)
+    return _result(product_id, lookup.status, LIVE_SOURCE, as_of=lookup.as_of)
+
+
+CACHEABLE_STATUSES = ("in_stock", "out_of_stock", "not_found")   # a failed check (unknown) is never reused
+
+
+@dataclass(frozen=True)
+class CheckOutcome:
+    """The public response plus what the caller may want to record (for example in the audit trail)."""
+    result: dict
+    cache_hit: bool = False
+
+
+def _live_check_cached(product_id) -> CheckOutcome:
+    """Live check with a short cache, so repeat clicks for one product do not each cost a Genie question."""
+    cached = result_cache.get(product_id)
+    if cached is not None:
+        logger.info("inventory check served from cache: product_id=%s", product_id)
+        return CheckOutcome(dict(cached, request_id=uuid.uuid4().hex), cache_hit=True)
+    result = _live_check(product_id)
+    if result["status"] in CACHEABLE_STATUSES:
+        result_cache.set(product_id, result, cache_seconds())
+    return CheckOutcome(result)
+
+
+def run_check(product_id, mock_status=None) -> CheckOutcome:
+    """Check one product. Raises InvalidProductId for a bad id.
+
+    mock_status is honoured in mock mode only, so nobody can fake a result against the live lookup.
+    Mock answers are never cached, because they depend on mock_status."""
     product_id = validate_product_id(product_id)
     if get_mode() == "mock":
-        return _mock_check(product_id, mock_status)
-    # Live mode arrives with SAGOI-12 and 13. Until then it must never claim a stock status,
-    # and mock_status is deliberately ignored so no caller can fake a result.
-    return unknown_result(product_id, reason="upstream_error")
+        return CheckOutcome(_mock_check(product_id, mock_status))
+    return _live_check_cached(product_id)
+
+
+def check_inventory(product_id, mock_status=None) -> dict:
+    """The public response for one product (see run_check for the cache flag)."""
+    return run_check(product_id, mock_status).result

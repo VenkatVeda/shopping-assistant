@@ -10,6 +10,15 @@ import pytest
 from core.inventory_service import STATUSES, InvalidProductId, check_inventory
 
 
+@pytest.fixture(autouse=True)
+def _fresh_limits():
+    """Start every test with an empty result cache and no rate-limit counts."""
+    from core import inventory_limits
+    inventory_limits.reset()
+    yield
+    inventory_limits.reset()
+
+
 @pytest.mark.parametrize("status", STATUSES)
 def test_mock_returns_the_requested_status(status):
     result = check_inventory("998643070", mock_status=status)
@@ -32,12 +41,6 @@ def test_unknown_carries_a_reason_and_no_timestamp():
 def test_bad_product_ids_are_rejected(bad_id):
     with pytest.raises(InvalidProductId):
         check_inventory(bad_id)
-
-
-def test_live_mode_never_claims_a_stock_status(monkeypatch):
-    monkeypatch.setenv("INVENTORY_CHECK_MODE", "live")
-    result = check_inventory("998643070", mock_status="in_stock")
-    assert result["status"] == "unknown"
 
 
 @pytest.fixture(scope="module")

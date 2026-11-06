@@ -103,6 +103,7 @@ def log_inventory_check(
     mode:        Optional[str] = None,
     error:       Optional[str] = None,
     subject_ref: Optional[str] = None,
+    cache_hit:   Optional[bool] = None,
 ) -> None:
     """
     Log one "Check if the product is in stock" call to raw_logs.tool_calls_raw (SAGOI-16).
@@ -126,6 +127,7 @@ def log_inventory_check(
                 "source":     result.get("source"),
                 "reason":     result.get("reason"),
                 "request_id": result.get("request_id"),
+                "cache_hit":  cache_hit,
             },
             status="success" if ok else "error",
             latency_ms=latency_ms,
