@@ -94,6 +94,48 @@ def log_cart_action(
         logger.warning("[SHOPPING AUDIT] log_cart_action failed: %s", e)
 
 
+def log_inventory_check(
+    audit_wrapper,
+    trace_id:    str,
+    product_id:  str,
+    result:      Optional[dict],
+    latency_ms:  Optional[float] = None,
+    mode:        Optional[str] = None,
+    error:       Optional[str] = None,
+    subject_ref: Optional[str] = None,
+) -> None:
+    """
+    Log one "Check if the product is in stock" call to raw_logs.tool_calls_raw (SAGOI-16).
+    Fire-and-forget and never raises, so a failed audit write cannot break the check.
+
+    Stores the product id, the outcome and its source (mock or live). It never stores the
+    user's email or name; the person is identified only by subject_ref.
+    """
+    try:
+        if audit_wrapper is None:
+            return
+        result = result or {}
+        status = result.get("status")
+        ok = error is None and status in ("in_stock", "out_of_stock", "not_found")
+        audit_wrapper.log_tool_call(
+            trace_id=trace_id,
+            tool_name="inventory_check",
+            tool_inputs={"product_id": product_id, "mode": mode},
+            tool_outputs={
+                "status":     status,
+                "source":     result.get("source"),
+                "reason":     result.get("reason"),
+                "request_id": result.get("request_id"),
+            },
+            status="success" if ok else "error",
+            latency_ms=latency_ms,
+            error_message=(error or result.get("reason")) if not ok else None,
+            subject_ref=subject_ref,
+        )
+    except Exception as e:
+        logger.warning("[SHOPPING AUDIT] log_inventory_check failed: %s", e)
+
+
 def log_order_action(
     audit_wrapper,
     trace_id:   str,
