@@ -14,6 +14,15 @@ PID = "998643070"
 RESPONSE_KEYS = {"product_id", "status", "as_of", "source", "request_id"}
 
 
+@pytest.fixture(autouse=True)
+def _fresh_limits():
+    """Start every test with an empty result cache and no rate-limit counts."""
+    from core import inventory_limits
+    inventory_limits.reset()
+    yield
+    inventory_limits.reset()
+
+
 class FakeClient:
     """Stands in for the Genie One client: returns a StockLookup or raises what it was given."""
 

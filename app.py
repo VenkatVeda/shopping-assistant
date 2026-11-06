@@ -28,7 +28,8 @@ from core.auth import (
 )
 from core.performance import get_monitor, get_tracker, track_time
 from core.observability import metrics_store, RequestTrace
-from core.inventory_service import check_inventory, InvalidProductId, unknown_result, get_mode as get_inventory_mode
+from core.inventory_service import run_check, validate_product_id, InvalidProductId, unknown_result, get_mode as get_inventory_mode
+from core.inventory_limits import rate_limiter as inventory_rate_limiter
 from core.evals import EvalRunner
 from core.geoip import get_country_from_request
 from core.shopping_audit import log_wishlist_action, log_cart_action, log_inventory_check
@@ -873,16 +874,30 @@ def select_product():
 @app.route('/api/inventory/check', methods=['POST'])
 @token_required
 def inventory_check():
-    """Check whether one product is in stock (used by the 'Check if the product is in stock' button)."""
+    """Check whether one product is in stock (used by the 'Check if the product is in stock' button).
+
+    Order of checks: login (401), product id (400), per-user rate limit (429), then the check itself.
+    Only checks that actually run are written to the audit trail."""
     data = request.get_json(silent=True) or {}
     product_id = data.get('product_id')
-    started = time.time()
     try:
-        result = check_inventory(product_id, data.get('mock_status'))
-        _audit_inventory_check(product_id, result, started)
-        return jsonify(result), 200
+        validate_product_id(product_id)
     except InvalidProductId as e:
         return jsonify({'error': 'Invalid product_id', 'message': str(e)}), 400
+
+    allowed, retry_after = inventory_rate_limiter.allow(str(request.user_id or request.user_email))
+    if not allowed:
+        response = jsonify({'error': 'Too many requests',
+                            'message': 'Too many stock checks. Please try again shortly.'})
+        response.status_code = 429
+        response.headers['Retry-After'] = str(retry_after)
+        return response
+
+    started = time.time()
+    try:
+        outcome = run_check(product_id, data.get('mock_status'))
+        _audit_inventory_check(product_id, outcome.result, started, cache_hit=outcome.cache_hit)
+        return jsonify(outcome.result), 200
     except Exception as e:
         # Any failure ends as "unknown", never as a stock status.
         logger.error(f"Error in inventory_check: {e}", exc_info=True)
@@ -891,7 +906,7 @@ def inventory_check():
         return jsonify(result), 200
 
 
-def _audit_inventory_check(product_id, result, started, error=None):
+def _audit_inventory_check(product_id, result, started, error=None, cache_hit=None):
     """Write the audit row for one inventory check. Never raises, never delays the response."""
     try:
         if workflow is None:
@@ -907,6 +922,7 @@ def _audit_inventory_check(product_id, result, started, error=None):
             mode=get_inventory_mode(),
             error=error,
             subject_ref=subject_ref,
+            cache_hit=cache_hit,
         )
     except Exception as e:
         logger.warning(f"inventory audit skipped: {e}")

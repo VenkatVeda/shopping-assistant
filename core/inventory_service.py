@@ -10,9 +10,11 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from core.genie_one_client import GenieOneAccessDenied, GenieOneTimeout, get_client
+from core.inventory_limits import cache_seconds, result_cache
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +93,39 @@ def _live_check(product_id) -> dict:
     return _result(product_id, lookup.status, LIVE_SOURCE, as_of=lookup.as_of)
 
 
-def check_inventory(product_id, mock_status=None) -> dict:
-    """Return the stock status for one product. Raises InvalidProductId for a bad id.
+CACHEABLE_STATUSES = ("in_stock", "out_of_stock", "not_found")   # a failed check (unknown) is never reused
 
-    mock_status is honoured in mock mode only, so nobody can fake a result against the live lookup."""
+
+@dataclass(frozen=True)
+class CheckOutcome:
+    """The public response plus what the caller may want to record (for example in the audit trail)."""
+    result: dict
+    cache_hit: bool = False
+
+
+def _live_check_cached(product_id) -> CheckOutcome:
+    """Live check with a short cache, so repeat clicks for one product do not each cost a Genie question."""
+    cached = result_cache.get(product_id)
+    if cached is not None:
+        logger.info("inventory check served from cache: product_id=%s", product_id)
+        return CheckOutcome(dict(cached, request_id=uuid.uuid4().hex), cache_hit=True)
+    result = _live_check(product_id)
+    if result["status"] in CACHEABLE_STATUSES:
+        result_cache.set(product_id, result, cache_seconds())
+    return CheckOutcome(result)
+
+
+def run_check(product_id, mock_status=None) -> CheckOutcome:
+    """Check one product. Raises InvalidProductId for a bad id.
+
+    mock_status is honoured in mock mode only, so nobody can fake a result against the live lookup.
+    Mock answers are never cached, because they depend on mock_status."""
     product_id = validate_product_id(product_id)
     if get_mode() == "mock":
-        return _mock_check(product_id, mock_status)
-    return _live_check(product_id)
+        return CheckOutcome(_mock_check(product_id, mock_status))
+    return _live_check_cached(product_id)
+
+
+def check_inventory(product_id, mock_status=None) -> dict:
+    """The public response for one product (see run_check for the cache flag)."""
+    return run_check(product_id, mock_status).result

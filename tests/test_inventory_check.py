@@ -10,6 +10,15 @@ import pytest
 from core.inventory_service import STATUSES, InvalidProductId, check_inventory
 
 
+@pytest.fixture(autouse=True)
+def _fresh_limits():
+    """Start every test with an empty result cache and no rate-limit counts."""
+    from core import inventory_limits
+    inventory_limits.reset()
+    yield
+    inventory_limits.reset()
+
+
 @pytest.mark.parametrize("status", STATUSES)
 def test_mock_returns_the_requested_status(status):
     result = check_inventory("998643070", mock_status=status)
