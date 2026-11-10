@@ -67,6 +67,14 @@ env:
   - name: AUDIT_SECRET_SCOPE
     valueFrom: audit-secret-scope
 
+  # Inventory check ("Check if the product is in stock"): live Genie One lookup through a dedicated service principal
+  - name: INVENTORY_CHECK_MODE
+    value: "live"
+  - name: INVENTORY_SP_CLIENT_ID
+    valueFrom: inventory-sp-client-id
+  - name: INVENTORY_SP_CLIENT_SECRET
+    valueFrom: inventory-sp-client-secret
+
   # User defaults
   - name: DEFAULT_USER_COUNTRY
     value: "US"
