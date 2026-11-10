@@ -210,6 +210,11 @@ def test_missing_credentials_are_reported(monkeypatch):
     for name in ("INVENTORY_SP_CLIENT_ID", "INVENTORY_SP_CLIENT_SECRET"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DATABRICKS_HOST", "adb-1.azuredatabricks.net")
+
+    def no_secret(key_setting, default_key):
+        raise GenieOneNotConfigured("secret returned no value")
+
+    monkeypatch.setattr(g, "_read_uc_secret", no_secret)      # no network in unit tests
     with pytest.raises(GenieOneNotConfigured):
         g._SpTokenProvider().get_token()
 
@@ -244,3 +249,114 @@ def test_a_failed_token_request_never_leaks_the_secret(monkeypatch):
     with pytest.raises(GenieOneError) as err:
         g._SpTokenProvider().get_token()
     assert "super-secret-value" not in str(err.value) and "401" in str(err.value)
+
+
+# ------------------------------------------------------------------ credentials read from Unity Catalog secrets
+
+def _ok_token(monkeypatch, seen):
+    def fake_post(url, auth=None, data=None, timeout=None):
+        seen.append(auth)
+        return SimpleNamespace(status_code=200, json=lambda: {"access_token": "tok", "expires_in": 3600})
+    monkeypatch.setattr(g.requests, "post", fake_post)
+
+
+def _no_uc_env(monkeypatch):
+    for name in ("INVENTORY_SP_CLIENT_ID", "INVENTORY_SP_CLIENT_SECRET", "INVENTORY_SP_SECRET_CATALOG",
+                 "INVENTORY_SP_SECRET_SCHEMA", "INVENTORY_SP_CLIENT_ID_KEY", "INVENTORY_SP_CLIENT_SECRET_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DATABRICKS_HOST", "adb-1.azuredatabricks.net")
+
+
+def test_credentials_come_from_uc_secrets_when_no_settings_are_given(monkeypatch):
+    _no_uc_env(monkeypatch)
+    asked, seen = [], []
+    monkeypatch.setattr(g, "_read_uc_secret", lambda setting, default: asked.append(default) or f"value-of-{default}")
+    _ok_token(monkeypatch, seen)
+    assert g._SpTokenProvider().get_token() == "tok"
+    assert asked == [g.DEFAULT_CLIENT_ID_KEY, g.DEFAULT_CLIENT_SECRET_KEY]
+    assert seen == [(f"value-of-{g.DEFAULT_CLIENT_ID_KEY}", f"value-of-{g.DEFAULT_CLIENT_SECRET_KEY}")]
+
+
+def test_settings_win_over_uc_secrets(monkeypatch):
+    _no_uc_env(monkeypatch)
+    monkeypatch.setenv("INVENTORY_SP_CLIENT_ID", "the-id")
+    monkeypatch.setenv("INVENTORY_SP_CLIENT_SECRET", "the-secret")
+    seen = []
+    monkeypatch.setattr(g, "_read_uc_secret", lambda *a: pytest.fail("UC secrets must not be read"))
+    _ok_token(monkeypatch, seen)
+    g._SpTokenProvider().get_token()
+    assert seen == [("the-id", "the-secret")]
+
+
+class _FakeWorkspaceClient:
+    """Stands in for databricks.sdk.WorkspaceClient: records the REST call, returns or raises what it was given."""
+    calls = []
+    outcome = {"effective_value": "s3cret-value"}
+
+    def __init__(self):
+        self.api_client = self
+
+    def do(self, method, path, query=None):
+        _FakeWorkspaceClient.calls.append((method, path, query))
+        if isinstance(_FakeWorkspaceClient.outcome, BaseException):
+            raise _FakeWorkspaceClient.outcome
+        return _FakeWorkspaceClient.outcome
+
+
+@pytest.fixture
+def uc(monkeypatch):
+    import databricks.sdk
+    _no_uc_env(monkeypatch)
+    _FakeWorkspaceClient.calls = []
+    _FakeWorkspaceClient.outcome = {"effective_value": "s3cret-value"}
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", _FakeWorkspaceClient)
+    return _FakeWorkspaceClient
+
+
+def test_a_uc_secret_is_read_by_catalog_schema_and_key(uc):
+    assert g._read_uc_secret("INVENTORY_SP_CLIENT_ID_KEY", g.DEFAULT_CLIENT_ID_KEY) == "s3cret-value"
+    assert uc.calls == [("GET", "/api/2.1/unity-catalog/secrets/shopping_assistant.default.sp_genie_one_mcp_client_id",
+                         {"include_value": "true"})]
+
+
+def test_the_secret_location_can_be_changed_by_settings(uc, monkeypatch):
+    monkeypatch.setenv("INVENTORY_SP_SECRET_CATALOG", "my_cat")
+    monkeypatch.setenv("INVENTORY_SP_SECRET_SCHEMA", "my_schema")
+    monkeypatch.setenv("INVENTORY_SP_CLIENT_SECRET_KEY", "my_key")
+    g._read_uc_secret("INVENTORY_SP_CLIENT_SECRET_KEY", g.DEFAULT_CLIENT_SECRET_KEY)
+    assert uc.calls[0][1] == "/api/2.1/unity-catalog/secrets/my_cat.my_schema.my_key"
+
+
+def test_the_plain_value_field_is_accepted_too(uc):
+    uc.outcome = {"value": "plain-value"}
+    assert g._read_uc_secret("INVENTORY_SP_CLIENT_ID_KEY", g.DEFAULT_CLIENT_ID_KEY) == "plain-value"
+
+
+@pytest.mark.parametrize("setting, bad", [("INVENTORY_SP_SECRET_CATALOG", "cat/../x"),
+                                          ("INVENTORY_SP_SECRET_SCHEMA", "a.b"),
+                                          ("INVENTORY_SP_CLIENT_ID_KEY", "key?include_value=false")])
+def test_a_bad_secret_name_never_reaches_the_url(uc, monkeypatch, setting, bad):
+    monkeypatch.setenv(setting, bad)
+    with pytest.raises(GenieOneNotConfigured):
+        g._read_uc_secret("INVENTORY_SP_CLIENT_ID_KEY", g.DEFAULT_CLIENT_ID_KEY)
+    assert uc.calls == []
+
+
+def test_a_permission_error_reading_the_secret_is_access_denied(uc):
+    uc.outcome = RuntimeError("PERMISSION_DENIED: user does not have READ SECRET on s3cret-value")
+    with pytest.raises(g.GenieOneAccessDenied) as err:
+        g._read_uc_secret("INVENTORY_SP_CLIENT_ID_KEY", g.DEFAULT_CLIENT_ID_KEY)
+    assert "s3cret-value" not in str(err.value) and "shopping_assistant.default" in str(err.value)
+
+
+def test_another_error_reading_the_secret_is_a_plain_error(uc):
+    uc.outcome = ConnectionError("network down")
+    with pytest.raises(GenieOneError) as err:
+        g._read_uc_secret("INVENTORY_SP_CLIENT_ID_KEY", g.DEFAULT_CLIENT_ID_KEY)
+    assert not isinstance(err.value, g.GenieOneAccessDenied) and "ConnectionError" in str(err.value)
+
+
+def test_an_empty_secret_is_reported(uc):
+    uc.outcome = {}
+    with pytest.raises(GenieOneNotConfigured):
+        g._read_uc_secret("INVENTORY_SP_CLIENT_ID_KEY", g.DEFAULT_CLIENT_ID_KEY)

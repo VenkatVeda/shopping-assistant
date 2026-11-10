@@ -10,8 +10,14 @@ Flow for one check (all inside one MCP session):
 
 Settings (environment variables):
   DATABRICKS_HOST                      workspace URL
-  INVENTORY_SP_CLIENT_ID / _SECRET     the SP's OAuth client credentials (supplied by SAGOI-9)
-  INVENTORY_SP_SCOPES                  OAuth scopes (default: ai-gateway genie sql model-serving-inference)
+  INVENTORY_SP_CLIENT_ID / _SECRET     the SP's OAuth client credentials, when given as environment values
+                                       (local runs). When absent, the app reads them from Unity Catalog secrets
+                                       as its own identity (the app's service principal needs USE CATALOG,
+                                       USE SCHEMA and READ SECRET):
+  INVENTORY_SP_SECRET_CATALOG / _SCHEMA  where those secrets live (default shopping_assistant / default)
+  INVENTORY_SP_CLIENT_ID_KEY / _CLIENT_SECRET_KEY  the secret names
+                                       (default sp_genie_one_mcp_client_id / sp_genie_one_mcp_client_secret)
+  INVENTORY_SP_SCOPES                 OAuth scopes (default: ai-gateway genie sql model-serving-inference)
   INVENTORY_SOURCE_TABLE               product table (default: sandbox.venkat.bags_embeddings_v2)
   INVENTORY_CHECK_TIMEOUT_SECONDS      limit for the whole check, retry included (default 60)
   INVENTORY_POLL_INTERVAL_SECONDS      pause between polls (default 2)
@@ -35,6 +41,10 @@ MCP_SERVICE = "system.ai.genie_one_mcp"
 DEFAULT_SOURCE_TABLE = "sandbox.venkat.bags_embeddings_v2"
 DEFAULT_SCOPES = "ai-gateway genie sql model-serving-inference"
 DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_SECRET_CATALOG = "shopping_assistant"
+DEFAULT_SECRET_SCHEMA = "default"
+DEFAULT_CLIENT_ID_KEY = "sp_genie_one_mcp_client_id"
+DEFAULT_CLIENT_SECRET_KEY = "sp_genie_one_mcp_client_secret"
 
 # The gateway sometimes fails a single call with this text; the next call succeeds.
 TRANSIENT = "Unable to verify MCP service access"
@@ -44,6 +54,7 @@ _DENIED_MARKERS = ("does not exist, or you do not have access", "PERMISSION_DENI
 # Same rule as core.inventory_service (kept here too so this module is safe on its own).
 _PRODUCT_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _TABLE_NAME = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
+_SECRET_PART = re.compile(r"^[A-Za-z0-9_]+$")
 
 # The question is fixed. Only the validated product id is filled in; no user text reaches it.
 QUESTION_TEMPLATE = (
@@ -157,6 +168,30 @@ def _source_table() -> str:
     return table
 
 
+def _read_uc_secret(key_setting: str, default_key: str) -> str:
+    """One Unity Catalog secret, read as the app's own identity (its service principal).
+    Names come from settings and are checked, so nothing unexpected reaches the URL. The value is never logged."""
+    catalog = (os.getenv("INVENTORY_SP_SECRET_CATALOG") or DEFAULT_SECRET_CATALOG).strip()
+    schema = (os.getenv("INVENTORY_SP_SECRET_SCHEMA") or DEFAULT_SECRET_SCHEMA).strip()
+    key = (os.getenv(key_setting) or default_key).strip()
+    if not all(_SECRET_PART.match(part) for part in (catalog, schema, key)):
+        raise GenieOneNotConfigured("the SP secret catalog, schema and key may only contain letters, digits and underscores")
+    name = f"{catalog}.{schema}.{key}"
+    try:
+        from databricks.sdk import WorkspaceClient
+        resp = WorkspaceClient().api_client.do(
+            "GET", f"/api/2.1/unity-catalog/secrets/{name}", query={"include_value": "true"})
+    except Exception as e:  # noqa: BLE001 - classified below; the message never holds the value
+        message = str(e)
+        if "PermissionDenied" in type(e).__name__ or any(m in message for m in _DENIED_MARKERS):
+            raise GenieOneAccessDenied(f"not allowed to read secret {name}") from None
+        raise GenieOneError(f"could not read secret {name}: {type(e).__name__}") from None
+    value = (resp or {}).get("effective_value") or (resp or {}).get("value")
+    if not value:
+        raise GenieOneNotConfigured(f"secret {name} returned no value")
+    return value
+
+
 class _SpTokenProvider:
     """OAuth client-credentials token for the SP, cached until shortly before it expires."""
 
@@ -171,8 +206,9 @@ class _SpTokenProvider:
                 return self._token
             client_id = os.getenv("INVENTORY_SP_CLIENT_ID")
             client_secret = os.getenv("INVENTORY_SP_CLIENT_SECRET")
-            if not client_id or not client_secret:
-                raise GenieOneNotConfigured("INVENTORY_SP_CLIENT_ID and INVENTORY_SP_CLIENT_SECRET are not set")
+            if not client_id or not client_secret:       # not given as settings: read the UC secrets
+                client_id = _read_uc_secret("INVENTORY_SP_CLIENT_ID_KEY", DEFAULT_CLIENT_ID_KEY)
+                client_secret = _read_uc_secret("INVENTORY_SP_CLIENT_SECRET_KEY", DEFAULT_CLIENT_SECRET_KEY)
             scopes = os.getenv("INVENTORY_SP_SCOPES") or DEFAULT_SCOPES
             try:
                 resp = requests.post(
