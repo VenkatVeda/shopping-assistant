@@ -11,6 +11,7 @@ from .rag_utils import (
     build_generation_prompt,
     build_reranking_prompt,
     parse_rerank_scores,
+    apply_price_priority,
 )
 from .performance import track_time
 import json
@@ -139,12 +140,17 @@ class Reranker:
             print(f"\n[RERANKER] Reranking {len(results)} products...")
             
             try:
+                # With a budget cap the LLM must see more candidates: the best-value items
+                # (priced near the cap) are not necessarily among the 20 most similar.
+                price_max = getattr(preferences, "price_max", None)
+                window = 30 if price_max else 20
                 # Build reranking prompt
                 rerank_prompt = build_reranking_prompt(
                     query=query,
                     products=results,
                     preferences=preferences,
-                    personalization_context=personalization_context
+                    personalization_context=personalization_context,
+                    max_products=window
                 )
                 
                 # Get LLM scores
@@ -158,7 +164,10 @@ class Reranker:
                             span.set_inputs({"product_count": len(results), "query": query[:200]})
                         except Exception:
                             pass
-                        response = self.llm.invoke(messages)
+                        # Output is ~12 tokens per product ({"i":N,"s":NN}); 20 products ≈ 250.
+                        # Low temperature: scoring should be stable, not creative.
+                        response = self.llm.invoke(
+                            messages, max_tokens=max(400, window * 14 + 60), temperature=0.0)
                         llm_response = response.content if hasattr(response, 'content') else str(response)
                         llm_response = llm_response.strip()
                         try:
@@ -204,8 +213,9 @@ class Reranker:
                     
                     reranked_products.append(product_dict)
                 
-                # Sort by rerank score (descending)
-                reranked_products.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+                # Sort by rerank score (descending). With a budget cap, good matches priced
+                # closer to the cap rank first (higher basket value); see apply_price_priority.
+                reranked_products = apply_price_priority(reranked_products, price_max)
                 
                 # Filter out irrelevant products (score < 30)
                 MIN_RELEVANCE_SCORE = 30

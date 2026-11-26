@@ -32,6 +32,10 @@ env:
     value: "system.ai.meta-llama-3-1-8b-instruct"  # For memory summarization
   - name: DATABRICKS_INTENT_ENDPOINT
     value: "system.ai.meta-llama-3-1-8b-instruct"  # For intent classification
+  # Policy-free model service for internal steps (reranker, memory, extractors, classifiers).
+  # Same Llama model, no guardrail policies. Intent classifier + response keep the policed route.
+  - name: DATABRICKS_INTERNAL_CHAT_ENDPOINT
+    value: "sandbox.venkat.llama-3-1-8b-internal"
   
   # MCP Vector Store Configuration
   - name: USE_MCP_VECTOR_SEARCH

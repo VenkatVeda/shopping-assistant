@@ -39,21 +39,18 @@ Task: Score each product from 0-100 based on how well it matches the user's need
 **EVALUATION CRITERIA (for relevant products only):**
 1. Category & Type Relevance (MOST IMPORTANT - must match query intent)
 2. Alignment with stated preferences (color, material, features)
-3. Price-value ratio: When budget is high (e.g., under $500), favor higher-quality products
-   - Don't just pick cheapest options
-   - A $200-300 product can score higher than a $50 product if quality/features are better
-   - Balance value: show mix of good mid-range and premium options within budget
+3. Price-value ratio: When the user gives a budget cap (e.g., "under $300"), favor products
+   priced close to that cap, within budget (premium options)
+   - Do NOT favor the cheapest options; a $280 product that matches the request should
+     score higher than a $100 product that matches equally well
+   - Never score a product above the cap highly; relevance to the request still comes first
 4. Quality indicators (brand reputation, material quality, construction)
 5. Practical suitability for the user's likely use case
 
 IMPORTANT: Be STRICT about relevance. It's better to return fewer highly relevant products than to include irrelevant ones.
 
-Respond ONLY with a JSON array of scores in this exact format:
-[
-  {{"product_index": 1, "score": 95, "reason": "Premium leather wallet, perfect match for compact wallet request"}},
-  {{"product_index": 2, "score": 15, "reason": "IRRELEVANT: Laptop bag when user requested wallet - wrong category"}},
-  {{"product_index": 3, "score": 82, "reason": "High-quality leather bifold, excellent value at $89"}},
-  ...
-]
+Respond ONLY with a compact JSON array, one entry per product, in this exact format.
+Do NOT include reasons, explanations, or any other text:
+[{{"i": 1, "s": 95}}, {{"i": 2, "s": 15}}, {{"i": 3, "s": 82}}]
 
 Provide scores for all products in order:
