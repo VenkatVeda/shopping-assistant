@@ -109,7 +109,24 @@ class ShoppingAssistantWorkflow:
             max_tokens=800
         )
         print(f"✓ Initialized Databricks Chat Model: {chat_endpoint}")
-        
+
+        # Internal-step model: reranker, memory summarisation, preference extraction and the
+        # follow-up classifiers. Their prompts are app-written and their output is never shown
+        # to the user, so they can run on a gateway route WITHOUT the safety/PII judge policies
+        # (each policy adds a pre_call + post_call judge LLM round trip). The raw user query is
+        # still screened by the intent classifier and the final reply by the response generator /
+        # output guardrail, which stay on chat_endpoint. Unset = same route as chat (no change).
+        internal_endpoint = os.getenv("DATABRICKS_INTERNAL_CHAT_ENDPOINT") or chat_endpoint
+        if internal_endpoint == chat_endpoint:
+            self.internal_model = self.chat_model
+        else:
+            self.internal_model = GatewayChatModel(
+                endpoint=internal_endpoint,
+                temperature=0.7,
+                max_tokens=800
+            )
+        print(f"✓ Internal-step model (no guardrail policies expected): {internal_endpoint}")
+
         # Initialize Vector Search Client
         # Check if running in Databricks Apps (where MCP subprocess spawning doesn't work)
         in_databricks_app = os.getenv("DATABRICKS_RUNTIME_VERSION") or os.path.exists("/databricks/spark")
@@ -141,11 +158,11 @@ class ShoppingAssistantWorkflow:
         
         # Initialize Memory
         self.memory = MemorySaver()
-        self.memory_manager = MemoryManager(chat_endpoint=chat_endpoint)
+        self.memory_manager = MemoryManager(chat_endpoint=internal_endpoint)
         
         # Initialize RAG Nodes
         self.result_validator = ResultValidator()
-        self.reranker = Reranker(self.chat_model)
+        self.reranker = Reranker(self.internal_model)
         self.response_generator = ResponseGenerator(self.chat_model)
         print("✓ Initialized RAG components: Validator, Reranker, Response Generator")
         
@@ -167,7 +184,7 @@ class ShoppingAssistantWorkflow:
                 
                 self.preference_extractor = PreferenceExtractor(
                     llm_client=workspace_client,
-                    model_name=chat_endpoint
+                    model_name=internal_endpoint
                 )
                 self.personalization_engine = PersonalizationEngine(
                     self.preference_extractor,
@@ -942,9 +959,9 @@ class ShoppingAssistantWorkflow:
                 "new_preferences": new_prefs_str
             })
             
-            response = self.chat_model.invoke(prompt)
+            response = self.internal_model.invoke(prompt)
             content = response.content if hasattr(response, 'content') else str(response)
-            
+
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 result = json.loads(json_match.group(0))
@@ -1833,7 +1850,7 @@ class ShoppingAssistantWorkflow:
                 })
                 try:
                     import json
-                    response      = self.chat_model.invoke(prompt)
+                    response      = self.internal_model.invoke(prompt)
                     response_text = response.content.strip() if hasattr(response, 'content') else str(response).strip()
                     json_match    = _re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, _re.DOTALL)
                     if json_match:

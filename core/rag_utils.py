@@ -8,6 +8,7 @@ from .models import Product, SearchPreferences
 from .prompt_loader import load_prompt
 import json
 import os
+import re
 
 
 def get_product_by_id(product_id: str, vector_client=None) -> Optional[Dict[str, Any]]:
@@ -239,11 +240,62 @@ def build_generation_prompt(
     return prompt
 
 
+def product_price(product: Any) -> Optional[float]:
+    """Best-effort numeric price of a product (dict with metadata, flat dict, or Document)."""
+    meta = {}
+    if isinstance(product, dict):
+        meta = product.get("metadata") or {}
+        raw = product.get("price")
+    else:
+        meta = getattr(product, "metadata", None) or {}
+        raw = getattr(product, "price", None)
+    if raw in (None, "", 0):
+        raw = meta.get("price") or meta.get("price_from")
+    try:
+        return float(str(raw).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# A product counts as a "good match" (eligible for the price priority below) at this rerank
+# score or above. The LLM cannot reliably separate e.g. 82 from 95 among bags that all fit the
+# request, so inside this tier price decides. Env PRICE_PRIORITY_MIN_RELEVANCE; 101 disables it.
+PRICE_PRIORITY_MIN_RELEVANCE = 75
+
+
+def apply_price_priority(products: List[Dict[str, Any]], price_max: Optional[float],
+                         min_relevance: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Order reranked products for a customer with a budget cap (higher basket value).
+
+    With a cap: products scoring >= min_relevance (good matches) come first, highest price
+    first (i.e. closest to the cap), ties broken by rerank_score. Weaker matches follow in
+    rerank_score order, so a poor match is never promoted just because it is expensive.
+    Without a cap, or when disabled: plain rerank_score descending.
+    `rerank_score` is left untouched; good matches get price_priority=True.
+    """
+    if min_relevance is None:
+        try:
+            min_relevance = float(os.getenv("PRICE_PRIORITY_MIN_RELEVANCE", PRICE_PRIORITY_MIN_RELEVANCE))
+        except ValueError:
+            min_relevance = PRICE_PRIORITY_MIN_RELEVANCE
+    score = lambda p: p.get("rerank_score", 0) or 0
+    if not price_max:
+        return sorted(products, key=score, reverse=True)
+    good = [p for p in products if score(p) >= min_relevance]
+    rest = [p for p in products if score(p) < min_relevance]
+    for p in good:
+        p["price_priority"] = True
+    good.sort(key=lambda p: (product_price(p) or 0, score(p)), reverse=True)
+    rest.sort(key=score, reverse=True)
+    return good + rest
+
+
 def build_reranking_prompt(
     query: str,
     products: List[Any],
     preferences: Optional[SearchPreferences],
-    personalization_context: Optional[str] = None
+    personalization_context: Optional[str] = None,
+    max_products: int = 20
 ) -> str:
     """
     Build prompt for LLM-based product reranking
@@ -258,7 +310,7 @@ def build_reranking_prompt(
         Prompt for reranking
     """
     # Format products with indices
-    products_text = format_products_for_llm(products, max_products=20)
+    products_text = format_products_for_llm(products, max_products=max_products)
     
     # Build preferences summary
     prefs_summary = []
@@ -300,30 +352,41 @@ def parse_rerank_scores(llm_response: str) -> Dict[int, Dict[str, Any]]:
     Returns:
         Dictionary mapping product index to score and reason
     """
+    def _to_dict(scores_list) -> Dict[int, Dict[str, Any]]:
+        # Accepts the compact {"i","s"} form and the older {"product_index","score","reason"} form.
+        out = {}
+        for item in scores_list:
+            idx = item.get('i', item.get('product_index', 0))
+            score = item.get('s', item.get('score', 50))
+            out[idx] = {'score': score, 'reason': item.get('reason', '')}
+        return out
+
     try:
         # Try to extract JSON from response
         # Handle cases where LLM adds extra text
         start_idx = llm_response.find('[')
         end_idx = llm_response.rfind(']') + 1
-        
-        if start_idx == -1 or end_idx == 0:
+
+        if start_idx == -1:
             # No JSON found, return empty dict
             return {}
-        
-        json_str = llm_response[start_idx:end_idx]
-        scores_list = json.loads(json_str)
-        
-        # Convert to dict for easy lookup
-        scores_dict = {}
-        for item in scores_list:
-            idx = item.get('product_index', 0)
-            score = item.get('score', 50)
-            reason = item.get('reason', '')
-            scores_dict[idx] = {'score': score, 'reason': reason}
-        
-        return scores_dict
-        
-    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        if end_idx == 0:
+            raise ValueError("response cut off before closing bracket")
+
+        return _to_dict(json.loads(llm_response[start_idx:end_idx]))
+
+    except (json.JSONDecodeError, ValueError, KeyError, AttributeError) as e:
+        # A response cut off by max_tokens has no closing bracket / a half-written last entry.
+        # Keep every complete {...} object instead of discarding the whole ranking.
+        salvaged = []
+        for m in re.finditer(r'\{[^{}]*\}', llm_response):
+            try:
+                salvaged.append(json.loads(m.group(0)))
+            except json.JSONDecodeError:
+                continue
+        if salvaged:
+            print(f"[RERANKING] Warning: Response not valid JSON ({e}); salvaged {len(salvaged)} scores")
+            return _to_dict(salvaged)
         print(f"[RERANKING] Warning: Could not parse LLM scores: {e}")
         return {}
 
